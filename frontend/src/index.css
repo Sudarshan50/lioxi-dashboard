@@ -1,0 +1,59 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: #07080d;
+  color: #e5e7eb;
+  font-feature-settings: "cv11", "ss01";
+}
+
+/* Layered aurora backdrop behind every page */
+.app-aurora {
+  position: relative;
+  isolation: isolate;
+}
+
+.app-aurora::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse 55% 45% at 12% -8%, rgba(99, 102, 241, 0.16), transparent 62%),
+    radial-gradient(ellipse 45% 40% at 88% 4%, rgba(168, 85, 247, 0.1), transparent 60%),
+    radial-gradient(ellipse 60% 55% at 55% 110%, rgba(14, 165, 233, 0.07), transparent 65%);
+}
+
+/* Gradient headline used on page titles */
+.gradient-title {
+  background: linear-gradient(100deg, #f8fafc 20%, #c7d2fe 55%, #a5b4fc 85%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+::selection {
+  background: rgba(99, 102, 241, 0.4);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2a2f3d;
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3b4254;
+}
