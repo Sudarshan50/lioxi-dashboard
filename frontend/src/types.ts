@@ -212,3 +212,126 @@ export interface FxRate {
   source?: "live" | "config" | "fallback";
   is_fallback?: boolean;
 }
+
+export interface KimiDeployStatus {
+  az_cli: boolean;
+  az_path: string | null;
+  script_found: boolean;
+  script_path: string | null;
+  ready: boolean;
+  message: string;
+  can_bootstrap?: boolean;
+  az_user?: string | null;
+  az_user_type?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  bootstrap_message?: string;
+}
+
+export interface KimiSecretsRow {
+  ok: boolean;
+  name?: string | null;
+  account_holder?: string | null;
+  AZURE_TENANT_ID?: string | null;
+  AZURE_CLIENT_ID?: string | null;
+  AZURE_CLIENT_SECRET?: string | null;
+  AZURE_SUBSCRIPTION_ID?: string | null;
+  subscription_name?: string | null;
+  error?: string | null;
+}
+
+export interface KimiRegenerateResponse {
+  ok_count: number;
+  fail_count: number;
+  results: KimiSecretsRow[];
+}
+
+export interface KimiCreditSnapshot {
+  ok: boolean;
+  name?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  credits_limit?: number | null;
+  credits_remaining?: number | null;
+  credits_used?: number | null;
+  credits_currency?: string | null;
+  credits_label?: string | null;
+  credits_available?: boolean;
+  error?: string | null;
+}
+
+export interface KimiCreditsResponse {
+  results: KimiCreditSnapshot[];
+}
+
+export interface KimiDeployResult {
+  ok: boolean;
+  name?: string | null;
+  email?: string | null;
+  azure_openai_endpoint?: string | null;
+  api_key?: string | null;
+  deployment_name?: string | null;
+  model?: string | null;
+  sku?: string | null;
+  tpm?: number | null;
+  rpm?: number | null;
+  capacity?: number | null;
+  quota_limit?: number | null;
+  region?: string | null;
+  account_name?: string | null;
+  resource_group?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  credits_limit?: number | null;
+  credits_remaining?: number | null;
+  credits_used?: number | null;
+  credits_currency?: string | null;
+  credits_label?: string | null;
+  credits_available?: boolean;
+  error?: string | null;
+  removed?: boolean;
+  deleted_resources?: string[];
+  deleted_message?: string | null;
+  pending?: boolean;
+}
+
+export interface KimiDeleteResult {
+  ok: boolean;
+  name?: string | null;
+  account_name?: string | null;
+  resource_group?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  deleted?: string[];
+  message?: string | null;
+  error?: string | null;
+}
+
+export interface KimiDeleteResponse {
+  ok_count: number;
+  fail_count: number;
+  results: KimiDeleteResult[];
+}
+
+export interface KimiTestResult {
+  ok: boolean;
+  name?: string | null;
+  account_name?: string | null;
+  deployment_name?: string | null;
+  endpoint?: string | null;
+  latency_ms?: number | null;
+  reply?: string | null;
+  error?: string | null;
+}
+
+export interface KimiTestResponse {
+  ok_count: number;
+  fail_count: number;
+  results: KimiTestResult[];
+}
+
+export interface KimiDeployResponse {
+  ok_count: number;
+  fail_count: number;
+  results: KimiDeployResult[];
+}

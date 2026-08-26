@@ -1,5 +1,6 @@
-import { Cloud, Layers, Pencil, Plus, RefreshCw, Search, Trash2, Upload, X } from "lucide-react";
+import { Cloud, Layers, Pencil, Plus, RefreshCw, Rocket, Search, Trash2, Upload, X } from "lucide-react";
 import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 
 import AccountCard from "@/components/accounts/AccountCard";
 import AddAccountModal from "@/components/accounts/AddAccountModal";
@@ -53,6 +54,7 @@ type AccountSort =
 type GatewayFilter = "all" | "o1" | "o2" | "both" | "disabled" | "none";
 
 export default function AccountsPage() {
+  const navigate = useNavigate();
   const { data: accounts, isLoading, isError: accountsError } = useAccounts();
   const { data: groups, isLoading: isGroupsLoading, isError: groupsError } = useAccountGroups();
   const { syncAccounts, progress, isSyncing } = useSyncAccounts();
@@ -182,6 +184,9 @@ export default function AccountsPage() {
               {isSyncing && progress ? `Sync all ${progress.current}/${progress.total}` : "Sync all"}
             </Button>
           )}
+          <Button variant="secondary" onClick={() => navigate("/deploy")} className="w-full sm:w-auto">
+            <Rocket size={16} /> Deploy Kimi K3
+          </Button>
           <Button variant="secondary" onClick={() => setIsBulkOpen(true)} className="w-full sm:w-auto">
             <Upload size={16} /> Bulk upload
           </Button>

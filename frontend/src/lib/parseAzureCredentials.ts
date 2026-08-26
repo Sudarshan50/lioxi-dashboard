@@ -170,6 +170,16 @@ export interface AzureAccountImport {
   deploymentName?: string;
 }
 
+export interface AzureDeploySecret {
+  name: string;
+  accountHolder?: string;
+  tenantId: string;
+  clientId: string;
+  clientSecret: string;
+  subscriptionId: string;
+  subscriptionName?: string;
+}
+
 export function parseAzureAccountImportArray(raw: string): { accounts: AzureAccountImport[]; error?: string } {
   const trimmed = raw.trim();
   if (!trimmed) return { accounts: [], error: "Paste a JSON array of accounts." };
@@ -234,6 +244,90 @@ export function parseAzureAccountImportArray(raw: string): { accounts: AzureAcco
     });
   }
   return { accounts };
+}
+
+function parseAccountList(raw: string): { items: unknown[]; error?: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { items: [], error: "Paste a JSON array of accounts." };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return { items: [], error: "That does not look like valid JSON." };
+  }
+
+  if (Array.isArray(parsed)) {
+    if (parsed.length === 0) return { items: [], error: "The array is empty." };
+    return { items: parsed };
+  }
+
+  const wrapper = asRecord(parsed);
+  if (!wrapper) return { items: [], error: "JSON must be an array of accounts." };
+
+  for (const key of ["accounts", "items", "data"]) {
+    if (Array.isArray(wrapper[key])) {
+      if ((wrapper[key] as unknown[]).length === 0) return { items: [], error: "The array is empty." };
+      return { items: wrapper[key] as unknown[] };
+    }
+  }
+
+  if (firstString(wrapper, FIELD_ALIASES.clientId) || firstString(wrapper, ["AZURE_CLIENT_ID"])) {
+    return { items: [wrapper] };
+  }
+  return { items: [], error: "JSON must be an array of accounts." };
+}
+
+export function parseAzureDeploySecretsArray(raw: string): { accounts: AzureDeploySecret[]; error?: string } {
+  const parsed = parseAccountList(raw);
+  if (parsed.error) return { accounts: [], error: parsed.error };
+
+  const accounts: AzureDeploySecret[] = [];
+  for (let index = 0; index < parsed.items.length; index++) {
+    const record = asRecord(parsed.items[index]);
+    if (!record) return { accounts: [], error: `Entry ${index + 1} must be a JSON object.` };
+    const sources = [record];
+    for (const nestedKey of NESTED_KEYS) {
+      const nested = asRecord(record[nestedKey]);
+      if (nested) sources.push(nested);
+    }
+    const creds = credentialsFromSources(sources);
+    if (creds.missing.length > 0) {
+      const labels = creds.missing.map(
+        (key) =>
+          ({ tenantId: "AZURE_TENANT_ID", clientId: "AZURE_CLIENT_ID", clientSecret: "AZURE_CLIENT_SECRET", subscriptionId: "AZURE_SUBSCRIPTION_ID" }[key])
+      );
+      return { accounts: [], error: `Entry ${index + 1} is missing ${labels.join(", ")}.` };
+    }
+    const name = firstString(record, NAME_ALIASES);
+    const accountHolder = firstString(record, ["account_holder", "accountHolder", "email", "ACCOUNT_HOLDER"]);
+    const subscriptionName = firstString(record, ["subscription_name", "subscriptionName", "AZURE_SUBSCRIPTION_NAME"]);
+    accounts.push({
+      name: name || accountHolder || `account-${index + 1}`,
+      accountHolder: accountHolder || undefined,
+      tenantId: creds.values.tenantId,
+      clientId: creds.values.clientId,
+      clientSecret: creds.values.clientSecret,
+      subscriptionId: creds.values.subscriptionId,
+      subscriptionName: subscriptionName || undefined,
+    });
+  }
+  return { accounts };
+}
+
+export function toKimiDeployPayload(accounts: AzureDeploySecret[]): Record<string, string>[] {
+  return accounts.map((account) => {
+    const row: Record<string, string> = {
+      name: account.name,
+      AZURE_TENANT_ID: account.tenantId,
+      AZURE_CLIENT_ID: account.clientId,
+      AZURE_CLIENT_SECRET: account.clientSecret,
+      AZURE_SUBSCRIPTION_ID: account.subscriptionId,
+    };
+    if (account.accountHolder) row.account_holder = account.accountHolder;
+    if (account.subscriptionName) row.subscription_name = account.subscriptionName;
+    return row;
+  });
 }
 
 export function describeParsedCredentials(result: AzureCredentialParseResult): string {

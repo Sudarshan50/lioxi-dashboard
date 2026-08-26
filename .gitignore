@@ -11,9 +11,12 @@
 *.pfx
 credentials.json
 credentials*.json
-ritesh.json
-anubhav.json
-dhruv.json
+# Repo-root JSON is always an SP/secrets dump. Package JSON lives under frontend/.
+/*.json
+*_kimi_*.json
+*_kimi_result.json
+new_final.json
+cursor-cli-monitor-setup-prompt.md
 *.sql.gz
 *.dump
 

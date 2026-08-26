@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { BellRing, Cloud, Cpu, LayoutDashboard, LogOut, X } from "lucide-react";
+import { BellRing, Cloud, Cpu, LayoutDashboard, LogOut, Rocket, X } from "lucide-react";
 import { NavLink } from "react-router-dom";
 
 import { useAuth } from "@/context/AuthContext";
@@ -7,6 +7,7 @@ import { useAuth } from "@/context/AuthContext";
 const navItems = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
   { to: "/accounts", label: "Accounts", icon: Cloud },
+  { to: "/deploy", label: "Deploy K3", icon: Rocket },
   { to: "/models", label: "Models", icon: Cpu },
   { to: "/alerts", label: "Alerts", icon: BellRing },
 ];

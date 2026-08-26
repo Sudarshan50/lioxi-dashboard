@@ -10,7 +10,7 @@ from app.config import get_settings
 from app.database import SessionLocal, init_models
 from app.dependencies import get_sync_orchestrator
 from app.repositories.admin_repository import AdminRepository
-from app.routers import account_groups, accounts, alerts, auth, dashboard, models, registered_models
+from app.routers import account_groups, accounts, alerts, auth, dashboard, kimi_deploy, models, registered_models
 from app.services.alert_service import (
     DEFAULT_AZURE_SYNC_INTERVAL_MINUTES,
     DEFAULT_SYNC_INTERVAL_MINUTES,
@@ -89,6 +89,7 @@ app.include_router(account_groups.router)
 app.include_router(registered_models.router)
 app.include_router(models.router)
 app.include_router(dashboard.router)
+app.include_router(kimi_deploy.router)
 
 
 @app.get("/api/health")

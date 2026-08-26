@@ -14,8 +14,8 @@ class AzureTokenProvider:
     def __init__(self) -> None:
         self._cache: dict[str, tuple[str, float]] = {}
 
-    async def get_token(self, credentials: ProviderCredentials) -> str:
-        cache_key = f"{credentials.tenant_id}:{credentials.client_id}"
+    async def get_token(self, credentials: ProviderCredentials, scope: str = _SCOPE) -> str:
+        cache_key = f"{credentials.tenant_id}:{credentials.client_id}:{scope}"
         cached = self._cache.get(cache_key)
         if cached and cached[1] > time.time() + 60:
             return cached[0]
@@ -25,7 +25,7 @@ class AzureTokenProvider:
             "client_id": credentials.client_id,
             "client_secret": credentials.client_secret,
             "grant_type": "client_credentials",
-            "scope": _SCOPE,
+            "scope": scope,
         }
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(url, data=data)
