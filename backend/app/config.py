@@ -19,7 +19,8 @@ class Settings(BaseSettings):
     admin_username: str = "admin"
     admin_password: str = "change_me"
 
-    sync_interval_minutes: int = 15
+    sync_interval_minutes: int = 5
+    azure_sync_interval_minutes: int = 30
     sync_lookback_hours: int = 168
     usd_inr_rate: float | None = None
 

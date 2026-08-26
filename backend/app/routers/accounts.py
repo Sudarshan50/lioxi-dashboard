@@ -16,7 +16,12 @@ from app.schemas.account import (
     DiscoveredResourceResponse,
     SyncAllResponse,
 )
-from app.services.account_service import AccountNotFoundError, AccountService, DuplicateAccountError
+from app.services.account_service import (
+    AccountNotFoundError,
+    AccountService,
+    AccountValidationError,
+    DuplicateAccountError,
+)
 from app.services.new_api_service import NewApiError, set_gateway_status
 from app.services.sync_orchestrator import SyncOrchestrator
 
@@ -54,6 +59,8 @@ async def create_account(payload: AccountCreateRequest, service: AccountService 
         return await service.create_account(payload)
     except DuplicateAccountError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AccountValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.get("/{account_id}/deployments", response_model=list[DeploymentResponse])
@@ -86,7 +93,7 @@ async def sync_all_accounts(orchestrator: SyncOrchestrator = Depends(get_sync_or
 
 @router.post("/newapi-sync")
 async def sync_new_api_channels(orchestrator: SyncOrchestrator = Depends(get_sync_orchestrator)):
-    return await orchestrator.sync_new_api_safe()
+    return await orchestrator.sync_new_api_cycle()
 
 
 def _validate_gateway(gateway: str | None) -> str | None:
@@ -154,6 +161,8 @@ async def update_account(account_id: int, payload: AccountUpdateRequest, service
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except DuplicateAccountError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except AccountValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/{account_id}")

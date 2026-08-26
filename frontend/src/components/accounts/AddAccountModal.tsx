@@ -1,3 +1,4 @@
+import { Plus, X } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import DeploymentLinkPicker, {
@@ -6,6 +7,12 @@ import DeploymentLinkPicker, {
   matchRegisteredId,
 } from "@/components/models/DeploymentLinkPicker";
 import RegisterModelModal from "@/components/models/RegisterModelModal";
+import ManualResourceFields, {
+  emptyManualResource,
+  ManualResourceValues,
+  parseCreditGrant,
+} from "@/components/accounts/ManualResourceFields";
+import OwnerTagField from "@/components/accounts/OwnerTagField";
 import Button from "@/components/ui/Button";
 import Input from "@/components/ui/Input";
 import Modal from "@/components/ui/Modal";
@@ -21,7 +28,13 @@ interface AddAccountModalProps {
   onClose: () => void;
 }
 
-type Step = "credentials" | "select-resource";
+type Step = "credentials" | "select-resource" | "manual";
+
+interface ManualModelRow {
+  id: string;
+  deploymentName: string;
+  registeredId: string;
+}
 
 export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProps) {
   const [step, setStep] = useState<Step>("credentials");
@@ -38,6 +51,11 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
   const [deployments, setDeployments] = useState<Deployment[]>([]);
   const [deploymentLinks, setDeploymentLinks] = useState<Record<string, string>>({});
   const [registeringDeployment, setRegisteringDeployment] = useState<Deployment | null>(null);
+  const [registeringManualRowId, setRegisteringManualRowId] = useState<string | null>(null);
+  const [manual, setManual] = useState<ManualResourceValues>(emptyManualResource());
+  const [manualModels, setManualModels] = useState<ManualModelRow[]>([newManualModelRow()]);
+  const [discoveredCreditsLimit, setDiscoveredCreditsLimit] = useState("");
+  const [ownerTag, setOwnerTag] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [didSave, setDidSave] = useState(false);
 
@@ -62,6 +80,11 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
     setDeployments([]);
     setDeploymentLinks({});
     setRegisteringDeployment(null);
+    setRegisteringManualRowId(null);
+    setManual(emptyManualResource());
+    setManualModels([newManualModelRow()]);
+    setDiscoveredCreditsLimit("");
+    setOwnerTag("");
     setError(null);
     setDidSave(false);
     onClose();
@@ -96,6 +119,13 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
     return matchRegisteredId(registeredModels, modelName);
   }
 
+  const canDiscover = Boolean(name && tenantId && clientId && clientSecret && subscriptionId);
+
+  function goManual(prefill?: Partial<ManualResourceValues>) {
+    setManual((prev) => ({ ...prev, ...prefill }));
+    setStep("manual");
+  }
+
   async function handleDiscover() {
     setError(null);
     try {
@@ -106,14 +136,16 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
         subscription_id: subscriptionId,
       });
       if (found.length === 0) {
-        setError("No Cognitive Services / Foundry resources found in that subscription for this identity.");
+        setError("No Cognitive Services / Foundry resources found. Enter the resource name manually.");
+        goManual();
         return;
       }
       setResources(found);
       setSelectedResourceId(found[0].resource_id);
       setStep("select-resource");
     } catch (err: any) {
-      setError(err?.response?.data?.detail ?? "Could not authenticate with those credentials.");
+      setError(err?.response?.data?.detail ?? "Could not reach Azure. Enter the resource manually.");
+      goManual();
     }
   }
 
@@ -142,7 +174,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
         setDeploymentLinks(links);
       } catch (err: any) {
         if (!cancelled) {
-          setError(err?.response?.data?.detail ?? "Could not load deployments for this resource.");
+          setError(err?.response?.data?.detail ?? "Could not load deployments. You can add them manually after save.");
         }
       }
     })();
@@ -187,6 +219,29 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
     setDeploymentLinks((prev) => ({ ...prev, [deploymentName]: value }));
   }
 
+  function grantFrom(raw: string): number | undefined {
+    const parsed = parseCreditGrant(raw);
+    if (parsed === undefined) return undefined;
+    if (Number.isNaN(parsed)) {
+      setError("Credit grant must be a number greater than 0.");
+      return NaN;
+    }
+    return parsed;
+  }
+
+  async function saveAccount(payload: Record<string, unknown>, links: Record<string, string>) {
+    const tag = ownerTag.trim();
+    if (tag) payload.owner_tag = tag;
+    const account = await createAccount.mutateAsync(payload);
+    const failed = await linkSelectedDeployments(createModel.mutateAsync, account.id, links);
+    if (failed.length > 0) {
+      setDidSave(true);
+      setError(`Account saved, but could not link ${failed.join(", ")}. Close this and add them from Models.`);
+      return;
+    }
+    resetAndClose();
+  }
+
   async function handleConfirm() {
     setError(null);
     const resource = resources.find((r) => r.resource_id === selectedResourceId);
@@ -196,29 +251,70 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
       setError("Pick a registered model for each selected deployment, or uncheck it.");
       return;
     }
+    const creditsLimit = grantFrom(discoveredCreditsLimit);
+    if (Number.isNaN(creditsLimit)) return;
     try {
-      const account = await createAccount.mutateAsync({
-        name,
-        tenant_id: tenantId,
-        client_id: clientId,
-        client_secret: clientSecret,
-        subscription_id: subscriptionId,
-        resource_id: resource.resource_id,
-        resource_group: resource.resource_group,
-        resource_name: resource.name,
-        endpoint: resource.endpoint,
-        kind: resource.kind,
-        location: resource.location,
-      });
-      const failed = await linkSelectedDeployments(createModel.mutateAsync, account.id, deploymentLinks);
-      if (failed.length > 0) {
-        setDidSave(true);
-        setError(
-          `Account saved, but could not link ${failed.join(", ")}. Close this and add them from Models.`
-        );
+      await saveAccount(
+        {
+          name,
+          tenant_id: tenantId,
+          client_id: clientId,
+          client_secret: clientSecret,
+          subscription_id: subscriptionId,
+          resource_id: resource.resource_id,
+          resource_group: resource.resource_group,
+          resource_name: resource.name,
+          endpoint: resource.endpoint,
+          kind: resource.kind,
+          location: resource.location,
+          ...(creditsLimit ? { credits_limit: creditsLimit } : {}),
+        },
+        deploymentLinks
+      );
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Could not save this account.");
+    }
+  }
+
+  async function handleManualSave() {
+    setError(null);
+    if (!manual.resourceName.trim()) {
+      setError("Resource name is required.");
+      return;
+    }
+    const creditsLimit = grantFrom(manual.creditsLimit);
+    if (creditsLimit === undefined) {
+      setError("Set a credit grant in USD so NewAPI alerts and auto-disable have a cap.");
+      return;
+    }
+    if (Number.isNaN(creditsLimit)) return;
+    const links: Record<string, string> = {};
+    for (const row of manualModels) {
+      const deploymentName = row.deploymentName.trim();
+      if (!deploymentName && !row.registeredId) continue;
+      if (!deploymentName || !row.registeredId) {
+        setError("Each model row needs a deployment name and a registered model, or leave the row empty.");
         return;
       }
-      resetAndClose();
+      links[deploymentName] = row.registeredId;
+    }
+    try {
+      await saveAccount(
+        {
+          name,
+          tenant_id: tenantId,
+          client_id: clientId,
+          client_secret: clientSecret,
+          subscription_id: subscriptionId,
+          resource_name: manual.resourceName.trim(),
+          resource_group: manual.resourceGroup.trim(),
+          endpoint: manual.endpoint.trim(),
+          kind: manual.kind,
+          location: manual.location.trim(),
+          credits_limit: creditsLimit,
+        },
+        links
+      );
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? "Could not save this account.");
     }
@@ -231,7 +327,13 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
       <Modal title="Add Azure account" isOpen={isOpen} onClose={resetAndClose} widthClassName="max-w-xl">
         {step === "credentials" && (
           <div className="flex flex-col gap-4">
-            <Input label="Account name" placeholder="e.g. Production - East US" value={name} onChange={(e) => setName(e.target.value)} />
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <Input label="Account name" placeholder="e.g. Production - East US" value={name} onChange={(e) => setName(e.target.value)} />
+              <OwnerTagField value={ownerTag} onChange={setOwnerTag} id="add-account-owner-tag" compact />
+            </div>
+            <p className="-mt-2 text-xs text-gray-500">
+              Name tag is the person this account belongs to. Pick an existing name or type a new one.
+            </p>
             <div className="flex flex-col gap-1.5">
               <label className="text-xs font-medium text-gray-400">Paste credentials JSON</label>
               <textarea
@@ -263,18 +365,18 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
             <Input label="Client secret" type="password" value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} />
             <Input label="Subscription ID" value={subscriptionId} onChange={(e) => setSubscriptionId(e.target.value)} />
             <p className="text-xs text-gray-500">
-              Use a read-only service principal with Reader, Monitoring Reader, Cost Management Reader, Cognitive
-              Services Usages Reader, and Billing Reader so remaining credits can be loaded. It is stored encrypted
-              and is never used to call your models.
+              Discover tries Azure first. If campus ARM is blocked, enter the resource name, deployment, and credit
+              grant manually so NewAPI alerts still work.
             </p>
             {error && <p className="break-words text-xs text-red-400">{error}</p>}
-            <Button
-              onClick={handleDiscover}
-              isLoading={discover.isPending}
-              disabled={!name || !tenantId || !clientId || !clientSecret || !subscriptionId}
-            >
-              Discover resources
-            </Button>
+            <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+              <Button variant="secondary" onClick={() => goManual()} disabled={!canDiscover}>
+                Enter manually
+              </Button>
+              <Button onClick={handleDiscover} isLoading={discover.isPending} disabled={!canDiscover}>
+                Discover resources
+              </Button>
+            </div>
           </div>
         )}
 
@@ -287,6 +389,17 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
                 </option>
               ))}
             </Select>
+
+            <Input
+              label="Credit grant (USD, optional)"
+              type="number"
+              min={0}
+              step="1"
+              placeholder="Leave blank to use Azure credits when they load"
+              value={discoveredCreditsLimit}
+              onChange={(e) => setDiscoveredCreditsLimit(e.target.value)}
+            />
+            <OwnerTagField value={ownerTag} onChange={setOwnerTag} id="add-account-owner-tag-resource" compact />
 
             <DeploymentLinkPicker
               deployments={deployments}
@@ -302,11 +415,95 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
               <Button variant="secondary" onClick={() => setStep("credentials")}>
                 Back
               </Button>
+              <div className="flex gap-2">
+                <Button variant="secondary" onClick={() => goManual({ resourceName: resources[0]?.name ?? "" })}>
+                  Enter manually
+                </Button>
+                <Button
+                  onClick={didSave ? resetAndClose : handleConfirm}
+                  isLoading={isSaving}
+                  disabled={!didSave && discoverDeployments.isPending}
+                >
+                  {didSave ? "Close" : "Save account"}
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {step === "manual" && (
+          <div className="flex flex-col gap-4">
+            <ManualResourceFields values={manual} onChange={(patch) => setManual((prev) => ({ ...prev, ...patch }))} />
+            <OwnerTagField value={ownerTag} onChange={setOwnerTag} id="add-account-owner-tag-manual" compact />
+            <div className="flex flex-col gap-2">
+              <label className="text-xs font-medium text-gray-400">Models / deployments</label>
+              {manualModels.map((row) => (
+                <div key={row.id} className="flex flex-col gap-2 rounded-lg border border-surface-border p-3 sm:flex-row sm:items-end">
+                  <Input
+                    label="Deployment name"
+                    placeholder="e.g. FW-Kimi-K3"
+                    value={row.deploymentName}
+                    onChange={(e) =>
+                      setManualModels((prev) =>
+                        prev.map((item) => (item.id === row.id ? { ...item, deploymentName: e.target.value } : item))
+                      )
+                    }
+                  />
+                  <Select
+                    label="Registered model"
+                    value={row.registeredId}
+                    onChange={(e) => {
+                      if (e.target.value === REGISTER_NEW) {
+                        setRegisteringManualRowId(row.id);
+                        setRegisteringDeployment({
+                          name: row.deploymentName || "deployment",
+                          model_name: row.deploymentName,
+                          model_version: "",
+                          sku: "",
+                          capacity: 0,
+                        });
+                        return;
+                      }
+                      setManualModels((prev) =>
+                        prev.map((item) => (item.id === row.id ? { ...item, registeredId: e.target.value } : item))
+                      );
+                    }}
+                  >
+                    <option value="">Select a registered model</option>
+                    {(registeredModels ?? []).map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.name}
+                      </option>
+                    ))}
+                    <option value={REGISTER_NEW}>+ Register a new model...</option>
+                  </Select>
+                  {manualModels.length > 1 && (
+                    <button
+                      type="button"
+                      onClick={() => setManualModels((prev) => prev.filter((item) => item.id !== row.id))}
+                      className="mb-2 self-end text-gray-500 hover:text-gray-300"
+                      aria-label="Remove model row"
+                    >
+                      <X size={16} />
+                    </button>
+                  )}
+                </div>
+              ))}
               <Button
-                onClick={didSave ? resetAndClose : handleConfirm}
-                isLoading={isSaving}
-                disabled={!didSave && discoverDeployments.isPending}
+                variant="ghost"
+                className="self-start px-2 py-1 text-xs"
+                onClick={() => setManualModels((prev) => [...prev, newManualModelRow()])}
               >
+                <Plus size={14} /> Add another model
+              </Button>
+              <p className="text-xs text-gray-500">Models are optional here — you can also add them later from Models.</p>
+            </div>
+            {error && <p className="break-words text-xs text-red-400">{error}</p>}
+            <div className="flex justify-between gap-3">
+              <Button variant="secondary" onClick={() => setStep("credentials")}>
+                Back
+              </Button>
+              <Button onClick={didSave ? resetAndClose : handleManualSave} isLoading={isSaving} disabled={!canDiscover}>
                 {didSave ? "Close" : "Save account"}
               </Button>
             </div>
@@ -316,13 +513,26 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
 
       <RegisterModelModal
         isOpen={registeringDeployment !== null}
-        onClose={() => setRegisteringDeployment(null)}
+        onClose={() => {
+          setRegisteringDeployment(null);
+          setRegisteringManualRowId(null);
+        }}
         initialName={registeringDeployment?.model_name}
         onRegistered={(id) => {
+          if (registeringManualRowId) {
+            setManualModels((prev) =>
+              prev.map((item) => (item.id === registeringManualRowId ? { ...item, registeredId: String(id) } : item))
+            );
+            return;
+          }
           if (!registeringDeployment) return;
           setDeploymentLinks((prev) => ({ ...prev, [registeringDeployment.name]: String(id) }));
         }}
       />
     </>
   );
+}
+
+function newManualModelRow(): ManualModelRow {
+  return { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, deploymentName: "", registeredId: "" };
 }

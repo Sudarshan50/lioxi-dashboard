@@ -7,6 +7,12 @@ import DeploymentLinkPicker, {
   matchRegisteredId,
 } from "@/components/models/DeploymentLinkPicker";
 import RegisterModelModal from "@/components/models/RegisterModelModal";
+import ManualResourceFields, {
+  emptyManualResource,
+  ManualResourceValues,
+  parseCreditGrant,
+} from "@/components/accounts/ManualResourceFields";
+import OwnerTagField from "@/components/accounts/OwnerTagField";
 import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
@@ -41,6 +47,7 @@ export default function AccountCard({ account }: { account: Account }) {
   const [testResult, setTestResult] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [nameDraft, setNameDraft] = useState(account.name);
+  const [ownerTagDraft, setOwnerTagDraft] = useState(account.owner_tag ?? "");
   const [resources, setResources] = useState<DiscoveredResource[]>([]);
   const [selectedResourceId, setSelectedResourceId] = useState(account.resource_id);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -49,6 +56,16 @@ export default function AccountCard({ account }: { account: Account }) {
   const [error, setError] = useState<string | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [pendingPortal, setPendingPortal] = useState<string | null>(null);
+  const [creditsLimitDraft, setCreditsLimitDraft] = useState(
+    account.credits_limit != null ? String(account.credits_limit) : ""
+  );
+  const [manual, setManual] = useState<ManualResourceValues>(
+    emptyManualResource(account.credits_limit != null ? String(account.credits_limit) : "")
+  );
+  const [useManualResource, setUseManualResource] = useState(false);
+  const [keepManualGrant, setKeepManualGrant] = useState(Boolean(account.credits_limit_manual));
+  const [manualDeploymentName, setManualDeploymentName] = useState("");
+  const [manualRegisteredId, setManualRegisteredId] = useState("");
 
   const portals = useMemo(
     () => (account.new_api_gateway ?? "").split("+").filter((p): p is "O1" | "O2" => p === "O1" || p === "O2"),
@@ -122,32 +139,68 @@ export default function AccountCard({ account }: { account: Account }) {
     setRegisteringDeployment(null);
     setError(null);
     setModelsLoading(false);
+    setKeepManualGrant(Boolean(account.credits_limit_manual));
+    setManualDeploymentName("");
+    setManualRegisteredId("");
+  }
+
+  async function retryDiscover() {
+    setError(null);
+    setModelsLoading(true);
+    try {
+      const found = await discover.mutateAsync(account.id);
+      setResources(found);
+      if (found.length === 0) {
+        setUseManualResource(true);
+        setError("Azure listed no resources. Keep the manual resource, or retry when ARM is reachable.");
+        setModelsLoading(false);
+        return false;
+      }
+      const resourceId = found.some((resource) => resource.resource_id === account.resource_id)
+        ? account.resource_id
+        : found.some((resource) => resource.name === account.resource_name)
+          ? found.find((resource) => resource.name === account.resource_name)!.resource_id
+          : found[0].resource_id;
+      setSelectedResourceId(resourceId);
+      setUseManualResource(false);
+      setKeepManualGrant(false);
+      return true;
+    } catch (err: any) {
+      setUseManualResource(true);
+      setModelsLoading(false);
+      setError(err?.response?.data?.detail ?? "Could not discover resources. Edit them manually, or retry when Azure is reachable.");
+      return false;
+    }
   }
 
   async function startEditing() {
     setNameDraft(account.name);
+    setOwnerTagDraft(account.owner_tag ?? "");
     setSelectedResourceId(account.resource_id);
+    setCreditsLimitDraft(account.credits_limit != null ? String(account.credits_limit) : "");
+    setManual({
+      resourceName: account.resource_name,
+      resourceGroup: account.resource_group === "manual" ? "" : account.resource_group,
+      location: account.location,
+      kind: account.kind || "AIServices",
+      endpoint: account.endpoint,
+      creditsLimit: account.credits_limit != null ? String(account.credits_limit) : "",
+    });
+    setKeepManualGrant(Boolean(account.credits_limit_manual));
+    setManualDeploymentName("");
+    setManualRegisteredId("");
+    setUseManualResource(false);
     setResources([]);
     setDeployments([]);
     setDeploymentLinks({});
     setRegisteringDeployment(null);
     setError(null);
-    setModelsLoading(true);
     setIsEditing(true);
-    try {
-      const found = await discover.mutateAsync(account.id);
-      setResources(found);
-      const resourceId = found.some((resource) => resource.resource_id === account.resource_id)
-        ? account.resource_id
-        : found[0]?.resource_id ?? account.resource_id;
-      setSelectedResourceId(resourceId);
-    } catch (err: any) {
-      setError(err?.response?.data?.detail ?? "Could not discover resources for this account.");
-    }
+    await retryDiscover();
   }
 
   useEffect(() => {
-    if (!isEditing || !selectedResourceId || discover.isPending) return;
+    if (!isEditing || useManualResource || !selectedResourceId || discover.isPending) return;
     let cancelled = false;
     setModelsLoading(true);
     setDeployments([]);
@@ -171,7 +224,7 @@ export default function AccountCard({ account }: { account: Account }) {
     return () => {
       cancelled = true;
     };
-  }, [isEditing, selectedResourceId, account.id, discover.isPending]);
+  }, [isEditing, selectedResourceId, account.id, discover.isPending, useManualResource]);
 
   useEffect(() => {
     if (!isEditing || modelsLoading || deployments.length === 0) return;
@@ -227,11 +280,6 @@ export default function AccountCard({ account }: { account: Account }) {
       setError("Account name is required.");
       return;
     }
-    const incomplete = Object.entries(deploymentLinks).filter(([, registeredId]) => !registeredId);
-    if (incomplete.length > 0) {
-      setError("Pick a registered model for each selected deployment, or uncheck it.");
-      return;
-    }
     const resource = resources.find((r) => r.resource_id === selectedResourceId);
     const payload: {
       name?: string;
@@ -241,18 +289,75 @@ export default function AccountCard({ account }: { account: Account }) {
       endpoint?: string;
       kind?: string;
       location?: string;
+      credits_limit?: number;
+      credits_limit_manual?: boolean;
+      owner_tag?: string;
     } = {};
     if (trimmed !== account.name) payload.name = trimmed;
-    if (resource && resource.resource_id !== account.resource_id) {
-      payload.resource_id = resource.resource_id;
-      payload.resource_group = resource.resource_group;
-      payload.resource_name = resource.name;
-      payload.endpoint = resource.endpoint;
-      payload.kind = resource.kind;
-      payload.location = resource.location;
+    const nextTag = ownerTagDraft.trim();
+    const prevTag = (account.owner_tag ?? "").trim();
+    if (nextTag !== prevTag) payload.owner_tag = nextTag;
+    if (useManualResource) {
+      if (!manual.resourceName.trim()) {
+        setError("Resource name is required.");
+        return;
+      }
+      payload.resource_name = manual.resourceName.trim();
+      payload.resource_group = manual.resourceGroup.trim();
+      payload.endpoint = manual.endpoint.trim();
+      payload.kind = manual.kind;
+      payload.location = manual.location.trim();
+      payload.resource_id = "";
+    } else if (resource) {
+      const sameResource =
+        resource.resource_id === account.resource_id &&
+        resource.resource_group === account.resource_group &&
+        resource.name === account.resource_name &&
+        resource.endpoint === account.endpoint &&
+        resource.kind === account.kind &&
+        resource.location === account.location;
+      if (!sameResource) {
+        payload.resource_id = resource.resource_id;
+        payload.resource_group = resource.resource_group;
+        payload.resource_name = resource.name;
+        payload.endpoint = resource.endpoint;
+        payload.kind = resource.kind;
+        payload.location = resource.location;
+      }
+    }
+    const grantRaw = useManualResource ? manual.creditsLimit : creditsLimitDraft;
+    const grant = parseCreditGrant(grantRaw);
+    if (Number.isNaN(grant)) {
+      setError("Credit grant must be a number greater than 0.");
+      return;
+    }
+    if (useManualResource) {
+      if (grant == null) {
+        setError("Set a credit grant in USD so alerts keep a cap until Azure credits load.");
+        return;
+      }
+      if (grant !== account.credits_limit) payload.credits_limit = grant;
+      payload.credits_limit_manual = true;
+    } else if (keepManualGrant) {
+      if (grant != null && grant !== account.credits_limit) payload.credits_limit = grant;
+      payload.credits_limit_manual = true;
+    } else if (account.credits_limit_manual) {
+      payload.credits_limit_manual = false;
+      if (grant != null && grant !== account.credits_limit) payload.credits_limit = grant;
+    } else if (grant != null && grant !== account.credits_limit) {
+      payload.credits_limit = grant;
+    }
+    const links = { ...deploymentLinks };
+    if (manualDeploymentName.trim() && manualRegisteredId) {
+      links[manualDeploymentName.trim()] = manualRegisteredId;
+    }
+    const incompleteLinks = Object.entries(links).filter(([, registeredId]) => !registeredId);
+    if (incompleteLinks.length > 0) {
+      setError("Pick a registered model for each selected deployment, or uncheck it.");
+      return;
     }
     const hasAccountChanges = Object.keys(payload).length > 0;
-    const hasNewLinks = Object.keys(deploymentLinks).length > 0;
+    const hasNewLinks = Object.keys(links).length > 0;
     if (!hasAccountChanges && !hasNewLinks) {
       cancelEditing();
       return;
@@ -263,11 +368,14 @@ export default function AccountCard({ account }: { account: Account }) {
         await updateAccount.mutateAsync({ accountId: account.id, ...payload });
       }
       if (hasNewLinks) {
-        const failed = await linkSelectedDeployments(createModel.mutateAsync, account.id, deploymentLinks);
+        const failed = await linkSelectedDeployments(createModel.mutateAsync, account.id, links);
         if (failed.length > 0) {
           setError(`Account saved, but could not link ${failed.join(", ")}.`);
           return;
         }
+      }
+      if (!useManualResource) {
+        await syncAccount.mutateAsync(account.id).catch(() => undefined);
       }
       cancelEditing();
     } catch (err: any) {
@@ -276,7 +384,7 @@ export default function AccountCard({ account }: { account: Account }) {
   }
 
   const statusTone = account.last_sync_status === "success" ? "success" : account.last_sync_status === "error" ? "error" : "neutral";
-  const isSaving = updateAccount.isPending || createModel.isPending;
+  const isSaving = updateAccount.isPending || createModel.isPending || syncAccount.isPending;
   const isDiscovering = discover.isPending || modelsLoading || discoverDeployments.isPending;
 
   return (
@@ -298,7 +406,7 @@ export default function AccountCard({ account }: { account: Account }) {
                 <button
                   type="button"
                   onClick={handleSave}
-                  disabled={isSaving || isDiscovering}
+                  disabled={isSaving}
                   className="text-emerald-400 hover:text-emerald-300 disabled:opacity-60"
                   aria-label="Save account"
                 >
@@ -308,56 +416,155 @@ export default function AccountCard({ account }: { account: Account }) {
                   <X size={16} />
                 </button>
               </div>
+              <OwnerTagField value={ownerTagDraft} onChange={setOwnerTagDraft} id={`edit-owner-tag-${account.id}`} compact />
               <div className="flex items-end gap-3">
                 <div className="min-w-0 flex-1">
-                  <Select
-                    label="Resource"
-                    value={selectedResourceId}
-                    onChange={(e) => handleResourceChange(e.target.value)}
-                    disabled={discover.isPending || resources.length === 0}
-                  >
-                    {resources.length === 0 ? (
-                      <option value={account.resource_id}>
-                        {account.resource_name} ({account.kind}, {account.location})
-                      </option>
-                    ) : (
-                      resources.map((resource) => (
-                        <option key={resource.resource_id} value={resource.resource_id}>
-                          {resource.name} ({resource.kind}, {resource.location})
+                  {!useManualResource ? (
+                    <Select
+                      label="Resource"
+                      value={selectedResourceId}
+                      onChange={(e) => handleResourceChange(e.target.value)}
+                      disabled={discover.isPending || resources.length === 0}
+                    >
+                      {resources.length === 0 ? (
+                        <option value={account.resource_id}>
+                          {account.resource_name} ({account.kind}, {account.location})
                         </option>
-                      ))
-                    )}
+                      ) : (
+                        resources.map((resource) => (
+                          <option key={resource.resource_id} value={resource.resource_id}>
+                            {resource.name} ({resource.kind}, {resource.location})
+                          </option>
+                        ))
+                      )}
+                    </Select>
+                  ) : (
+                    <ManualResourceFields values={manual} onChange={(patch) => setManual((prev) => ({ ...prev, ...patch }))} />
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => void retryDiscover()}
+                  disabled={isDiscovering}
+                  className="mb-1.5 shrink-0 text-gray-500 hover:text-gray-200 disabled:opacity-50"
+                  aria-label="Retry Azure discover"
+                  title="Retry Azure discover"
+                >
+                  {isDiscovering ? <Spinner className="h-4 w-4" /> : <RefreshCw size={16} />}
+                </button>
+              </div>
+              {!useManualResource && (
+                <>
+                  <Input
+                    label="Credit grant (USD)"
+                    type="number"
+                    min={0}
+                    step="1"
+                    placeholder="e.g. 1000"
+                    value={creditsLimitDraft}
+                    onChange={(e) => setCreditsLimitDraft(e.target.value)}
+                  />
+                  <label className="flex items-start gap-2 text-xs text-gray-400">
+                    <input
+                      type="checkbox"
+                      checked={keepManualGrant}
+                      onChange={(e) => setKeepManualGrant(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-surface-border bg-surface text-accent focus:ring-accent"
+                    />
+                    <span>
+                      Keep this grant for alerts. Uncheck so the next Azure sync replaces it with live credits.
+                    </span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setUseManualResource(true)}
+                    className="self-start text-xs text-gray-400 hover:text-gray-200"
+                  >
+                    Enter resource manually
+                  </button>
+                </>
+              )}
+              {useManualResource && (
+                <button
+                  type="button"
+                  onClick={() => void retryDiscover()}
+                  className="self-start text-xs text-gray-400 hover:text-gray-200"
+                >
+                  Retry Azure discover
+                </button>
+              )}
+              {!useManualResource && (
+                <DeploymentLinkPicker
+                  deployments={deployments}
+                  isLoading={discover.isPending || modelsLoading || discoverDeployments.isPending}
+                  alreadyLinked={alreadyLinked}
+                  registeredModels={registeredModels}
+                  links={deploymentLinks}
+                  onToggle={toggleDeployment}
+                  onRegisteredChange={handleRegisteredChange}
+                />
+              )}
+              {(useManualResource || deployments.length === 0) && (
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <Input
+                    label="Deployment name (manual)"
+                    placeholder="e.g. FW-Kimi-K3"
+                    value={manualDeploymentName}
+                    onChange={(e) => setManualDeploymentName(e.target.value)}
+                  />
+                  <Select
+                    label="Registered model"
+                    value={manualRegisteredId}
+                    onChange={(e) => {
+                      if (e.target.value === REGISTER_NEW) {
+                        setRegisteringDeployment({
+                          name: manualDeploymentName || "deployment",
+                          model_name: manualDeploymentName,
+                          model_version: "",
+                          sku: "",
+                          capacity: 0,
+                        });
+                        return;
+                      }
+                      setManualRegisteredId(e.target.value);
+                    }}
+                  >
+                    <option value="">Select a registered model</option>
+                    {(registeredModels ?? []).map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.name}
+                      </option>
+                    ))}
+                    <option value={REGISTER_NEW}>+ Register a new model...</option>
                   </Select>
                 </div>
-                {discover.isPending && <Spinner className="mb-1.5 shrink-0" />}
-              </div>
-              <DeploymentLinkPicker
-                deployments={deployments}
-                isLoading={discover.isPending || modelsLoading || discoverDeployments.isPending}
-                alreadyLinked={alreadyLinked}
-                registeredModels={registeredModels}
-                links={deploymentLinks}
-                onToggle={toggleDeployment}
-                onRegisteredChange={handleRegisteredChange}
-              />
+              )}
               {error && <p className="break-words text-xs text-red-400">{error}</p>}
             </div>
           ) : (
             <div className="min-w-0">
               <div className="flex min-w-0 items-center gap-1.5">
                 <p className="truncate font-medium text-gray-100">{account.name}</p>
+                {account.owner_tag && (
+                  <Badge tone="info" className="max-w-[8rem] shrink-0 truncate" title="Tag">
+                    {account.owner_tag}
+                  </Badge>
+                )}
                 <button type="button" onClick={startEditing} className="text-gray-600 hover:text-gray-300" aria-label="Edit account">
                   <Pencil size={12} />
                 </button>
               </div>
+              {account.new_api_name && (
+                <p className="truncate text-[11px] text-gray-400" title="NewAPI channel">
+                  {account.new_api_name}
+                </p>
+              )}
               <p className="truncate text-xs text-gray-500">
                 {account.resource_name} - {account.location}
+                {account.credits_limit_manual ? " · manual grant" : ""}
               </p>
-              {account.new_api_name && (
+              {(portals.length > 0 || (account.new_api_status != null && account.new_api_status !== 1)) && (
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                  <Badge tone="info" className="max-w-full truncate">
-                    {account.new_api_name}
-                  </Badge>
                   {account.new_api_status != null && account.new_api_status !== 1 && (
                     <Badge tone="warning">gateway disabled</Badge>
                   )}
@@ -472,7 +679,11 @@ export default function AccountCard({ account }: { account: Account }) {
         initialName={registeringDeployment?.model_name}
         onRegistered={(id) => {
           if (!registeringDeployment) return;
-          setDeploymentLinks((prev) => ({ ...prev, [registeringDeployment.name]: String(id) }));
+          if (deployments.some((item) => item.name === registeringDeployment.name)) {
+            setDeploymentLinks((prev) => ({ ...prev, [registeringDeployment.name]: String(id) }));
+          } else {
+            setManualRegisteredId(String(id));
+          }
         }}
       />
     </>

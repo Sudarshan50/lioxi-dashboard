@@ -8,6 +8,7 @@ import DeploymentLinkPicker, {
 } from "@/components/models/DeploymentLinkPicker";
 import RegisterModelModal from "@/components/models/RegisterModelModal";
 import Button from "@/components/ui/Button";
+import Input from "@/components/ui/Input";
 import Modal from "@/components/ui/Modal";
 import Select from "@/components/ui/Select";
 import Spinner from "@/components/ui/Spinner";
@@ -15,6 +16,8 @@ import { useAccounts, useCreateAccount, useDiscoverDeployments, useDiscoverResou
 import { useCreateModel } from "@/hooks/useModels";
 import { useRegisteredModels } from "@/hooks/useRegisteredModels";
 import { AzureAccountImport, parseAzureAccountImportArray } from "@/lib/parseAzureCredentials";
+import { parseCreditGrant } from "@/components/accounts/ManualResourceFields";
+import OwnerTagField from "@/components/accounts/OwnerTagField";
 import { Deployment, DiscoveredResource } from "@/types";
 
 interface BulkUploadAccountsModalProps {
@@ -39,6 +42,12 @@ interface ImportRow {
   resourcesLoading: boolean;
   deploymentsLoading: boolean;
   error: string | null;
+  resourceName: string;
+  location: string;
+  creditsLimit: string;
+  deploymentName: string;
+  registeredId: string;
+  ownerTag: string;
 }
 
 export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadAccountsModalProps) {
@@ -149,8 +158,8 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
           resources: [],
           selectedResourceId: "",
           resourcesLoading: false,
-          included: false,
-          error: "No Cognitive Services / Foundry resources found for this identity.",
+          included: true,
+          error: "Azure listed no resources. Enter resource name, model, and credit grant below.",
         });
         return;
       }
@@ -162,8 +171,8 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
     } catch (err: any) {
       patchRow(row.id, {
         resourcesLoading: false,
-        included: false,
-        error: err?.response?.data?.detail ?? "Could not authenticate with those credentials.",
+        included: true,
+        error: err?.response?.data?.detail ?? "Could not reach Azure. Enter resource name, model, and credit grant below.",
       });
     }
   }
@@ -207,9 +216,16 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
       return;
     }
     for (const row of selected) {
-      if (!row.selectedResourceId) {
-        setError(`Pick a resource for "${row.name}".`);
+      if (!row.selectedResourceId && !row.resourceName.trim()) {
+        setError(`Pick a resource or enter a resource name for "${row.name}".`);
         return;
+      }
+      if (!row.selectedResourceId) {
+        const grant = parseCreditGrant(row.creditsLimit);
+        if (grant == null || Number.isNaN(grant)) {
+          setError(`Set a credit grant in USD for "${row.name}" so alerts can run without Azure credits.`);
+          return;
+        }
       }
       const incomplete = Object.entries(row.deploymentLinks).filter(([, registeredId]) => !registeredId);
       if (incomplete.length > 0) {
@@ -225,25 +241,38 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
         const row = selected[index];
         setSaveProgress({ current: index + 1, total: selected.length });
         const resource = row.resources.find((item) => item.resource_id === row.selectedResourceId);
-        if (!resource) {
-          failed.push(row.name);
+        const grant = parseCreditGrant(row.creditsLimit);
+        if (grant != null && Number.isNaN(grant)) {
+          failed.push(`${row.name}: invalid credit grant`);
           continue;
         }
+        const payload: Record<string, unknown> = {
+          name: row.name,
+          tenant_id: row.tenantId,
+          client_id: row.clientId,
+          client_secret: row.clientSecret,
+          subscription_id: row.subscriptionId,
+        };
+        if (resource) {
+          payload.resource_id = resource.resource_id;
+          payload.resource_group = resource.resource_group;
+          payload.resource_name = resource.name;
+          payload.endpoint = resource.endpoint;
+          payload.kind = resource.kind;
+          payload.location = resource.location;
+        } else {
+          payload.resource_name = row.resourceName.trim();
+          payload.location = row.location.trim();
+        }
+        if (grant) payload.credits_limit = grant;
+        if (row.ownerTag.trim()) payload.owner_tag = row.ownerTag.trim();
         try {
-          const account = await createAccount.mutateAsync({
-            name: row.name,
-            tenant_id: row.tenantId,
-            client_id: row.clientId,
-            client_secret: row.clientSecret,
-            subscription_id: row.subscriptionId,
-            resource_id: resource.resource_id,
-            resource_group: resource.resource_group,
-            resource_name: resource.name,
-            endpoint: resource.endpoint,
-            kind: resource.kind,
-            location: resource.location,
-          });
-          const linkFailed = await linkSelectedDeployments(createModel.mutateAsync, account.id, row.deploymentLinks);
+          const account = await createAccount.mutateAsync(payload);
+          const links = { ...row.deploymentLinks };
+          if (row.deploymentName.trim() && row.registeredId) {
+            links[row.deploymentName.trim()] = row.registeredId;
+          }
+          const linkFailed = await linkSelectedDeployments(createModel.mutateAsync, account.id, links);
           if (linkFailed.length > 0) {
             failed.push(`${row.name} (models: ${linkFailed.join(", ")})`);
           }
@@ -324,6 +353,12 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
                     />
                   </div>
                   <div className="mt-3 flex flex-col gap-3 pl-6">
+                    <OwnerTagField
+                      value={row.ownerTag}
+                      onChange={(value) => patchRow(row.id, { ownerTag: value })}
+                      id={`bulk-owner-tag-${row.id}`}
+                      compact
+                    />
                     <div className="flex flex-col gap-1.5">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-xs font-medium text-gray-400">Resource</span>
@@ -339,7 +374,7 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
                         disabled={row.resourcesLoading || row.resources.length === 0}
                       >
                         {row.resources.length === 0 ? (
-                          <option value="">{row.resourcesLoading ? "Discovering resources..." : "No resources found"}</option>
+                          <option value="">{row.resourcesLoading ? "Discovering resources..." : "No resources found — enter manually"}</option>
                         ) : (
                           row.resources.map((resource) => (
                             <option key={resource.resource_id} value={resource.resource_id}>
@@ -349,6 +384,78 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
                         )}
                       </Select>
                     </div>
+                    {row.resources.length === 0 && !row.resourcesLoading && (
+                      <div className="flex flex-col gap-3">
+                        <Input
+                          label="Resource name"
+                          placeholder="e.g. surai-mt700glk-northcentralus"
+                          value={row.resourceName}
+                          onChange={(e) => patchRow(row.id, { resourceName: e.target.value, included: true })}
+                        />
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          <Input
+                            label="Location"
+                            placeholder="e.g. northcentralus"
+                            value={row.location}
+                            onChange={(e) => patchRow(row.id, { location: e.target.value })}
+                          />
+                          <Input
+                            label="Credit grant (USD)"
+                            type="number"
+                            min={0}
+                            placeholder="e.g. 1000"
+                            value={row.creditsLimit}
+                            onChange={(e) => patchRow(row.id, { creditsLimit: e.target.value })}
+                          />
+                        </div>
+                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                          <Input
+                            label="Deployment name"
+                            placeholder="e.g. FW-Kimi-K3"
+                            value={row.deploymentName}
+                            onChange={(e) => patchRow(row.id, { deploymentName: e.target.value })}
+                          />
+                          <Select
+                            label="Registered model"
+                            value={row.registeredId}
+                            onChange={(e) => {
+                              if (e.target.value === REGISTER_NEW) {
+                                setRegistering({
+                                  rowId: row.id,
+                                  deployment: {
+                                    name: row.deploymentName || "deployment",
+                                    model_name: row.deploymentName,
+                                    model_version: "",
+                                    sku: "",
+                                    capacity: 0,
+                                  },
+                                });
+                                return;
+                              }
+                              patchRow(row.id, { registeredId: e.target.value });
+                            }}
+                          >
+                            <option value="">Select a registered model</option>
+                            {(registeredModels ?? []).map((model) => (
+                              <option key={model.id} value={model.id}>
+                                {model.name}
+                              </option>
+                            ))}
+                            <option value={REGISTER_NEW}>+ Register a new model...</option>
+                          </Select>
+                        </div>
+                      </div>
+                    )}
+                    {row.resources.length > 0 && (
+                      <Input
+                        label="Credit grant (USD, optional)"
+                        type="number"
+                        min={0}
+                        placeholder="Leave blank to use Azure credits"
+                        value={row.creditsLimit}
+                        onChange={(e) => patchRow(row.id, { creditsLimit: e.target.value })}
+                      />
+                    )}
                     <DeploymentLinkPicker
                       deployments={row.deployments}
                       isLoading={row.resourcesLoading || row.deploymentsLoading}
@@ -398,9 +505,14 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
         initialName={registering?.deployment.model_name}
         onRegistered={(id) => {
           if (!registering) return;
-          patchRow(registering.rowId, (current) => ({
-            deploymentLinks: { ...current.deploymentLinks, [registering.deployment.name]: String(id) },
-          }));
+          patchRow(registering.rowId, (current) => {
+            if (current.deployments.some((item) => item.name === registering.deployment.name)) {
+              return {
+                deploymentLinks: { ...current.deploymentLinks, [registering.deployment.name]: String(id) },
+              };
+            }
+            return { registeredId: String(id) };
+          });
         }}
       />
     </>
@@ -445,5 +557,11 @@ function toRow(account: AzureAccountImport, index: number): ImportRow {
     resourcesLoading: true,
     deploymentsLoading: false,
     error: null,
+    resourceName: account.resourceName ?? "",
+    location: account.location ?? "",
+    creditsLimit: account.creditsLimit != null ? String(account.creditsLimit) : "",
+    deploymentName: account.deploymentName ?? "",
+    registeredId: "",
+    ownerTag: "",
   };
 }

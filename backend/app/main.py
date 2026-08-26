@@ -1,6 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager, suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import FastAPI
@@ -11,7 +11,14 @@ from app.database import SessionLocal, init_models
 from app.dependencies import get_sync_orchestrator
 from app.repositories.admin_repository import AdminRepository
 from app.routers import account_groups, accounts, alerts, auth, dashboard, models, registered_models
+from app.services.alert_service import (
+    DEFAULT_AZURE_SYNC_INTERVAL_MINUTES,
+    DEFAULT_SYNC_INTERVAL_MINUTES,
+    get_alert_config,
+)
 from app.services.bootstrap import ensure_admin_seeded
+from app.services.owner_tag import apply_owner_tags
+from app.services.sync_scheduler import AZURE_JOB_ID, NEWAPI_JOB_ID, bind_scheduler
 from app.services.telegram_bot import run_bot_polling
 
 scheduler = AsyncIOScheduler()
@@ -24,14 +31,32 @@ async def lifespan(app: FastAPI):
 
     async with SessionLocal() as session:
         await ensure_admin_seeded(AdminRepository(session), settings.admin_username, settings.admin_password)
+        await apply_owner_tags(session)
+        config = await get_alert_config(session)
+    newapi_minutes = int(config.get("sync_interval_minutes") or DEFAULT_SYNC_INTERVAL_MINUTES)
+    azure_minutes = int(
+        config.get("azure_sync_interval_minutes")
+        or settings.azure_sync_interval_minutes
+        or DEFAULT_AZURE_SYNC_INTERVAL_MINUTES
+    )
 
     orchestrator = get_sync_orchestrator()
+    bind_scheduler(scheduler)
     scheduler.add_job(
-        orchestrator.sync_all,
+        orchestrator.sync_new_api_cycle,
         "interval",
-        minutes=settings.sync_interval_minutes,
+        minutes=newapi_minutes,
         next_run_time=datetime.now(),
-        id="sync_all_accounts",
+        id=NEWAPI_JOB_ID,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        orchestrator.sync_azure_all,
+        "interval",
+        minutes=azure_minutes,
+        next_run_time=datetime.now() + timedelta(minutes=5),
+        id=AZURE_JOB_ID,
         max_instances=1,
         coalesce=True,
     )

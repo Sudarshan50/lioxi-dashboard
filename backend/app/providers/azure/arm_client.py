@@ -42,12 +42,20 @@ class AzureArmClient:
         items: list[dict] = []
         url = f"{_MANAGEMENT_BASE}{path}"
         request_params = params
+        seen: set[str] = set()
         async with httpx.AsyncClient(timeout=30) as client:
-            while url:
+            while url and url not in seen and len(seen) < 200:
+                seen.add(url)
                 response = await client.get(url, headers=self._auth_header(token), params=request_params)
                 body = self._parse(response)
-                items.extend(body.get("value", []))
-                url = body.get("nextLink")
+                page_items = body.get("value") or []
+                items.extend(page_items)
+                next_link = body.get("nextLink")
+                # Some Cognitive Services list responses return value=[] plus a
+                # nextLink that never completes. Stop instead of hanging.
+                if not next_link or not page_items:
+                    break
+                url = next_link
                 request_params = None
         return items
 

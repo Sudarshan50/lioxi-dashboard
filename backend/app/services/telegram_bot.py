@@ -26,7 +26,7 @@ _HELP = (
     "────────────────────\n"
     "/usage — pick an account, see full metrics\n"
     "/usage &lt;name&gt; — details for matching accounts\n"
-    "/alerts — accounts at or above the lowest configured threshold\n"
+    "/alerts — live accounts at or above the lowest configured threshold\n"
     "/disabled — channels currently disabled\n"
     "/enable — pick a disabled channel to re-enable\n"
     "/disable — pick an enabled channel to disable\n"
@@ -73,11 +73,11 @@ def _account_card(account) -> str:
     lines.extend(
         [
             f"Σ  Total      <b>${(account.new_api_cost_usd or 0):,.2f}</b>",
-            f"💳 Azure credits  {_credit_text(account, account.credits_remaining)} left of {_credit_text(account, account.credits_limit)}",
+            f"💳 Azure grant   {_credit_text(account, account.credits_limit)}",
         ]
     )
     if percent is not None:
-        lines.append(f"📊 {_bar(percent)}  <b>{percent:.1f}% consumed</b>")
+        lines.append(f"📊 {_bar(percent)}  <b>{percent:.1f}% of grant (NewAPI)</b>")
     lines.append(f"⚙️ Gateway    {status} · weight {weight} · priority {priority}")
     if account.new_api_synced_at:
         lines.append(f"🕒 Synced     {format_ist(account.new_api_synced_at)}")
@@ -134,16 +134,16 @@ async def _cmd_alerts() -> str:
         accounts = await AccountRepository(session).list_all()
         config = await get_alert_config(session)
     floor = min(config["thresholds"]) if config["thresholds"] else 75
-    hot = sorted((a for a in accounts if (_percent(a) or 0) >= floor), key=lambda a: _percent(a) or 0, reverse=True)
+    live = [a for a in accounts if a.new_api_status == 1]
+    hot = sorted((a for a in live if (_percent(a) or 0) >= floor), key=lambda a: _percent(a) or 0, reverse=True)
     if not hot:
-        return f"✅ All accounts are below {floor}% of their Azure credits."
-    lines = [f"🚨 <b>Accounts at or above {floor}% of Azure credits</b>", "────────────────────"]
-    warn_at = max(config["thresholds"]) if config["thresholds"] else 95
+        return f"All live accounts are below {floor}% of grant (NewAPI spend)."
+    lines = [f"<b>Live accounts at or above {floor}% of grant (NewAPI)</b>"]
     for account in hot:
         percent = _percent(account)
-        icon = "🚨" if percent >= warn_at else "🟠"
-        remaining = _credit_text(account, account.credits_remaining, digits=0)
-        lines.append(f"{icon} {percent:5.1f}%  {html.escape(account.name)}  ({remaining} left)")
+        spend = f"${(account.new_api_cost_usd or 0):,.0f}"
+        grant = _credit_text(account, account.credits_limit, digits=0)
+        lines.append(f"{percent:5.1f}%  {html.escape(account.name)}  ({spend} / {grant})")
     return "\n".join(lines)
 
 

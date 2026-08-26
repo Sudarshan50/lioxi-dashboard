@@ -30,6 +30,19 @@ function normalizeKey(key: string) {
   return key.replace(/[_-]/g, "").toLowerCase();
 }
 
+function firstNumber(source: Record<string, unknown>, aliases: string[]): number | null {
+  const lookup = new Map(Object.entries(source).map(([key, value]) => [normalizeKey(key), value]));
+  for (const alias of aliases) {
+    const value = lookup.get(normalizeKey(alias));
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+    if (typeof value === "string" && value.trim()) {
+      const parsed = Number(value.replace(/,/g, "").trim());
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  return null;
+}
+
 function firstString(source: Record<string, unknown>, aliases: string[]): string {
   const lookup = new Map(Object.entries(source).map(([key, value]) => [normalizeKey(key), value]));
   for (const alias of aliases) {
@@ -151,6 +164,10 @@ export interface AzureAccountImport {
   clientId: string;
   clientSecret: string;
   subscriptionId: string;
+  resourceName?: string;
+  location?: string;
+  creditsLimit?: number;
+  deploymentName?: string;
 }
 
 export function parseAzureAccountImportArray(raw: string): { accounts: AzureAccountImport[]; error?: string } {
@@ -200,12 +217,20 @@ export function parseAzureAccountImportArray(raw: string): { accounts: AzureAcco
     if (problems.length > 0) {
       return { accounts: [], error: `Entry ${index + 1} is missing ${problems.join(", ")}.` };
     }
+    const resourceName = firstString(record, ["resource_name", "resourceName", "AZURE_RESOURCE_NAME"]);
+    const location = firstString(record, ["location", "AZURE_LOCATION"]);
+    const deploymentName = firstString(record, ["deployment_name", "deploymentName", "model_name", "modelName"]);
+    const creditsLimit = firstNumber(record, ["credits_limit", "credit_limit", "creditsLimit", "grant"]);
     accounts.push({
       name,
       tenantId: creds.values.tenantId,
       clientId: creds.values.clientId,
       clientSecret: creds.values.clientSecret,
       subscriptionId: creds.values.subscriptionId,
+      resourceName: resourceName || undefined,
+      location: location || undefined,
+      creditsLimit: creditsLimit ?? undefined,
+      deploymentName: deploymentName || undefined,
     });
   }
   return { accounts };

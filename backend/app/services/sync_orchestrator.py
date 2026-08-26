@@ -21,41 +21,56 @@ class SyncOrchestrator:
 
     def __init__(self, secret_box: SecretBox) -> None:
         self._secret_box = secret_box
-        self._run_lock = asyncio.Lock()
+        self._newapi_lock = asyncio.Lock()
+        self._azure_lock = asyncio.Lock()
 
     async def sync_all(self) -> dict:
-        async with self._run_lock:
-            return await self._sync_all_locked()
+        """Manual Sync all: NewAPI + alerts, then a slow Azure sweep."""
+        newapi = await self.sync_new_api_cycle()
+        azure = await self.sync_azure_all()
+        return {**azure, "newapi": newapi}
 
-    async def _sync_all_locked(self) -> dict:
-        # Azure credits first so auto-disable sees this cycle's balance, not
-        # the previous 15-minute snapshot.
-        async with SessionLocal() as session:
-            accounts = await AccountRepository(session).list_all()
-        results = await asyncio.gather(*[self.sync_one(account.id) for account in accounts])
-        newapi = await self.sync_new_api_safe()
-        failed = [result for result in results if result.get("status") == "error"]
-        return {
-            "status": "completed" if not failed else "partial",
-            "synced": len(results) - len(failed),
-            "failed": [{"id": result["id"], "name": result["name"], "error": result.get("error")} for result in failed],
-            "newapi": newapi,
-        }
+    async def sync_new_api_cycle(self) -> dict:
+        """Spend, channel status, then credit alerts. Independent of Azure."""
+        async with self._newapi_lock:
+            result = await self.sync_new_api_safe()
+            result["alerts"] = await self.check_alerts_safe()
+            return result
+
+    async def sync_azure_all(self) -> dict:
+        async with self._azure_lock:
+            async with SessionLocal() as session:
+                accounts = await AccountRepository(session).list_all()
+            limit = asyncio.Semaphore(3)
+
+            async def _bounded(account_id: int) -> dict:
+                async with limit:
+                    return await self.sync_one(account_id)
+
+            results = await asyncio.gather(*[_bounded(account.id) for account in accounts])
+            failed = [result for result in results if result.get("status") == "error"]
+            return {
+                "status": "completed" if not failed else "partial",
+                "synced": len(results) - len(failed),
+                "failed": [{"id": result["id"], "name": result["name"], "error": result.get("error")} for result in failed],
+            }
 
     async def sync_new_api_safe(self) -> dict:
         """NewAPI gateway sync must never block the Azure sync path."""
         try:
             async with SessionLocal() as session:
-                result = await sync_new_api(session)
+                return await sync_new_api(session)
         except Exception as exc:  # noqa: BLE001 - degraded, not fatal
             logger.warning("NewAPI sync failed", exc_info=True)
             return {"status": "error", "error": str(exc)[:300]}
+
+    async def check_alerts_safe(self) -> dict:
         try:
             async with SessionLocal() as session:
-                result["alerts"] = await check_new_api_credit_alerts(session)
+                return await check_new_api_credit_alerts(session)
         except Exception:  # noqa: BLE001 - alerting must not fail the sync
             logger.warning("Credit alert check failed", exc_info=True)
-        return result
+            return {"status": "error"}
 
     async def sync_one(self, account_id: int) -> dict:
         async with SessionLocal() as session:

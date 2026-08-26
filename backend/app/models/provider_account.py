@@ -37,11 +37,14 @@ class ProviderAccount(Base, TimestampMixin):
     credits_unit: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     credits_label: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
     credits_available: Mapped[bool] = mapped_column(default=False)
+    # When True, Azure sync must not replace the user-set grant used by alerts.
+    credits_limit_manual: Mapped[bool] = mapped_column(default=False, server_default="false")
 
     new_api_gateway: Mapped[str | None] = mapped_column(String(8), nullable=True, default=None)
     new_api_channel_id: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     new_api_name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
     new_api_tag: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
+    owner_tag: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
     new_api_used_quota: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o1_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o2_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
@@ -54,3 +57,6 @@ class ProviderAccount(Base, TimestampMixin):
     new_api_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     # Highest Azure-consumed % already announced (75/95). 100 = exhausted auto-stop announced.
     new_api_alert_level: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    payable_settled: Mapped[bool] = mapped_column(default=False, server_default="false")
+    payable_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    at_cap_manual: Mapped[bool] = mapped_column(default=False, server_default="false")

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 
 from app.core.exceptions import AzureApiError
 from app.providers.azure.arm_client import AzureArmClient
@@ -7,6 +8,10 @@ from app.providers.base import DeploymentInfo, DiscoveredResource, ProviderCrede
 _COGNITIVE_SERVICES_API = "2023-05-01"
 _DEPLOYMENTS_API = "2024-10-01"
 _PROJECTS_API = "2025-04-01-preview"
+_RESOURCES_API = "2021-04-01"
+_COGNITIVE_ACCOUNT_TYPE = "microsoft.cognitiveservices/accounts"
+
+logger = logging.getLogger(__name__)
 
 
 class AzureDiscoveryService:
@@ -16,9 +21,93 @@ class AzureDiscoveryService:
         self._arm_client = arm_client
 
     async def list_accounts(self, credentials: ProviderCredentials) -> list[DiscoveredResource]:
+        # The provider-specific list is the usual path, but some Foundry
+        # subscriptions return an empty page (and a hanging nextLink) even
+        # when Cognitive Services accounts exist. The generic ARM resources
+        # list still returns them.
+        by_id: dict[str, dict] = {}
+        for loader in (self._list_provider_accounts, self._list_subscription_resources):
+            try:
+                items = await loader(credentials)
+            except Exception:
+                logger.info("Account discovery via %s failed", loader.__name__, exc_info=True)
+                continue
+            for item in items:
+                resource_id = (item.get("id") or "").rstrip("/")
+                if not resource_id:
+                    continue
+                key = resource_id.lower()
+                current = by_id.get(key)
+                if current is None or _resource_detail_score(item) > _resource_detail_score(current):
+                    by_id[key] = item
+        hydrated = await asyncio.gather(
+            *[self._hydrate_account(credentials, item) for item in by_id.values()]
+        )
+        resources = [_to_resource(item) for item in hydrated if item.get("id")]
+        if len(resources) <= 1:
+            return resources
+        return await self._prefer_resources_with_deployments(credentials, resources)
+
+    async def _list_provider_accounts(self, credentials: ProviderCredentials) -> list[dict]:
         path = f"/subscriptions/{credentials.subscription_id}/providers/Microsoft.CognitiveServices/accounts"
-        items = await self._arm_client.get_all_pages(credentials, path, params={"api-version": _COGNITIVE_SERVICES_API})
-        return [_to_resource(item) for item in items]
+        return await self._arm_client.get_all_pages(
+            credentials, path, params={"api-version": _COGNITIVE_SERVICES_API}
+        )
+
+    async def _list_subscription_resources(self, credentials: ProviderCredentials) -> list[dict]:
+        path = f"/subscriptions/{credentials.subscription_id}/resources"
+        items: list[dict] = []
+        try:
+            items = await self._arm_client.get_all_pages(
+                credentials,
+                path,
+                params={
+                    "api-version": _RESOURCES_API,
+                    "$filter": "resourceType eq 'Microsoft.CognitiveServices/accounts'",
+                },
+            )
+        except AzureApiError:
+            items = []
+        accounts = [item for item in items if _is_cognitive_account(item)]
+        if accounts:
+            return accounts
+        items = await self._arm_client.get_all_pages(
+            credentials, path, params={"api-version": _RESOURCES_API}
+        )
+        return [item for item in items if _is_cognitive_account(item)]
+
+    async def _hydrate_account(self, credentials: ProviderCredentials, item: dict) -> dict:
+        properties = item.get("properties") or {}
+        if item.get("kind") and item.get("location") and properties.get("endpoint"):
+            return item
+        resource_id = item.get("id")
+        if not resource_id:
+            return item
+        try:
+            detail = await self._arm_client.get(
+                credentials, resource_id, params={"api-version": _COGNITIVE_SERVICES_API}
+            )
+        except AzureApiError:
+            return item
+        return detail or item
+
+    async def _prefer_resources_with_deployments(
+        self, credentials: ProviderCredentials, resources: list[DiscoveredResource]
+    ) -> list[DiscoveredResource]:
+        counts = await asyncio.gather(
+            *[self._deployment_count(credentials, resource.resource_id) for resource in resources]
+        )
+        ranked = sorted(
+            zip(resources, counts, strict=True),
+            key=lambda pair: (-pair[1], pair[0].name.lower()),
+        )
+        return [resource for resource, _count in ranked]
+
+    async def _deployment_count(self, credentials: ProviderCredentials, resource_id: str) -> int:
+        try:
+            return len(await self.list_deployments(credentials, resource_id))
+        except Exception:
+            return 0
 
     async def list_deployments(self, credentials: ProviderCredentials, resource_id: str) -> list[DeploymentInfo]:
         account_task = self._list_at(
@@ -122,3 +211,16 @@ def _to_deployment(item: dict) -> DeploymentInfo:
 def _extract_resource_group(resource_id: str) -> str:
     parts = resource_id.split("/")
     return parts[parts.index("resourceGroups") + 1] if "resourceGroups" in parts else ""
+
+
+def _is_cognitive_account(item: dict) -> bool:
+    resource_type = (item.get("type") or "").lower()
+    if resource_type == _COGNITIVE_ACCOUNT_TYPE:
+        return True
+    resource_id = (item.get("id") or "").lower()
+    return "/providers/microsoft.cognitiveservices/accounts/" in resource_id
+
+
+def _resource_detail_score(item: dict) -> int:
+    properties = item.get("properties") or {}
+    return int(bool(item.get("kind"))) + int(bool(item.get("location"))) + int(bool(properties.get("endpoint")))

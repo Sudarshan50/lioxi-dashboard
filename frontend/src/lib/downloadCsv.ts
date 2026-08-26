@@ -8,12 +8,14 @@ function filenameFromDisposition(header: string | undefined, fallback: string) {
 export async function downloadDashboardCsv(params: {
   range: string;
   groupId?: number | null;
+  owner?: string | null;
   fallbackName?: string;
 }) {
   const response = await apiClient.get("/api/dashboard/export", {
     params: {
       range: params.range,
       ...(params.groupId != null ? { group_id: params.groupId } : {}),
+      ...(params.owner ? { owner: params.owner } : {}),
     },
     responseType: "blob",
   });

@@ -17,6 +17,10 @@ dhruv.json
 *.sql.gz
 *.dump
 
+# Member/endpoint mapping sheet (names + Azure resource hosts). Local only.
+imp_data.csv
+**/imp_data.csv
+
 # Python
 __pycache__/
 *.pyc

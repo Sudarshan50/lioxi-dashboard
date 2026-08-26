@@ -56,12 +56,13 @@ class SyncService:
         if balance.available:
             account.credits_remaining = balance.remaining
             account.credits_used = balance.used
-            account.credits_limit = balance.limit
-            account.credits_currency = balance.currency
-            account.credits_unit = balance.unit
-            account.credits_label = balance.label
-            account.credits_available = True
-        elif not account.credits_available:
+            if not account.credits_limit_manual:
+                account.credits_limit = balance.limit
+                account.credits_currency = balance.currency
+                account.credits_unit = balance.unit
+                account.credits_label = balance.label
+                account.credits_available = True
+        elif not account.credits_available and not account.credits_limit_manual:
             account.credits_remaining = balance.remaining
             account.credits_used = balance.used
             account.credits_limit = balance.limit

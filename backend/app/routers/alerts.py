@@ -10,7 +10,11 @@ from app.services.alert_service import (
     check_new_api_credit_alerts,
     get_alert_config,
     save_alert_config,
+    set_at_cap_manual,
+    set_payable_settled,
 )
+from app.services.account_service import AccountNotFoundError
+from app.services.sync_scheduler import apply_azure_sync_interval, apply_sync_interval
 from app.services.telegram_service import TelegramError, is_configured, send_message
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"], dependencies=[Depends(get_current_admin)])
@@ -20,6 +24,9 @@ class AlertConfigPayload(BaseModel):
     enabled: bool = True
     thresholds: list[int]
     rearm_margin: float = 5.0
+    overspend_buffer_usd: float = 250.0
+    sync_interval_minutes: int = 5
+    azure_sync_interval_minutes: int = 30
 
 
 @router.get("/status")
@@ -42,9 +49,20 @@ async def read_config(db: AsyncSession = Depends(get_db)):
 @router.put("/config")
 async def update_config(payload: AlertConfigPayload, db: AsyncSession = Depends(get_db)):
     try:
-        return await save_alert_config(db, payload.model_dump())
+        config = await save_alert_config(db, payload.model_dump())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    apply_sync_interval(int(config["sync_interval_minutes"]))
+    apply_azure_sync_interval(int(config["azure_sync_interval_minutes"]))
+    return config
+
+
+class PayableSettledPayload(BaseModel):
+    settled: bool
+
+
+class AtCapManualPayload(BaseModel):
+    at_cap: bool
 
 
 @router.get("/state")
@@ -52,17 +70,38 @@ async def read_state(db: AsyncSession = Depends(get_db)):
     return await alert_state(db)
 
 
+@router.patch("/state/{account_id}/settled")
+async def update_payable_settled(
+    account_id: int, payload: PayableSettledPayload, db: AsyncSession = Depends(get_db)
+):
+    try:
+        return await set_payable_settled(db, account_id, payload.settled)
+    except AccountNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.patch("/state/{account_id}/at-cap")
+async def update_at_cap_manual(
+    account_id: int, payload: AtCapManualPayload, db: AsyncSession = Depends(get_db)
+):
+    try:
+        return await set_at_cap_manual(db, account_id, payload.at_cap)
+    except AccountNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/test")
 async def send_test_alert(db: AsyncSession = Depends(get_db)):
     config = await get_alert_config(db)
     levels = " and ".join(f"<b>{t}%</b>" for t in config["thresholds"])
+    buffer = config.get("overspend_buffer_usd", 250)
     sample = (
-        "✅ <b>Portal Connected</b>\n"
-        "────────────────────\n"
-        f"Credit alerts are live. You'll be notified when any account\n"
-        f"consumes {levels} of its Azure credits. Channels are\n"
-        "<b>auto-disabled</b> when remaining hits zero, or when outstanding\n"
-        "charges already consume the Azure credit grant."
+        f"<b>Portal connected</b>\n"
+        f"Credit alerts are live. You'll be notified when any account's\n"
+        f"NewAPI spend hits {levels} of its Azure credit grant. Channels are\n"
+        f"<b>auto-disabled</b> when NewAPI spend reaches grant + ${buffer:,.0f}."
     )
     try:
         await send_message(sample)

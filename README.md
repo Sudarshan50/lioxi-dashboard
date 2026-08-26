@@ -26,8 +26,10 @@ Cost shown on the dashboard has two sources:
 - **Actual billed cost** - the real number from Azure Cost Management, at the
   account level (Azure doesn't split billing by deployment).
 
-A background scheduler re-syncs every account on an interval (default 15
-minutes); you can also trigger a sync on demand from the Accounts page.
+A background scheduler re-syncs NewAPI spend and channel status on an
+interval (default 5 minutes, configurable on the Alerts page). Azure
+token/cost sync runs separately on a slower schedule. You can also trigger
+a full sync on demand from the Accounts page.
 
 ## Architecture
 
@@ -82,6 +84,11 @@ OpenAI usage API) means implementing that interface and registering it in
    Optional: fill `NEW_API_*` / `NEW_API2_*` for gateway spend sync, and
    `TELEGRAM_*` for group alerts. Leave them blank to run the portal without
    those integrations.
+
+   Name tags can be typed when you add an account. To auto-tag from a local
+   Name,Endpoint sheet, copy `backend/app/data/imp_data.csv.example` to
+   `backend/app/data/imp_data.csv` and fill it on this machine only. That file
+   is gitignored — do not commit it.
 
 2. Start everything:
 

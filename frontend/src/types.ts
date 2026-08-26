@@ -19,10 +19,12 @@ export interface Account {
   credits_unit: string | null;
   credits_label: string | null;
   credits_available: boolean;
+  credits_limit_manual?: boolean;
   new_api_gateway: string | null;
   new_api_channel_id: number | null;
   new_api_name: string | null;
   new_api_tag: string | null;
+  owner_tag: string | null;
   new_api_used_quota: number | null;
   new_api_cost_o1_usd: number | null;
   new_api_cost_o2_usd: number | null;
@@ -33,6 +35,9 @@ export interface Account {
   new_api_weight: number | null;
   new_api_priority: number | null;
   new_api_synced_at: string | null;
+  payable_settled?: boolean;
+  payable_settled_at?: string | null;
+  at_cap_manual?: boolean;
   created_at: string;
 }
 
@@ -41,6 +46,7 @@ export interface AccountGroup {
   name: string;
   accounts: { id: number; name: string }[];
   created_at: string;
+  auto?: boolean;
 }
 
 export interface SyncAllResult {
@@ -134,22 +140,35 @@ export interface AlertConfig {
   enabled: boolean;
   thresholds: number[];
   rearm_margin: number;
+  overspend_buffer_usd: number;
+  sync_interval_minutes: number;
+  azure_sync_interval_minutes: number;
 }
 
 export interface AlertStateItem {
   id: number;
   name: string;
+  new_api_name?: string | null;
+  new_api_tag?: string | null;
+  owner_tag?: string | null;
   gateway: string | null;
   gateway_enabled: boolean;
   spend_usd: number;
-  credits_remaining: number | null;
+  spend_o1_usd?: number | null;
+  spend_o2_usd?: number | null;
+  endpoint?: string;
   credits_limit: number | null;
-  credits_outstanding: number | null;
   credits_currency: string | null;
+  stop_at_usd: number | null;
+  headroom_usd: number | null;
+  overspend_buffer_usd: number;
   percent: number | null;
   exhausted: boolean;
-  exhausted_reason: "zero" | "overspent" | null;
+  exhausted_reason: "overspent" | "manual" | null;
+  at_cap_manual?: boolean;
   alert_level: number;
+  payable_settled?: boolean;
+  payable_settled_at?: string | null;
 }
 
 export interface TimeseriesPoint {

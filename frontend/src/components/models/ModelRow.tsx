@@ -5,7 +5,7 @@ import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
 import Spinner from "@/components/ui/Spinner";
 import { useDeleteModel, useUpdateModel } from "@/hooks/useModels";
-import { EstimateCurrency, formatCurrency, formatEstimatedCost, formatTokens } from "@/lib/format";
+import { EstimateCurrency, formatEstimatedCost, formatTokens } from "@/lib/format";
 import { BreakdownItem, MonitoredModel } from "@/types";
 
 interface ModelRowProps {
@@ -14,10 +14,6 @@ interface ModelRowProps {
   usageLoading?: boolean;
   estimateCurrency: EstimateCurrency;
   usdInr: number;
-  newApiCost?: number | null;
-  actualCost?: number | null;
-  actualCostCurrency?: string | null;
-  showAccountCosts?: boolean;
 }
 
 export default function ModelRow({
@@ -26,10 +22,6 @@ export default function ModelRow({
   usageLoading = false,
   estimateCurrency,
   usdInr,
-  newApiCost = null,
-  actualCost = null,
-  actualCostCurrency = null,
-  showAccountCosts = false,
 }: ModelRowProps) {
   const updateModel = useUpdateModel();
   const deleteModel = useDeleteModel();
@@ -55,12 +47,11 @@ export default function ModelRow({
 
   return (
     <tr className="border-b border-surface-border text-sm last:border-0 hover:bg-surface-hover/60">
-      <td className="whitespace-nowrap py-3 pl-4 pr-4 sm:pl-0">
+      <td className="whitespace-nowrap py-3 pr-4">
         <p className="font-medium text-gray-100">{model.model_name}</p>
         <p className="text-xs text-gray-500">{model.deployment_name}</p>
         {error && <p className="mt-1 max-w-[16rem] break-words text-xs text-red-400">{error}</p>}
       </td>
-      <td className="whitespace-nowrap py-3 pr-4 text-gray-400">{model.provider_account_name}</td>
       <td className="whitespace-nowrap py-3 pr-4 text-gray-400">
         {usageLoading ? <Spinner className="h-4 w-4" /> : usage ? formatTokens(usage.total_tokens) : "—"}
       </td>
@@ -73,28 +64,10 @@ export default function ModelRow({
           "—"
         )}
       </td>
-      <td className="whitespace-nowrap py-3 pr-4 text-gray-400">
-        {usageLoading ? (
-          <Spinner className="h-4 w-4" />
-        ) : showAccountCosts && actualCost != null && actualCost > 0 ? (
-          formatCurrency(actualCost, actualCostCurrency || "USD")
-        ) : (
-          "—"
-        )}
-      </td>
-      <td className="whitespace-nowrap py-3 pr-4 text-gray-400">
-        {usageLoading ? (
-          <Spinner className="h-4 w-4" />
-        ) : showAccountCosts && newApiCost != null && newApiCost > 0 ? (
-          formatEstimatedCost(newApiCost, estimateCurrency, usdInr)
-        ) : (
-          "—"
-        )}
-      </td>
       <td className="whitespace-nowrap py-3 pr-4">
         <Badge tone={model.enabled ? "success" : "neutral"}>{model.enabled ? "Enabled" : "Disabled"}</Badge>
       </td>
-      <td className="whitespace-nowrap py-3 pr-4 text-right sm:pr-0">
+      <td className="whitespace-nowrap py-3 pr-0 text-right">
         <div className="flex justify-end gap-2">
           <Button variant="secondary" className="px-2.5 py-1.5 text-xs" onClick={handleToggle} isLoading={updateModel.isPending}>
             {model.enabled ? "Disable" : "Enable"}

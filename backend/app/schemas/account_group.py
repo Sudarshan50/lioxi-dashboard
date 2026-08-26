@@ -23,3 +23,4 @@ class AccountGroupResponse(BaseModel):
     name: str
     accounts: list[AccountSummary]
     created_at: datetime
+    auto: bool = False

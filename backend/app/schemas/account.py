@@ -33,12 +33,14 @@ class AccountCreateRequest(BaseModel):
     client_id: str
     client_secret: str
     subscription_id: str
-    resource_id: str
-    resource_group: str
     resource_name: str
-    endpoint: str
-    kind: str
-    location: str
+    resource_id: str = ""
+    resource_group: str = ""
+    endpoint: str = ""
+    kind: str = ""
+    location: str = ""
+    credits_limit: float | None = None
+    owner_tag: str | None = None
 
 
 class AccountUpdateRequest(BaseModel):
@@ -49,6 +51,9 @@ class AccountUpdateRequest(BaseModel):
     endpoint: str | None = None
     kind: str | None = None
     location: str | None = None
+    credits_limit: float | None = None
+    credits_limit_manual: bool | None = None
+    owner_tag: str | None = None
 
 
 class AccountResponse(BaseModel):
@@ -74,10 +79,12 @@ class AccountResponse(BaseModel):
     credits_unit: str | None
     credits_label: str | None
     credits_available: bool
+    credits_limit_manual: bool = False
     new_api_gateway: str | None = None
     new_api_channel_id: int | None = None
     new_api_name: str | None = None
     new_api_tag: str | None = None
+    owner_tag: str | None = None
     new_api_used_quota: float | None = None
     new_api_cost_o1_usd: float | None = None
     new_api_cost_o2_usd: float | None = None
@@ -89,6 +96,9 @@ class AccountResponse(BaseModel):
     new_api_priority: int | None = None
     new_api_synced_at: datetime | None = None
     created_at: datetime
+    payable_settled: bool = False
+    payable_settled_at: datetime | None = None
+    at_cap_manual: bool = False
 
 
 class DeploymentResponse(BaseModel):

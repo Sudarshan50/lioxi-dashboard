@@ -1,4 +1,4 @@
-import { Clock, Coins, Download, FileDown, Gauge, MessageSquare, Receipt, RefreshCw, Router, Timer, Upload } from "lucide-react";
+import { Clock, Coins, Download, FileDown, Gauge, HandCoins, MessageSquare, Receipt, RefreshCw, Router, Timer, Upload } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import BreakdownBarChart from "@/components/charts/BreakdownBarChart";
@@ -27,6 +27,8 @@ import {
 import { useEstimateCurrency } from "@/hooks/useEstimateCurrency";
 import { useModels } from "@/hooks/useModels";
 import { convertUsd, formatCurrency, formatDateTime, formatEstimatedCost, formatRate, formatRelative, formatTokens } from "@/lib/format";
+import { amountPayableUsd, downloadPayableCsv } from "@/lib/payable";
+import { matchesOwner, rollupBreakdownByTag, rollupTpmByTag, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
 
 const RANGE_OPTIONS = [
   { value: "24h", label: "Last 24 hours" },
@@ -42,6 +44,7 @@ export default function OverviewPage() {
   const [accountFilter, setAccountFilter] = useState<string>(ALL);
   const [modelFilter, setModelFilter] = useState<string>(ALL);
   const [groupFilter, setGroupFilter] = useState<string>(ALL);
+  const [ownerFilter, setOwnerFilter] = useState<string>(ALL);
 
   const { data: accounts, isLoading: accountsLoading, isError: accountsError } = useAccounts();
   const { data: models, isLoading: modelsLoading, isError: modelsError } = useModels();
@@ -59,7 +62,9 @@ export default function OverviewPage() {
   const accountId = accountFilter === ALL ? null : Number(accountFilter);
   const modelId = modelFilter === ALL ? null : Number(modelFilter);
   const groupId = groupFilter === ALL ? null : Number(groupFilter);
+  const owner = ownerFilter === ALL ? null : ownerFilter;
   const selectedGroup = (groups ?? []).find((g) => g.id === groupId);
+  const ownerOptions = useMemo(() => uniqueOwners(accounts ?? []), [accounts]);
 
   const modelsForFilter = useMemo(() => {
     const memberIds = groupId ? new Set(selectedGroup?.accounts.map((account) => account.id) ?? []) : null;
@@ -67,6 +72,10 @@ export default function OverviewPage() {
       if (!model.model_name || model.registered_model_id == null) return false;
       if (accountId && model.provider_account_id !== accountId) return false;
       if (memberIds && !memberIds.has(model.provider_account_id)) return false;
+      if (owner) {
+        const account = (accounts ?? []).find((item) => item.id === model.provider_account_id);
+        if (!matchesOwner(account?.owner_tag, owner)) return false;
+      }
       return true;
     });
     const unique = new Map<number, (typeof scoped)[number]>();
@@ -74,7 +83,7 @@ export default function OverviewPage() {
       if (!unique.has(model.registered_model_id)) unique.set(model.registered_model_id, model);
     }
     return [...unique.values()].sort((a, b) => a.model_name.localeCompare(b.model_name, undefined, { sensitivity: "base" }));
-  }, [models, accountId, groupId, selectedGroup]);
+  }, [accounts, models, accountId, groupId, owner, selectedGroup]);
 
   function handleAccountChange(value: string) {
     setAccountFilter(value);
@@ -88,37 +97,48 @@ export default function OverviewPage() {
     if (value !== ALL) setAccountFilter(ALL);
   }
 
-  const overview = useDashboardOverview({ range, accountId, modelId, groupId });
-  const timeseries = useDashboardTimeseries({ range, accountId, modelId, groupId });
-  const tpmByAccount = useTimeseriesByAccount({ range, accountId, modelId, groupId });
-  const byAccount = useBreakdownByAccount(range, modelId, accountId, groupId);
-  const byModel = useBreakdownByModel(range, accountId, groupId, modelId);
+  const overview = useDashboardOverview({ range, accountId, modelId, groupId, owner });
+  const timeseries = useDashboardTimeseries({ range, accountId, modelId, groupId, owner });
+  const tpmByAccount = useTimeseriesByAccount({ range, accountId, modelId, groupId, owner });
+  const byAccount = useBreakdownByAccount(range, modelId, accountId, groupId, undefined, owner);
+  const byModel = useBreakdownByModel(range, accountId, groupId, modelId, undefined, owner);
+  const byAccountRows = useMemo(() => {
+    const rows = byAccount.data ?? [];
+    if (accountId || !accounts) return rows;
+    return rollupBreakdownByTag(rows, accounts);
+  }, [accountId, accounts, byAccount.data]);
+  const tpmRows = useMemo(() => {
+    const rows = tpmByAccount.data ?? [];
+    if (accountId || !accounts) return rows;
+    return rollupTpmByTag(rows, accounts);
+  }, [accountId, accounts, tpmByAccount.data]);
+  const breakdownHint = accountId ? "per account" : "combined by tag (name from endpoint map)";
   const dashboardError = overview.isError || timeseries.isError || tpmByAccount.isError || byAccount.isError || byModel.isError;
   const actualCurrency = overview.data?.actual_cost_currency || "INR";
   const tpmByAccountBars = useMemo(
     () =>
-      [...(byAccount.data ?? [])]
+      [...byAccountRows]
         .filter((item) => (item.avg_tpm ?? 0) > 0)
         .sort((a, b) => (b.avg_tpm ?? 0) - (a.avg_tpm ?? 0)),
-    [byAccount.data]
+    [byAccountRows]
   );
   const estimatedSpendBars = useMemo(
     () =>
-      [...(byAccount.data ?? [])]
+      [...byAccountRows]
         .filter((item) => (item.estimated_cost ?? item.estimated_cost_usd ?? 0) > 0)
         .map((item) => ({
           ...item,
           estimated_cost: convertUsd(item.estimated_cost_usd ?? item.estimated_cost ?? 0, estimateCurrency, usdInr),
         }))
         .sort((a, b) => (b.estimated_cost ?? 0) - (a.estimated_cost ?? 0)),
-    [byAccount.data, estimateCurrency, usdInr]
+    [byAccountRows, estimateCurrency, usdInr]
   );
   const actualSpendBars = useMemo(
     () =>
-      [...(byAccount.data ?? [])]
+      [...byAccountRows]
         .filter((item) => (item.actual_cost ?? 0) > 0)
         .sort((a, b) => (b.actual_cost ?? 0) - (a.actual_cost ?? 0)),
-    [byAccount.data]
+    [byAccountRows]
   );
   const pickNewApi = (item?: { new_api_cost?: number; new_api_cost_o1?: number; new_api_cost_o2?: number }) => {
     if (!item) return 0;
@@ -129,17 +149,17 @@ export default function OverviewPage() {
   const gatewayHint = gatewayView === "ALL" ? "O1 + O2 combined" : `${gatewayView} portal only`;
   const newApiSpendBars = useMemo(
     () =>
-      [...(byAccount.data ?? [])]
+      [...byAccountRows]
         .filter((item) => pickNewApi(item) > 0)
         .map((item) => ({ ...item, new_api_cost: convertUsd(pickNewApi(item), estimateCurrency, usdInr) }))
         .sort((a, b) => (b.new_api_cost ?? 0) - (a.new_api_cost ?? 0)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [byAccount.data, estimateCurrency, usdInr, gatewayView]
+    [byAccountRows, estimateCurrency, usdInr, gatewayView]
   );
   const costComparisonData = useMemo(
-    () => (byAccount.data ?? []).map((item) => ({ ...item, new_api_cost: pickNewApi(item) })),
+    () => byAccountRows.map((item) => ({ ...item, new_api_cost: pickNewApi(item) })),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [byAccount.data, gatewayView]
+    [byAccountRows, gatewayView]
   );
   const estimatedModelBars = useMemo(
     () =>
@@ -158,19 +178,34 @@ export default function OverviewPage() {
       : "From registered token prices · USD";
   const estimateChartLabel = estimateCurrency === "INR" ? "₹" : "USD";
 
-  const activeFilterCount = (accountId ? 1 : 0) + (modelId ? 1 : 0) + (groupId ? 1 : 0);
+  const activeFilterCount = (accountId ? 1 : 0) + (modelId ? 1 : 0) + (groupId ? 1 : 0) + (owner ? 1 : 0);
   const selectedAccount = (accounts ?? []).find((account) => account.id === accountId);
   const selectedModel = (models ?? []).find((model) => model.registered_model_id === modelId);
-  const scopeHint = [selectedGroup?.name, selectedAccount?.name, selectedModel?.model_name].filter(Boolean).join(" · ");
+  const ownerLabel = owner === UNTAGGED_OWNER ? "Untagged" : owner;
+  const scopeHint = [ownerLabel, selectedGroup?.name, selectedAccount?.name, selectedModel?.model_name]
+    .filter(Boolean)
+    .join(" · ");
 
-  const scopedAccounts = useMemo(() => {
-    if (accountId) return (accounts ?? []).filter((account) => account.id === accountId);
+  const accountsForFilter = useMemo(() => {
+    let rows = accounts ?? [];
     if (groupId) {
       const memberIds = new Set(selectedGroup?.accounts.map((account) => account.id) ?? []);
-      return (accounts ?? []).filter((account) => memberIds.has(account.id));
+      rows = rows.filter((account) => memberIds.has(account.id));
     }
-    return accounts ?? [];
-  }, [accounts, accountId, groupId, selectedGroup]);
+    if (owner) rows = rows.filter((account) => matchesOwner(account.owner_tag, owner));
+    return rows;
+  }, [accounts, groupId, owner, selectedGroup]);
+
+  const scopedAccounts = useMemo(() => {
+    let rows = accounts ?? [];
+    if (accountId) rows = rows.filter((account) => account.id === accountId);
+    else if (groupId) {
+      const memberIds = new Set(selectedGroup?.accounts.map((account) => account.id) ?? []);
+      rows = rows.filter((account) => memberIds.has(account.id));
+    }
+    if (owner) rows = rows.filter((account) => matchesOwner(account.owner_tag, owner));
+    return rows;
+  }, [accounts, accountId, groupId, owner, selectedGroup]);
 
   const lastSyncedAt = useMemo(() => {
     let latest: string | null = null;
@@ -180,6 +215,30 @@ export default function OverviewPage() {
     }
     return latest;
   }, [scopedAccounts]);
+
+  const payableRows = useMemo(
+    () =>
+      scopedAccounts.map((account) => ({
+        name: account.name,
+        owner: account.owner_tag,
+        newApiName: account.new_api_name,
+        endpoint: account.endpoint,
+        spendO1Usd: account.new_api_cost_o1_usd,
+        spendO2Usd: account.new_api_cost_o2_usd,
+        spendUsd: account.new_api_cost_usd,
+        settled: Boolean(account.payable_settled),
+      })),
+    [scopedAccounts]
+  );
+  const payableGrandTotal = useMemo(
+    () =>
+      payableRows.reduce((sum, row) => {
+        const spend =
+          gatewayView === "O1" ? row.spendO1Usd : gatewayView === "O2" ? row.spendO2Usd : row.spendUsd;
+        return sum + amountPayableUsd(spend);
+      }, 0),
+    [payableRows, gatewayView]
+  );
 
   async function handleSync() {
     setSyncMessage(null);
@@ -240,6 +299,15 @@ export default function OverviewPage() {
               </Button>
               <Button
                 variant="secondary"
+                onClick={() => downloadPayableCsv(payableRows, "amount-payable.csv")}
+                disabled={scopedAccounts.length === 0}
+                className="w-full shrink-0 sm:w-auto"
+              >
+                <HandCoins size={16} />
+                Export payable
+              </Button>
+              <Button
+                variant="secondary"
                 onClick={handleSync}
                 isLoading={isSyncing}
                 disabled={scopedAccounts.length === 0}
@@ -265,13 +333,24 @@ export default function OverviewPage() {
       {dashboardError && <Banner tone="error">Could not load dashboard data. Try refreshing the page.</Banner>}
 
       <Card>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
           <Select label="Time range" value={range} onChange={(e) => setRange(e.target.value)}>
             {RANGE_OPTIONS.map((option) => (
               <option key={option.value} value={option.value}>
                 {option.label}
               </option>
             ))}
+          </Select>
+          <Select label="Tag" value={ownerFilter} onChange={(e) => { setOwnerFilter(e.target.value); setAccountFilter(ALL); setModelFilter(ALL); }}>
+            <option value={ALL}>All tags</option>
+            {ownerOptions.map((name) => (
+              <option key={name} value={name}>
+                {name}
+              </option>
+            ))}
+            {(accounts ?? []).some((account) => !(account.owner_tag ?? "").trim()) && (
+              <option value={UNTAGGED_OWNER}>Untagged</option>
+            )}
           </Select>
           <Select label="Group" value={groupFilter} onChange={(e) => handleGroupChange(e.target.value)} disabled={groupsLoading}>
             <option value={ALL}>{groupsLoading ? "Loading groups..." : "All groups"}</option>
@@ -283,7 +362,7 @@ export default function OverviewPage() {
           </Select>
           <Select label="Account" value={accountFilter} onChange={(e) => handleAccountChange(e.target.value)} disabled={accountsLoading}>
             <option value={ALL}>{accountsLoading ? "Loading accounts..." : "All accounts"}</option>
-            {namedOptions(accounts).map((account) => (
+            {namedOptions(owner || groupId ? accountsForFilter : accounts).map((account) => (
               <option key={account.id} value={account.id}>
                 {account.name}
               </option>
@@ -304,6 +383,7 @@ export default function OverviewPage() {
               setAccountFilter(ALL);
               setModelFilter(ALL);
               setGroupFilter(ALL);
+              setOwnerFilter(ALL);
             }}
             className="mt-3 text-xs font-medium text-accent hover:text-accent-hover"
           >
@@ -352,6 +432,13 @@ export default function OverviewPage() {
             tone="violet"
             hint={`Gateway lifetime quota · ${gatewayHint}`}
             action={<GatewayToggle value={gatewayView} onChange={setGatewayView} />}
+          />
+          <StatCard
+            label="Amount payable"
+            value={formatEstimatedCost(payableGrandTotal, estimateCurrency, usdInr)}
+            icon={<HandCoins size={20} />}
+            tone="amber"
+            hint={`NewAPI spend × 12% · ${gatewayHint}`}
           />
           <StatCard
             label="Input tokens"
@@ -409,9 +496,9 @@ export default function OverviewPage() {
       </Card>
 
       <Card className="min-w-0 overflow-hidden">
-        <h2 className="text-sm font-semibold text-gray-200">TPM by account</h2>
+        <h2 className="text-sm font-semibold text-gray-200">TPM by {accountId ? "account" : "tag"}</h2>
         <p className="mt-0.5 text-xs text-gray-500">
-          Hourly tokens ÷ 60 per account{scopeHint ? ` · ${scopeHint}` : ""} · click a time to see every account
+          Hourly tokens ÷ 60 {breakdownHint}{scopeHint ? ` · ${scopeHint}` : ""} · click a time to see every series
         </p>
         <div className="mt-4">
           {tpmByAccount.isLoading ? (
@@ -419,9 +506,9 @@ export default function OverviewPage() {
               <Spinner />
             </div>
           ) : tpmByAccount.isError ? (
-            <p className="py-16 text-center text-sm text-gray-500">Could not load TPM by account.</p>
+            <p className="py-16 text-center text-sm text-gray-500">Could not load TPM.</p>
           ) : (tpmByAccount.data ?? []).length > 0 ? (
-            <TpmByAccountChart data={tpmByAccount.data ?? []} />
+            <TpmByAccountChart data={tpmRows} />
           ) : (
             <p className="py-16 text-center text-sm text-gray-500">No account TPM in this range</p>
           )}
@@ -431,7 +518,9 @@ export default function OverviewPage() {
       <Card className="min-w-0 overflow-hidden">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
-            <h2 className="text-sm font-semibold text-gray-200">Cost per account — Estimated vs Actual vs NewAPI</h2>
+            <h2 className="text-sm font-semibold text-gray-200">
+              Cost per {accountId ? "account" : "tag"} — Estimated vs Actual vs NewAPI
+            </h2>
             <p className="mt-0.5 text-xs text-gray-500">
               All in {estimateCurrency}
               {estimateCurrency === "INR" ? ` at ₹${usdInr.toFixed(2)} / $1` : ` (₹ converted at ${usdInr.toFixed(2)})`} ·
@@ -460,7 +549,7 @@ export default function OverviewPage() {
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 lg:gap-6">
         <Card className="min-w-0 overflow-hidden">
-          <h2 className="text-sm font-semibold text-gray-200">Avg TPM by account</h2>
+          <h2 className="text-sm font-semibold text-gray-200">Avg TPM by {accountId ? "account" : "tag"}</h2>
           {scopeHint && <p className="mt-0.5 text-xs text-gray-500">{scopeHint}</p>}
           <div className="mt-4">
             {byAccount.isLoading ? (
@@ -478,7 +567,7 @@ export default function OverviewPage() {
         </Card>
         <Card className="min-w-0 overflow-hidden">
           <h2 className="text-sm font-semibold text-gray-200">
-            Estimated spend by account ({estimateChartLabel})
+            Estimated spend by {accountId ? "account" : "tag"} ({estimateChartLabel})
           </h2>
           <p className="mt-0.5 text-xs text-gray-500">
             {estimateHint}
@@ -500,7 +589,7 @@ export default function OverviewPage() {
         </Card>
         <Card className="min-w-0 overflow-hidden">
           <h2 className="text-sm font-semibold text-gray-200">
-            Actual spend by account{actualCurrency === "INR" ? " (₹)" : ` (${actualCurrency})`}
+            Actual spend by {accountId ? "account" : "tag"}{actualCurrency === "INR" ? " (₹)" : ` (${actualCurrency})`}
           </h2>
           <p className="mt-0.5 text-xs text-gray-500">
             Azure billed amount{actualCurrency === "INR" ? ", kept in rupees" : ""}
@@ -522,7 +611,7 @@ export default function OverviewPage() {
         </Card>
         <Card className="min-w-0 overflow-hidden">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-semibold text-gray-200">NewAPI spend by account ({estimateChartLabel})</h2>
+            <h2 className="text-sm font-semibold text-gray-200">NewAPI spend by {accountId ? "account" : "tag"} ({estimateChartLabel})</h2>
             <GatewayToggle value={gatewayView} onChange={setGatewayView} />
           </div>
           <p className="mt-0.5 text-xs text-gray-500">
@@ -570,8 +659,11 @@ export default function OverviewPage() {
         isOpen={isExportOpen}
         onClose={() => setIsExportOpen(false)}
         groups={namedOptions(groups)}
+        owners={ownerOptions}
+        hasUntagged={(accounts ?? []).some((account) => !(account.owner_tag ?? "").trim())}
         defaultRange={range}
         defaultGroupId={groupFilter}
+        defaultOwner={ownerFilter}
       />
     </div>
   );

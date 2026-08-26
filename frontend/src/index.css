@@ -57,3 +57,66 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #3b4254;
 }
+
+@keyframes brokerage-in {
+  0% {
+    opacity: 0;
+    max-width: 0;
+    padding-left: 0;
+    padding-right: 0;
+    transform: translateX(1.25rem) skewX(10deg);
+    filter: blur(8px);
+    background-color: rgba(244, 63, 94, 0.2);
+  }
+  55% {
+    filter: blur(0);
+    background-color: rgba(244, 63, 94, 0.08);
+  }
+  100% {
+    opacity: 1;
+    max-width: 8.75rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    transform: translateX(0) skewX(0);
+    filter: blur(0);
+    background-color: transparent;
+  }
+}
+
+@keyframes brokerage-out {
+  0% {
+    opacity: 1;
+    max-width: 8.75rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    transform: translateX(0) skewX(0);
+    filter: blur(0);
+  }
+  35% {
+    transform: translateX(0.2rem) skewX(-14deg);
+    filter: blur(2px);
+    background-color: rgba(244, 63, 94, 0.14);
+  }
+  100% {
+    opacity: 0;
+    max-width: 0;
+    padding-left: 0;
+    padding-right: 0;
+    transform: translateX(1.25rem) skewX(-18deg);
+    filter: blur(8px);
+    background-color: transparent;
+  }
+}
+
+.brokerage-col {
+  overflow: hidden;
+  white-space: nowrap;
+  vertical-align: middle;
+  text-align: right;
+  animation: brokerage-in 0.52s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.brokerage-col-out {
+  animation: brokerage-out 0.38s cubic-bezier(0.4, 0, 0.2, 1) both;
+  pointer-events: none;
+}

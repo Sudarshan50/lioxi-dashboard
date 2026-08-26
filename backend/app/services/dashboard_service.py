@@ -7,17 +7,9 @@ from app.repositories.account_group_repository import AccountGroupRepository
 from app.repositories.account_repository import AccountRepository
 from app.repositories.model_repository import ModelRepository
 from app.repositories.usage_repository import UsageRepository
+from app.services.owner_tag import UNTAGGED
 
-_EXPORT_FIELDS = (
-    "name",
-    "endpoint",
-    "endpoint_name",
-    "model",
-    "input_tokens",
-    "output_tokens",
-    "total_tokens",
-    "total_cost",
-)
+_PAYABLE_RATE = 0.12
 
 _RANGE_MAP = {
     "24h": timedelta(hours=24),
@@ -83,9 +75,10 @@ class DashboardService:
         model_id: int | None,
         group_id: int | None = None,
         gateway: str | None = None,
+        owner: str | None = None,
     ) -> dict:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
         overview = await self._usage_repository.get_overview(start, end, account_ids, model_id)
         hourly = await self._usage_repository.get_timeseries(start, end, account_ids, model_id)
         overview.update(
@@ -136,9 +129,10 @@ class DashboardService:
         model_id: int | None,
         group_id: int | None = None,
         gateway: str | None = None,
+        owner: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
         return await self._usage_repository.get_timeseries(start, end, account_ids, model_id)
 
     async def get_timeseries_by_account(
@@ -148,9 +142,10 @@ class DashboardService:
         model_id: int | None,
         group_id: int | None = None,
         gateway: str | None = None,
+        owner: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
         return await self._usage_repository.get_timeseries_by_account(start, end, account_ids, model_id)
 
     async def get_breakdown_by_account(
@@ -160,9 +155,10 @@ class DashboardService:
         account_id: int | None = None,
         group_id: int | None = None,
         gateway: str | None = None,
+        owner: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
         items = await self._usage_repository.get_breakdown_by_account(start, end, model_id, account_ids)
         minutes = max((end - start).total_seconds() / 60, 60)
         billed = await self._usage_repository.get_actual_cost_by_account(start, end, account_ids)
@@ -201,18 +197,19 @@ class DashboardService:
         group_id: int | None = None,
         model_id: int | None = None,
         gateway: str | None = None,
+        owner: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
         items = await self._usage_repository.get_breakdown_by_model(start, end, account_ids, model_id)
         _mark_estimated_usd(items)
         return items
 
     async def get_breakdown_by_monitored_model(
-        self, range_key: str, account_id: int | None, group_id: int | None = None
+        self, range_key: str, account_id: int | None, group_id: int | None = None, owner: str | None = None
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id)
+        account_ids = await self._resolve_account_ids(account_id, group_id, owner=owner)
         items = await self._usage_repository.get_breakdown_by_monitored_model(start, end, account_ids)
         _mark_estimated_usd(items)
         for item in items:
@@ -227,18 +224,11 @@ class DashboardService:
         account_id: int | None = None,
         model_id: int | None = None,
         group_id: int | None = None,
+        owner: str | None = None,
     ) -> tuple[str, bytes]:
-        from app.services.alert_service import consumed_percent
-
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id)
+        account_ids = await self._resolve_account_ids(account_id, group_id, owner=owner)
         deployment_rows = await self._usage_repository.get_export_rows(start, end, account_ids, model_id)
-        breakdown = {
-            item["id"]: item
-            for item in await self._usage_repository.get_breakdown_by_account(start, end, model_id, account_ids)
-        }
-        billed = await self._usage_repository.get_actual_cost_by_account(start, end, account_ids)
-        _, billed_currency = await self._usage_repository._get_actual_cost(start, end, account_ids)
         accounts = [
             account
             for account in await self._account_repository.list_all()
@@ -246,186 +236,183 @@ class DashboardService:
         ]
         accounts.sort(key=lambda account: account.name.lower())
 
-        # Input/output tokens per account, aggregated from the deployment rows
-        # (the account breakdown only carries the combined total).
-        io_by_account: dict[str, list[int]] = {}
+        by_account: dict[str, list[float]] = {}
         for row in deployment_rows:
-            entry = io_by_account.setdefault(row["name"], [0, 0])
+            entry = by_account.setdefault(row["name"], [0.0, 0.0, 0.0])
             entry[0] += row["input_tokens"]
             entry[1] += row["output_tokens"]
+            entry[2] += row["total_cost"]
 
         group_label = "all"
+        if owner:
+            group_label = "untagged" if owner == "__none__" else owner
         if group_id is not None:
             group = await self._account_group_repository.get(group_id)
             if group is not None:
-                group_label = group.name
+                group_label = f"{group_label}-{group.name}" if group_label != "all" else group.name
 
         buffer = io.StringIO()
         buffer.write("\ufeff")
         writer = csv.writer(buffer)
-
         writer.writerow(
             [
-                f"Usage export · scope: {group_label} · range: {range_key} ({start.isoformat()} to {end.isoformat()})"
-                " · tokens/estimated/actual are in-range · newapi_*_usd_lifetime is gateway lifetime quota"
+                "Billing export. "
+                f"Scope: {group_label}. Range: {range_key} ({start.isoformat()} to {end.isoformat()}). "
+                "Input/output tokens and estimated cost USD are for this range. "
+                "O1/O2/Total NewAPI spend USD is NewAPI lifetime dollars. "
+                "O1/O2 payable USD is that portal's NewAPI spend × 12%. "
+                "O1+O2 payable USD is the sum of those two. "
+                "Amount payable USD is total NewAPI spend × 12%. "
+                "Current balance USD is remaining Azure credit. "
+                "Settled is marked only for accounts marked paid on Alerts."
             ]
         )
         writer.writerow([])
-        writer.writerow(["ACCOUNT SUMMARY"])
+        writer.writerow(["ACCOUNT BILLING"])
         writer.writerow(
             [
-                "account",
-                "endpoint",
-                "gateway",
-                "gateway_status",
-                "o1_status",
-                "o2_status",
-                "input_tokens",
-                "output_tokens",
-                "total_tokens",
-                "requests",
-                "estimated_cost_usd",
-                f"actual_cost_{billed_currency.lower()}",
-                "actual_cost_currency",
-                "newapi_o1_usd_lifetime",
-                "newapi_o2_usd_lifetime",
-                "newapi_total_usd_lifetime",
-                "azure_credits_remaining",
-                "azure_credits_limit",
-                "credits_currency",
-                "azure_credits_consumed_pct",
-                "alert_announced_pct",
+                "Account",
+                "Owner",
+                "NewAPI name",
+                "Endpoint",
+                "Input tokens",
+                "Output tokens",
+                "Estimated cost USD",
+                "O1 spend USD",
+                "O2 spend USD",
+                "Total NewAPI USD",
+                "O1 payable USD",
+                "O2 payable USD",
+                "O1+O2 payable USD",
+                "Amount payable USD",
+                "Current balance USD",
+                "Credit grant USD",
+                "Settled",
             ]
         )
         totals = {
-            "input": 0,
-            "output": 0,
-            "tokens": 0,
-            "requests": 0,
+            "input": 0.0,
+            "output": 0.0,
             "est": 0.0,
-            "actual": 0.0,
             "o1": 0.0,
             "o2": 0.0,
             "newapi": 0.0,
-            "remaining": 0.0,
-            "limit": 0.0,
-            "consumed": 0.0,
+            "payable_o1": 0.0,
+            "payable_o2": 0.0,
+            "payable_o1_o2": 0.0,
+            "payable": 0.0,
+            "balance": 0.0,
+            "grant": 0.0,
         }
         for account in accounts:
-            usage = breakdown.get(account.id, {})
-            input_tokens, output_tokens = io_by_account.get(account.name, [0, 0])
-            o1 = account.new_api_cost_o1_usd or 0.0
-            o2 = account.new_api_cost_o2_usd or 0.0
-            new_api_total = account.new_api_cost_usd or 0.0
-            actual, actual_currency = billed.get(account.id, (0.0, billed_currency))
-            percent = consumed_percent(account)
+            input_tokens, output_tokens, estimated = by_account.get(account.name, [0.0, 0.0, 0.0])
+            labels = {part for part in (account.new_api_gateway or "").split("+") if part in {"O1", "O2"}}
+            o1 = account.new_api_cost_o1_usd if "O1" in labels else None
+            o2 = account.new_api_cost_o2_usd if "O2" in labels else None
+            newapi = account.new_api_cost_usd if labels else None
+            if newapi is None and (o1 is not None or o2 is not None):
+                newapi = (o1 or 0.0) + (o2 or 0.0)
+            payable = None if newapi is None else round(max(newapi, 0.0) * _PAYABLE_RATE, 2)
+            payable_o1 = None if o1 is None else round(max(o1, 0.0) * _PAYABLE_RATE, 2)
+            payable_o2 = None if o2 is None else round(max(o2, 0.0) * _PAYABLE_RATE, 2)
+            payable_o1_o2 = None if payable_o1 is None and payable_o2 is None else round((payable_o1 or 0.0) + (payable_o2 or 0.0), 2)
+            balance = account.credits_remaining if account.credits_available else None
+            grant = account.credits_limit if account.credits_available else None
             totals["input"] += input_tokens
             totals["output"] += output_tokens
-            totals["tokens"] += usage.get("total_tokens", 0)
-            totals["requests"] += usage.get("requests", 0)
-            totals["est"] += usage.get("estimated_cost_usd", 0.0)
-            totals["actual"] += actual
-            totals["o1"] += o1
-            totals["o2"] += o2
-            totals["newapi"] += new_api_total
-            if (account.credits_currency or billed_currency) == billed_currency:
-                totals["remaining"] += account.credits_remaining or 0.0
-                totals["limit"] += account.credits_limit or 0.0
-            if percent is not None and account.credits_limit:
-                totals["consumed"] += max((account.credits_limit or 0) - (account.credits_remaining or 0), 0.0)
+            totals["est"] += estimated
+            if o1 is not None:
+                totals["o1"] += o1
+            if o2 is not None:
+                totals["o2"] += o2
+            if newapi is not None:
+                totals["newapi"] += newapi
+            if payable is not None:
+                totals["payable"] += payable
+            if payable_o1 is not None:
+                totals["payable_o1"] += payable_o1
+            if payable_o2 is not None:
+                totals["payable_o2"] += payable_o2
+            if payable_o1_o2 is not None:
+                totals["payable_o1_o2"] += payable_o1_o2
+            if balance is not None:
+                totals["balance"] += balance
+            if grant is not None:
+                totals["grant"] += grant
             writer.writerow(
                 [
                     account.name,
+                    account.owner_tag or "",
+                    account.new_api_name or "",
                     account.endpoint or "",
-                    account.new_api_gateway or "",
-                    _status_text(account.new_api_status),
-                    _status_text(account.new_api_status_o1),
-                    _status_text(account.new_api_status_o2),
-                    input_tokens,
-                    output_tokens,
-                    usage.get("total_tokens", 0),
-                    usage.get("requests", 0),
-                    round(usage.get("estimated_cost_usd", 0.0), 2),
-                    round(actual, 2),
-                    actual_currency,
-                    round(o1, 2),
-                    round(o2, 2),
-                    round(new_api_total, 2),
-                    round(account.credits_remaining, 2) if account.credits_remaining is not None else "",
-                    round(account.credits_limit, 2) if account.credits_limit is not None else "",
-                    account.credits_currency or "",
-                    round(percent, 1) if percent is not None else "",
-                    account.new_api_alert_level or "",
+                    int(input_tokens),
+                    int(output_tokens),
+                    round(estimated, 2),
+                    "" if o1 is None else round(o1, 2),
+                    "" if o2 is None else round(o2, 2),
+                    "" if newapi is None else round(newapi, 2),
+                    "" if payable_o1 is None else payable_o1,
+                    "" if payable_o2 is None else payable_o2,
+                    "" if payable_o1_o2 is None else payable_o1_o2,
+                    "" if payable is None else payable,
+                    "" if balance is None else round(balance, 2),
+                    "" if grant is None else round(grant, 2),
+                    "settled" if getattr(account, "payable_settled", False) else "",
                 ]
             )
-        combined_percent = (
-            round(totals["consumed"] / totals["limit"] * 100, 1) if totals["limit"] > 0 else ""
-        )
         writer.writerow(
             [
                 "TOTAL",
                 "",
                 "",
                 "",
-                "",
-                "",
-                totals["input"],
-                totals["output"],
-                totals["tokens"],
-                totals["requests"],
+                int(totals["input"]),
+                int(totals["output"]),
                 round(totals["est"], 2),
-                round(totals["actual"], 2),
-                billed_currency,
                 round(totals["o1"], 2),
                 round(totals["o2"], 2),
                 round(totals["newapi"], 2),
-                round(totals["remaining"], 2),
-                round(totals["limit"], 2),
-                "",
-                combined_percent,
+                round(totals["payable_o1"], 2),
+                round(totals["payable_o2"], 2),
+                round(totals["payable_o1_o2"], 2),
+                round(totals["payable"], 2),
+                round(totals["balance"], 2),
+                round(totals["grant"], 2),
                 "",
             ]
-        )
-
-        writer.writerow([])
-        writer.writerow(["PER-DEPLOYMENT USAGE"])
-        writer.writerow(
-            ["account", "endpoint", "deployment", "model", "input_tokens", "output_tokens", "total_tokens", "estimated_cost_usd"]
-        )
-        model_totals = [0, 0, 0, 0.0]
-        for row in deployment_rows:
-            model_totals[0] += row["input_tokens"]
-            model_totals[1] += row["output_tokens"]
-            model_totals[2] += row["total_tokens"]
-            model_totals[3] += row["total_cost"]
-            writer.writerow([row[field] for field in _EXPORT_FIELDS])
-        writer.writerow(
-            ["TOTAL", "", "", "", model_totals[0], model_totals[1], model_totals[2], round(model_totals[3], 2)]
         )
 
         filename = _csv_filename(group_label, range_key)
         return filename, buffer.getvalue().encode("utf-8")
 
     async def _resolve_account_ids(
-        self, account_id: int | None, group_id: int | None, gateway: str | None = None
+        self,
+        account_id: int | None,
+        group_id: int | None,
+        gateway: str | None = None,
+        owner: str | None = None,
     ) -> list[int] | None:
         """A group filter takes precedence over a single-account filter since
         picking a group implies "every account in it", which a lone account_id
-        can't express. An optional gateway filter (O1/O2) narrows further to
-        accounts matched on that NewAPI portal.
+        can't express. Owner and gateway filters intersect with that scope.
         """
         ids: list[int] | None = None
         if group_id is not None:
             ids = await self._account_group_repository.member_account_ids(group_id)
         elif account_id is not None:
             ids = [account_id]
-        if gateway:
+        if owner or gateway:
             accounts = await self._account_repository.list_all()
-            gateway_ids = {a.id for a in accounts if _in_gateway_scope(a.new_api_gateway, gateway)}
-            ids = [i for i in ids if i in gateway_ids] if ids is not None else sorted(gateway_ids)
+            if owner:
+                if owner == UNTAGGED:
+                    owner_ids = {a.id for a in accounts if not (a.owner_tag or "").strip()}
+                else:
+                    owner_ids = {a.id for a in accounts if (a.owner_tag or "") == owner}
+                ids = [i for i in ids if i in owner_ids] if ids is not None else sorted(owner_ids)
+            if gateway:
+                gateway_ids = {a.id for a in accounts if _in_gateway_scope(a.new_api_gateway, gateway)}
+                ids = [i for i in ids if i in gateway_ids] if ids is not None else sorted(gateway_ids)
             if not ids:
-                # Sentinel that matches no rows so an empty scope returns zeros
-                # instead of falling back to "all accounts".
                 ids = [-1]
         return ids
 
@@ -444,10 +431,6 @@ def _mark_estimated_usd(items: list[dict]) -> None:
     for item in items:
         item["estimated_cost"] = float(item.get("estimated_cost_usd") or 0)
         item["currency"] = "USD"
-
-
-def _status_text(status: int | None) -> str:
-    return {None: "", 1: "enabled", 2: "disabled", 3: "auto-disabled"}.get(status, str(status))
 
 
 def _in_gateway_scope(account_gateway: str | None, scope: str) -> bool:
@@ -471,4 +454,4 @@ def _in_gateway_scope(account_gateway: str | None, scope: str) -> bool:
 def _csv_filename(group_label: str, range_key: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", group_label).strip("-._") or "all"
     day = datetime.now(timezone.utc).date().isoformat()
-    return f"usage_{safe}_{range_key}_{day}.csv"
+    return f"billing_{safe}_{range_key}_{day}.csv"

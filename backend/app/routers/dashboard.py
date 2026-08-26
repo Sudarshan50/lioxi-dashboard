@@ -26,9 +26,10 @@ async def overview(
     model_id: int | None = None,
     group_id: int | None = None,
     gateway: str | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    return await service.get_overview(range, account_id, model_id, group_id, gateway)
+    return await service.get_overview(range, account_id, model_id, group_id, gateway, owner)
 
 
 @router.get("/timeseries", response_model=list[TimeseriesPoint])
@@ -38,9 +39,10 @@ async def timeseries(
     model_id: int | None = None,
     group_id: int | None = None,
     gateway: str | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    return await service.get_timeseries(range, account_id, model_id, group_id, gateway)
+    return await service.get_timeseries(range, account_id, model_id, group_id, gateway, owner)
 
 
 @router.get("/timeseries-by-account", response_model=list[AccountTpmPoint])
@@ -50,9 +52,10 @@ async def timeseries_by_account(
     model_id: int | None = None,
     group_id: int | None = None,
     gateway: str | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    return await service.get_timeseries_by_account(range, account_id, model_id, group_id, gateway)
+    return await service.get_timeseries_by_account(range, account_id, model_id, group_id, gateway, owner)
 
 
 @router.get("/by-account", response_model=list[BreakdownItem])
@@ -62,9 +65,10 @@ async def by_account(
     model_id: int | None = None,
     group_id: int | None = None,
     gateway: str | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    return await service.get_breakdown_by_account(range, model_id, account_id, group_id, gateway)
+    return await service.get_breakdown_by_account(range, model_id, account_id, group_id, gateway, owner)
 
 
 @router.get("/by-model", response_model=list[BreakdownItem])
@@ -74,9 +78,10 @@ async def by_model(
     model_id: int | None = None,
     group_id: int | None = None,
     gateway: str | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    return await service.get_breakdown_by_model(range, account_id, group_id, model_id, gateway)
+    return await service.get_breakdown_by_model(range, account_id, group_id, model_id, gateway, owner)
 
 
 @router.get("/by-deployment", response_model=list[BreakdownItem])
@@ -84,9 +89,10 @@ async def by_deployment(
     range: str = "7d",
     account_id: int | None = None,
     group_id: int | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    return await service.get_breakdown_by_monitored_model(range, account_id, group_id)
+    return await service.get_breakdown_by_monitored_model(range, account_id, group_id, owner)
 
 
 @router.get("/fx", response_model=FxRate)
@@ -101,9 +107,10 @@ async def export_csv(
     account_id: int | None = None,
     model_id: int | None = None,
     group_id: int | None = None,
+    owner: str | None = None,
     service: DashboardService = Depends(_service),
 ):
-    filename, content = await service.export_csv(range, account_id, model_id, group_id)
+    filename, content = await service.export_csv(range, account_id, model_id, group_id, owner)
     return Response(
         content=content,
         media_type="text/csv; charset=utf-8",

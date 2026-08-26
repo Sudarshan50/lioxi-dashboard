@@ -3,7 +3,7 @@ import { ReactNode } from "react";
 import { createPortal } from "react-dom";
 
 interface ModalProps {
-  title: string;
+  title: ReactNode;
   isOpen: boolean;
   onClose: () => void;
   children: ReactNode;
@@ -23,7 +23,7 @@ export default function Modal({ title, isOpen, onClose, children, widthClassName
       }}
     >
       <div
-        className={`flex max-h-[90vh] w-full ${widthClassName} flex-col rounded-2xl border border-surface-border bg-surface-raised p-5 shadow-card sm:p-6`}
+        className={`flex max-h-[90vh] w-full ${widthClassName} flex-col rounded-2xl border border-surface-border bg-surface-raised p-5 shadow-card transition-[max-width] duration-500 ease-out sm:p-6`}
       >
         <div className="mb-5 flex shrink-0 items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-100">{title}</h2>

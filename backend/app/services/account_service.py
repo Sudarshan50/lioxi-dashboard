@@ -11,6 +11,7 @@ from app.schemas.account import (
     AccountDiscoverRequest,
     AccountUpdateRequest,
 )
+from app.services.owner_tag import apply_owner_to_account, parse_owner_tag
 
 
 class AccountNotFoundError(Exception):
@@ -18,6 +19,10 @@ class AccountNotFoundError(Exception):
 
 
 class DuplicateAccountError(Exception):
+    pass
+
+
+class AccountValidationError(Exception):
     pass
 
 
@@ -56,6 +61,15 @@ class AccountService:
         existing = await self._account_repository.get_by_name(payload.name)
         if existing is not None:
             raise DuplicateAccountError("An account with that name already exists.")
+        resource = _filled_resource(
+            subscription_id=payload.subscription_id,
+            resource_name=payload.resource_name,
+            resource_id=payload.resource_id,
+            resource_group=payload.resource_group,
+            endpoint=payload.endpoint,
+            kind=payload.kind,
+            location=payload.location,
+        )
         account = ProviderAccount(
             name=payload.name,
             provider_type="azure_openai",
@@ -63,13 +77,20 @@ class AccountService:
             client_id=payload.client_id,
             client_secret_encrypted=self._secret_box.encrypt(payload.client_secret),
             subscription_id=payload.subscription_id,
-            resource_id=payload.resource_id,
-            resource_group=payload.resource_group,
-            resource_name=payload.resource_name,
-            endpoint=payload.endpoint,
-            kind=payload.kind,
-            location=payload.location,
+            resource_id=resource["resource_id"],
+            resource_group=resource["resource_group"],
+            resource_name=resource["resource_name"],
+            endpoint=resource["endpoint"],
+            kind=resource["kind"],
+            location=resource["location"],
         )
+        _apply_credit_grant(account, payload.credits_limit, manual=True)
+        try:
+            account.owner_tag = parse_owner_tag(payload.owner_tag)
+        except ValueError as exc:
+            raise AccountValidationError(str(exc)) from exc
+        siblings = await self._account_repository.list_all()
+        apply_owner_to_account(account, [*siblings, account])
         try:
             return await self._account_repository.create(account)
         except IntegrityError as exc:
@@ -109,10 +130,33 @@ class AccountService:
             existing = await self._account_repository.get_by_name(payload.name)
             if existing is not None:
                 raise DuplicateAccountError("An account with that name already exists.")
-        for field in ("name", "resource_id", "resource_group", "resource_name", "endpoint", "kind", "location"):
-            value = getattr(payload, field)
-            if value is not None:
-                setattr(account, field, value)
+        resource_fields = {
+            "resource_id": payload.resource_id if payload.resource_id is not None else account.resource_id,
+            "resource_group": payload.resource_group if payload.resource_group is not None else account.resource_group,
+            "resource_name": payload.resource_name if payload.resource_name is not None else account.resource_name,
+            "endpoint": payload.endpoint if payload.endpoint is not None else account.endpoint,
+            "kind": payload.kind if payload.kind is not None else account.kind,
+            "location": payload.location if payload.location is not None else account.location,
+        }
+        if any(
+            getattr(payload, field) is not None
+            for field in ("resource_id", "resource_group", "resource_name", "endpoint", "kind", "location")
+        ):
+            filled = _filled_resource(subscription_id=account.subscription_id, **resource_fields)
+            for key, value in filled.items():
+                setattr(account, key, value)
+        if payload.name is not None:
+            account.name = payload.name
+        if payload.credits_limit is not None:
+            _apply_credit_grant(account, payload.credits_limit, manual=True)
+        if payload.credits_limit_manual is not None:
+            account.credits_limit_manual = payload.credits_limit_manual
+        if payload.owner_tag is not None:
+            try:
+                account.owner_tag = parse_owner_tag(payload.owner_tag)
+            except ValueError as exc:
+                raise AccountValidationError(str(exc)) from exc
+        apply_owner_to_account(account, await self._account_repository.list_all())
         try:
             return await self._account_repository.save(account)
         except IntegrityError as exc:
@@ -135,3 +179,56 @@ class AccountService:
             client_secret=self._secret_box.decrypt(account.client_secret_encrypted),
             subscription_id=account.subscription_id,
         )
+
+
+def _filled_resource(
+    *,
+    subscription_id: str,
+    resource_name: str,
+    resource_id: str = "",
+    resource_group: str = "",
+    endpoint: str = "",
+    kind: str = "",
+    location: str = "",
+) -> dict[str, str]:
+    name = (resource_name or "").strip()
+    if not name:
+        raise AccountValidationError("Resource name is required.")
+    group = (resource_group or "").strip() or "manual"
+    kind_value = (kind or "").strip() or "AIServices"
+    location_value = (location or "").strip()
+    endpoint_value = (endpoint or "").strip()
+    if not endpoint_value:
+        endpoint_value = f"https://{name}.cognitiveservices.azure.com/"
+    resource_id_value = (resource_id or "").strip()
+    if not resource_id_value:
+        resource_id_value = (
+            f"/subscriptions/{subscription_id}/resourceGroups/{group}"
+            f"/providers/Microsoft.CognitiveServices/accounts/{name}"
+        )
+    return {
+        "resource_name": name,
+        "resource_group": group,
+        "kind": kind_value,
+        "location": location_value,
+        "endpoint": endpoint_value,
+        "resource_id": resource_id_value,
+    }
+
+
+def _apply_credit_grant(account: ProviderAccount, limit: float | None, *, manual: bool) -> None:
+    if limit is None:
+        return
+    if limit <= 0:
+        raise AccountValidationError("Credit grant must be greater than 0.")
+    account.credits_limit = float(limit)
+    if account.credits_remaining is None or account.credits_remaining > limit:
+        account.credits_remaining = float(limit)
+    if account.credits_used is None:
+        account.credits_used = 0.0
+    account.credits_currency = account.credits_currency or "USD"
+    account.credits_unit = "currency"
+    account.credits_label = "Manual credit grant" if manual else (account.credits_label or "Credits")
+    account.credits_available = True
+    if manual:
+        account.credits_limit_manual = True

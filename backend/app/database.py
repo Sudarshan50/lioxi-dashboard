@@ -26,10 +26,12 @@ _ACCOUNT_EXTRA_COLUMNS = (
     ("credits_unit", "VARCHAR(16)"),
     ("credits_label", "VARCHAR(256)"),
     ("credits_available", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("credits_limit_manual", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("new_api_gateway", "VARCHAR(8)"),
     ("new_api_channel_id", "INTEGER"),
     ("new_api_name", "VARCHAR(128)"),
     ("new_api_tag", "VARCHAR(128)"),
+    ("owner_tag", "VARCHAR(64)"),
     ("new_api_used_quota", "DOUBLE PRECISION"),
     ("new_api_cost_o1_usd", "DOUBLE PRECISION"),
     ("new_api_cost_o2_usd", "DOUBLE PRECISION"),
@@ -41,6 +43,9 @@ _ACCOUNT_EXTRA_COLUMNS = (
     ("new_api_priority", "INTEGER"),
     ("new_api_synced_at", "TIMESTAMPTZ"),
     ("new_api_alert_level", "INTEGER NOT NULL DEFAULT 0"),
+    ("payable_settled", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("payable_settled_at", "TIMESTAMPTZ"),
+    ("at_cap_manual", "BOOLEAN NOT NULL DEFAULT FALSE"),
 )
 
 

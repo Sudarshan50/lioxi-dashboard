@@ -1,0 +1,3 @@
+Name,Endpoint
+Alice,https://example-resource.openai.azure.com/
+Bob,https://another-resource.cognitiveservices.azure.com/

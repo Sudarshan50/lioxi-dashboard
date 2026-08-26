@@ -122,6 +122,24 @@ def _membership(account: ProviderAccount) -> set[str]:
     return {part for part in (account.new_api_gateway or "").split("+") if part in {"O1", "O2"}}
 
 
+def _channel_status(raw) -> int | None:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _portal_status(channels: list[dict]) -> int | None:
+    """On if any channel is enabled (1). Any other known NewAPI status
+    (2 = manual disable, 3 = auto-disable) is off.
+    """
+    known = [_channel_status(channel.get("status")) for channel in channels]
+    known = [status for status in known if status is not None]
+    if not known:
+        return None
+    return 1 if any(status == 1 for status in known) else 2
+
+
 def _set_portal_cost_status(account: ProviderAccount, label: str, quota: float, status: int | None) -> None:
     cost = _quota_to_usd(quota)
     if label == "O1":
@@ -137,9 +155,9 @@ def _clear_portal(account: ProviderAccount, label: str) -> None:
 
 
 def recompute_overall_status(account: ProviderAccount) -> None:
-    """Enabled while any known portal is live or unknown. Unknown is treated
-    as live so a failed fetch cannot mark an exhausted account 'off' and
-    stop auto-disable retries.
+    """Enabled while any mapped portal is enabled or unknown. Unknown stays
+    live so a failed fetch cannot mark an exhausted account 'off' and stop
+    auto-disable retries. Auto-disabled (3) is treated as off.
     """
     labels = _membership(account)
     statuses: list[int | None] = []
@@ -150,7 +168,7 @@ def recompute_overall_status(account: ProviderAccount) -> None:
     if not statuses:
         account.new_api_status = None
         return
-    account.new_api_status = 1 if any(status != 2 for status in statuses) else 2
+    account.new_api_status = 1 if any(status is None or status == 1 for status in statuses) else 2
 
 
 def gateway_still_live(account: ProviderAccount) -> bool:
@@ -238,8 +256,8 @@ async def set_gateway_status(
     session: AsyncSession, account_id: int, status: int, gateway_label: str | None = None
 ) -> dict:
     """Flips every channel for this account's Azure resource. By default acts on
-    every configured gateway (combined spend draws the same Azure credits);
-    pass gateway_label="O1"/"O2" to touch only that portal.
+    portals this account is already mapped to (O1, O2, or both). Pass
+    gateway_label="O1"/"O2" to touch only that portal.
     """
     async with _gateway_lock:
         return await _set_gateway_status_locked(session, account_id, status, gateway_label)
@@ -254,7 +272,10 @@ async def _set_gateway_status_locked(
     key = _account_key(account)
     if not key:
         raise NewApiError("Account has no endpoint to match against")
+    membership = _membership(account)
     targets = [gw for gw in gateways() if gateway_label is None or gw.label == gateway_label]
+    if gateway_label is None and membership:
+        targets = [gw for gw in targets if gw.label in membership]
     if not targets:
         raise NewApiError(f"Gateway {gateway_label} is not configured")
 
@@ -265,6 +286,8 @@ async def _set_gateway_status_locked(
             channels = await fetch_channels(gateway)
             matches = [channel for channel in channels if _host_key(channel.get("base_url")) == key]
             if not matches:
+                if membership and gateway.label not in membership:
+                    continue
                 errors[gateway.label] = "no matching channels"
                 continue
             changed: list[int] = []
@@ -346,21 +369,18 @@ async def _sync_new_api_locked(session: AsyncSession) -> dict:
     for account in accounts:
         labelled = matched.get(account.id, [])
         quota_by_label: dict[str, float] = {}
-        status_by_label: dict[str, int | None] = {}
         channels_by_label: dict[str, list[dict]] = {}
         for label, channel in labelled:
             quota_by_label[label] = quota_by_label.get(label, 0.0) + float(channel.get("used_quota") or 0)
             channels_by_label.setdefault(label, []).append(channel)
-            current = status_by_label.get(label)
-            if current == 1:
-                continue
-            status_by_label[label] = 1 if channel.get("status") == 1 else channel.get("status")
 
         membership = _membership(account)
         for label in fetched_ok:
             if label in quota_by_label:
                 membership.add(label)
-                _set_portal_cost_status(account, label, quota_by_label[label], status_by_label.get(label))
+                _set_portal_cost_status(
+                    account, label, quota_by_label[label], _portal_status(channels_by_label[label])
+                )
             else:
                 membership.discard(label)
                 _clear_portal(account, label)

@@ -22,6 +22,12 @@ services:
     env_file: .env
     environment:
       POSTGRES_HOST: db
+    extra_hosts:
+      # Campus DNS also returns IPv6 for ARM that this network cannot reach.
+      - "management.azure.com:4.150.240.10"
+      - "arm-0001.arm-msedge.net:4.150.240.10"
+      - "login.microsoftonline.com:20.190.145.142"
+      - "login.microsoft.com:20.190.146.32"
     depends_on:
       db:
         condition: service_healthy

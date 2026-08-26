@@ -50,6 +50,8 @@ export function useCreateAccount() {
     mutationFn: async (payload: Record<string, unknown>) => (await apiClient.post<Account>("/api/accounts", payload)).data,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-groups"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
     },
   });
 }
@@ -69,9 +71,14 @@ export function useUpdateAccount() {
       endpoint?: string;
       kind?: string;
       location?: string;
+      credits_limit?: number;
+      credits_limit_manual?: boolean;
+      owner_tag?: string;
     }) => (await apiClient.patch<Account>(`/api/accounts/${accountId}`, payload)).data,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-groups"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
     },
   });
 }
@@ -82,6 +89,7 @@ export function useDeleteAccount() {
     mutationFn: async (accountId: number) => apiClient.delete(`/api/accounts/${accountId}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-groups"] });
     },
   });
 }
@@ -99,6 +107,7 @@ export function useSyncAccount() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
       queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
     },
   });
 }
@@ -116,6 +125,7 @@ export function useSetGatewayStatus() {
       ).data,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-groups"] });
     },
   });
 }

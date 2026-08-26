@@ -1,4 +1,4 @@
-import { Cloud, Layers, Pencil, Plus, RefreshCw, Search, Trash2, Upload } from "lucide-react";
+import { Cloud, Layers, Pencil, Plus, RefreshCw, Search, Trash2, Upload, X } from "lucide-react";
 import { useMemo, useState } from "react";
 
 import AccountCard from "@/components/accounts/AccountCard";
@@ -10,25 +10,63 @@ import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import EmptyState from "@/components/ui/EmptyState";
+import OwnerChips from "@/components/ui/OwnerChips";
 import Select from "@/components/ui/Select";
 import Spinner from "@/components/ui/Spinner";
 import { useAccounts, useSyncAccounts } from "@/hooks/useAccounts";
 import { useAccountGroups, useDeleteAccountGroup } from "@/hooks/useAccountGroups";
+import { useUsdInrRate } from "@/hooks/useDashboard";
+import {
+  combinedSpendUsd,
+  compareOptionalNumbers,
+  compareOptionalText,
+  consumedPercent,
+  creditLeftRatio,
+  creditOutstandingUsd,
+  creditRemainingUsd,
+  finiteNumber,
+  gatewayRank,
+  portalSpendUsd,
+} from "@/lib/accountSort";
+import { amountPayableUsd } from "@/lib/payable";
+import { formatCurrency } from "@/lib/format";
+import { matchesOwner, ownerCounts, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
 import { Account, AccountGroup } from "@/types";
 
-type AccountSort = "name" | "synced" | "credits-left" | "outstanding" | "newapi-spend";
+type AccountSort =
+  | "name"
+  | "name-desc"
+  | "synced"
+  | "credits-left"
+  | "credits-left-desc"
+  | "consumed"
+  | "outstanding"
+  | "newapi-spend"
+  | "payable"
+  | "newapi-o1"
+  | "newapi-o2"
+  | "gateway"
+  | "owner"
+  | "location"
+  | "created";
+
+type GatewayFilter = "all" | "o1" | "o2" | "both" | "disabled" | "none";
 
 export default function AccountsPage() {
   const { data: accounts, isLoading, isError: accountsError } = useAccounts();
   const { data: groups, isLoading: isGroupsLoading, isError: groupsError } = useAccountGroups();
   const { syncAccounts, progress, isSyncing } = useSyncAccounts();
   const deleteGroup = useDeleteAccountGroup();
+  const fx = useUsdInrRate();
+  const usdInr = fx.data?.usd_inr ?? 87;
 
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isBulkOpen, setIsBulkOpen] = useState(false);
   const [isGroupModalOpen, setIsGroupModalOpen] = useState(false);
   const [editingGroup, setEditingGroup] = useState<AccountGroup | null>(null);
   const [search, setSearch] = useState("");
+  const [ownerFilter, setOwnerFilter] = useState<string | null>(null);
+  const [gatewayFilter, setGatewayFilter] = useState<GatewayFilter>("all");
   const [sort, setSort] = useState<AccountSort>("name");
   const [syncAllMessage, setSyncAllMessage] = useState<string | null>(null);
   const [syncAllError, setSyncAllError] = useState<string | null>(null);
@@ -81,21 +119,54 @@ export default function AccountsPage() {
     setIsGroupModalOpen(true);
   }
 
-  const filteredAccounts = useMemo(() => {
-    const needle = search.trim().toLowerCase();
-    const visible = (accounts ?? []).filter((account) => {
-      if (needle) {
-        const haystack = `${account.name} ${account.resource_name} ${account.new_api_name ?? ""} ${account.new_api_tag ?? ""}`.toLowerCase();
-        if (!haystack.includes(needle)) return false;
+  const groupsByAccountId = useMemo(() => {
+    const map = new Map<number, string[]>();
+    for (const group of groups ?? []) {
+      for (const member of group.accounts) {
+        const names = map.get(member.id) ?? [];
+        names.push(group.name);
+        map.set(member.id, names);
       }
-      if (sort === "synced") return syncTime(account) != null;
-      if (sort === "credits-left") return creditRemaining(account) != null;
-      if (sort === "outstanding") return creditOutstanding(account) != null;
-      if (sort === "newapi-spend") return account.new_api_cost_usd != null;
-      return true;
+    }
+    return map;
+  }, [groups]);
+
+  const ownerStats = useMemo(() => ownerCounts(accounts ?? []), [accounts]);
+  const owners = useMemo(() => uniqueOwners(accounts ?? []), [accounts]);
+
+  const filteredAccounts = useMemo(() => {
+    const visible = (accounts ?? []).filter((account) => {
+      if (!matchesOwner(account.owner_tag, ownerFilter)) return false;
+      if (!matchesGatewayFilter(account, gatewayFilter)) return false;
+      return matchesAccountSearch(account, search, groupsByAccountId.get(account.id) ?? []);
     });
-    return [...visible].sort((left, right) => compareAccounts(left, right, sort));
-  }, [accounts, search, sort]);
+    return [...visible].sort((left, right) => compareAccounts(left, right, sort, usdInr));
+  }, [accounts, gatewayFilter, groupsByAccountId, ownerFilter, search, sort, usdInr]);
+
+  const hasActiveFilters = Boolean(search.trim() || ownerFilter || gatewayFilter !== "all");
+
+  function resetFilters() {
+    setSearch("");
+    setOwnerFilter(null);
+    setGatewayFilter("all");
+  }
+
+  const ownerTotals = useMemo(() => {
+    const spend = filteredAccounts.reduce((sum, account) => sum + (account.new_api_cost_usd || 0), 0);
+    const payable = filteredAccounts.reduce((sum, account) => sum + amountPayableUsd(account.new_api_cost_usd), 0);
+    return { spend, payable, count: filteredAccounts.length };
+  }, [filteredAccounts]);
+
+  const accountsByTag = useMemo(() => {
+    const groups = new Map<string, typeof filteredAccounts>();
+    for (const account of filteredAccounts) {
+      const tag = ownerLabel(account.owner_tag);
+      const rows = groups.get(tag) ?? [];
+      rows.push(account);
+      groups.set(tag, rows);
+    }
+    return [...groups.entries()].sort((left, right) => left[0].localeCompare(right[0], undefined, { sensitivity: "base" }));
+  }, [filteredAccounts]);
 
   return (
     <div className="flex flex-col gap-5 sm:gap-6">
@@ -141,12 +212,19 @@ export default function AccountsPage() {
               <Card key={group.id} className="flex flex-col gap-2">
                 <div className="flex items-start justify-between gap-2">
                   <p className="font-medium text-gray-100">{group.name}</p>
-                  <Badge tone="neutral">
-                    {group.accounts.length} account{group.accounts.length === 1 ? "" : "s"}
-                  </Badge>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {group.auto && <Badge tone="info">auto</Badge>}
+                    <Badge tone="neutral">
+                      {group.accounts.length} account{group.accounts.length === 1 ? "" : "s"}
+                    </Badge>
+                  </div>
                 </div>
                 <p className="truncate text-xs text-gray-500">
-                  {group.accounts.length > 0 ? group.accounts.map((a) => a.name).join(", ") : "No accounts yet"}
+                  {group.auto
+                    ? "Auto-filled from ~$1,000 Azure credit grants"
+                    : group.accounts.length > 0
+                      ? group.accounts.map((a) => a.name).join(", ")
+                      : "No accounts yet"}
                 </p>
                 <div className="mt-1 flex gap-2">
                   <Button variant="secondary" className="px-2.5 py-1.5 text-xs" onClick={() => openEditGroup(group)}>
@@ -175,44 +253,136 @@ export default function AccountsPage() {
       </section>
 
       <section className="flex flex-col gap-3">
-        <h2 className="text-sm font-semibold text-gray-200">All accounts</h2>
+        <div className="flex items-baseline justify-between gap-3">
+          <h2 className="text-sm font-semibold text-gray-200">All accounts</h2>
+          {accounts && accounts.length > 0 && (
+            <p className="text-xs tabular-nums text-gray-500">
+              {filteredAccounts.length === accounts.length
+                ? `${accounts.length} account${accounts.length === 1 ? "" : "s"}`
+                : `${filteredAccounts.length} of ${accounts.length}`}
+            </p>
+          )}
+        </div>
 
         {accounts && accounts.length > 0 && (
-          <Card className="flex flex-col gap-3 sm:flex-row sm:items-end">
-            <div className="relative min-w-0 w-full sm:max-w-sm">
-              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search accounts by name or resource"
-                className="w-full rounded-lg border border-surface-border bg-surface py-2 pl-8 pr-3 text-sm text-gray-100 outline-none transition-colors placeholder:text-gray-600 focus:border-accent"
-              />
-            </div>
-            <div className="w-full sm:max-w-[14rem]">
-              <Select label="Sort by" value={sort} onChange={(e) => setSort(e.target.value as AccountSort)}>
-                <option value="name">Name</option>
-                <option value="synced">Last synced</option>
-                <option value="credits-left">Credits left</option>
-                <option value="outstanding">Outstanding amount</option>
+          <div className="rounded-2xl border border-white/[0.06] bg-surface-raised/80 bg-card-sheen p-4 shadow-card backdrop-blur-sm sm:p-5">
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_11.5rem_13.5rem] xl:items-end">
+              <div className="flex min-w-0 flex-col gap-1.5 md:col-span-2 xl:col-span-1">
+                <label htmlFor="account-search" className="text-xs font-medium text-gray-400">
+                  Search
+                </label>
+                <div className="relative">
+                  <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                  <input
+                    id="account-search"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Name, resource, channel, tag, or group"
+                    className="w-full rounded-lg border border-surface-border bg-black/30 py-2 pl-8 pr-9 text-sm text-gray-100 outline-none transition-colors placeholder:text-gray-600 focus:border-accent"
+                  />
+                  {search && (
+                    <button
+                      type="button"
+                      onClick={() => setSearch("")}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-md p-0.5 text-gray-500 hover:text-gray-200"
+                      aria-label="Clear search"
+                    >
+                      <X size={14} />
+                    </button>
+                  )}
+                </div>
+              </div>
+              <Select
+                id="account-gateway-filter"
+                label="Gateway"
+                value={gatewayFilter}
+                onChange={(e) => setGatewayFilter(e.target.value as GatewayFilter)}
+              >
+                <option value="all">All gateways</option>
+                <option value="both">O1 + O2</option>
+                <option value="o1">On O1</option>
+                <option value="o2">On O2</option>
+                <option value="disabled">Disabled</option>
+                <option value="none">No NewAPI match</option>
+              </Select>
+              <Select id="account-sort" label="Sort by" value={sort} onChange={(e) => setSort(e.target.value as AccountSort)}>
+                <option value="name">Name A–Z</option>
+                <option value="name-desc">Name Z–A</option>
+                <option value="credits-left">Credits left (low)</option>
+                <option value="credits-left-desc">Credits left (high)</option>
+                <option value="consumed">Consumed %</option>
+                <option value="outstanding">Outstanding</option>
                 <option value="newapi-spend">NewAPI spend</option>
+                <option value="payable">Amount payable</option>
+                <option value="newapi-o1">O1 spend</option>
+                <option value="newapi-o2">O2 spend</option>
+                <option value="gateway">Gateway status</option>
+                <option value="owner">Tag</option>
+                <option value="location">Location</option>
+                <option value="synced">Last synced</option>
+                <option value="created">Recently added</option>
               </Select>
             </div>
-          </Card>
+
+            <OwnerChips
+              owners={owners}
+              counts={ownerStats.counts}
+              untagged={ownerStats.untagged}
+              value={ownerFilter}
+              onChange={setOwnerFilter}
+            />
+
+            {ownerFilter && (
+              <p className="mt-3 text-xs text-gray-500">
+                Combined for {ownerFilter === UNTAGGED_OWNER ? "untagged" : ownerFilter}:{" "}
+                <span className="tabular-nums text-violet-300">{formatCurrency(ownerTotals.spend, "USD")}</span> spend ·{" "}
+                <span className="tabular-nums text-amber-200">{formatCurrency(ownerTotals.payable, "USD")}</span> payable ·{" "}
+                <span className="tabular-nums text-gray-300">{ownerTotals.count}</span> account
+                {ownerTotals.count === 1 ? "" : "s"}
+              </p>
+            )}
+
+            {hasActiveFilters && (
+              <div className="mt-3 flex items-center justify-end">
+                <button type="button" onClick={resetFilters} className="text-xs text-gray-500 hover:text-gray-200">
+                  Reset filters
+                </button>
+              </div>
+            )}
+          </div>
         )}
 
         {isLoading ? (
           <Spinner />
         ) : accounts && accounts.length > 0 ? (
           filteredAccounts.length > 0 ? (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-              {filteredAccounts.map((account) => (
-                <AccountCard key={account.id} account={account} />
-              ))}
+            <div className="flex flex-col gap-6">
+              {accountsByTag.map(([tag, rows]) => {
+                const spend = rows.reduce((sum, account) => sum + (account.new_api_cost_usd || 0), 0);
+                const payable = amountPayableUsd(spend);
+                return (
+                  <div key={tag} className="flex flex-col gap-3">
+                    <div className="flex flex-wrap items-baseline justify-between gap-2">
+                      <h3 className="text-sm font-semibold text-gray-200">{tag}</h3>
+                      <p className="text-xs text-gray-500">
+                        <span className="tabular-nums text-violet-300">{formatCurrency(spend, "USD")}</span> spend ·{" "}
+                        <span className="tabular-nums text-amber-200">{formatCurrency(payable, "USD")}</span> payable ·{" "}
+                        {rows.length} account{rows.length === 1 ? "" : "s"}
+                      </p>
+                    </div>
+                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                      {rows.map((account) => (
+                        <AccountCard key={account.id} account={account} />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           ) : (
             <EmptyState
               icon={<Search size={28} className="text-gray-600" />}
-              title={search.trim() ? "No accounts match your search" : emptySortTitle(sort)}
+              title={hasActiveFilters ? "No accounts match your filters" : "No accounts match"}
             />
           )
         ) : (
@@ -232,57 +402,108 @@ export default function AccountsPage() {
   );
 }
 
-function compareAccounts(left: Account, right: Account, sort: AccountSort): number {
-  const primary =
-    sort === "synced"
-      ? compareNumbers(syncTime(left), syncTime(right), "desc")
-      : sort === "credits-left"
-        ? compareNumbers(creditRemaining(left), creditRemaining(right), "asc")
-        : sort === "outstanding"
-          ? compareNumbers(creditOutstanding(left), creditOutstanding(right), "desc")
-          : sort === "newapi-spend"
-            ? compareNumbers(left.new_api_cost_usd, right.new_api_cost_usd, "desc")
-            : 0;
-  return primary !== 0 ? primary : left.name.localeCompare(right.name, undefined, { sensitivity: "base" });
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase().replace(/[_\-\s./]+/g, " ").trim();
+}
+
+function matchesAccountSearch(account: Account, rawQuery: string, groupNames: string[]): boolean {
+  const query = rawQuery.trim();
+  if (!query) return true;
+
+  const tagged = query.match(/^tag:\s*(.*)$/i);
+  const needle = normalizeSearchText(tagged ? tagged[1] : query);
+  if (tagged && !needle) return Boolean((account.new_api_tag ?? "").trim());
+  if (!needle) return true;
+
+  if (tagged) {
+    return (
+      tokensMatch(normalizeSearchText(account.new_api_tag ?? ""), needle) ||
+      tokensMatch(normalizeSearchText(account.new_api_name ?? ""), needle)
+    );
+  }
+
+  const haystack = normalizeSearchText(
+    [
+      account.name,
+      account.resource_name,
+      account.resource_group,
+      account.endpoint,
+      account.location,
+      account.owner_tag,
+      account.new_api_name,
+      account.new_api_tag,
+      account.new_api_gateway,
+      ...groupNames,
+    ]
+      .filter(Boolean)
+      .join(" ")
+  );
+  return tokensMatch(haystack, needle);
+}
+
+function tokensMatch(haystack: string, needle: string): boolean {
+  if (haystack.includes(needle)) return true;
+  return needle.split(/\s+/).filter(Boolean).every((token) => haystack.includes(token));
+}
+
+function gatewayLabels(account: Account): Set<string> {
+  return new Set((account.new_api_gateway ?? "").split("+").filter((part) => part === "O1" || part === "O2"));
+}
+
+function matchesGatewayFilter(account: Account, filter: GatewayFilter): boolean {
+  const labels = gatewayLabels(account);
+  if (filter === "all") return true;
+  if (filter === "none") return labels.size === 0;
+  if (filter === "both") return labels.has("O1") && labels.has("O2");
+  if (filter === "o1") return labels.has("O1");
+  if (filter === "o2") return labels.has("O2");
+  return account.new_api_status != null && account.new_api_status !== 1;
+}
+
+function compareAccounts(left: Account, right: Account, sort: AccountSort, usdInr: number): number {
+  const name = compareOptionalText(left.name, right.name);
+  let primary = 0;
+  if (sort === "name") primary = name;
+  else if (sort === "name-desc") primary = -name;
+  else if (sort === "synced") primary = compareOptionalNumbers(syncTime(left), syncTime(right), "desc");
+  else if (sort === "credits-left") {
+    primary = compareOptionalNumbers(creditLeftRatio(left), creditLeftRatio(right), "asc");
+  } else if (sort === "credits-left-desc") {
+    primary = compareOptionalNumbers(creditLeftRatio(left), creditLeftRatio(right), "desc");
+  } else if (sort === "consumed") primary = compareOptionalNumbers(consumedPercent(left), consumedPercent(right), "desc");
+  else if (sort === "outstanding") {
+    primary = compareOptionalNumbers(creditOutstandingUsd(left, usdInr), creditOutstandingUsd(right, usdInr), "desc");
+  } else if (sort === "newapi-spend") primary = compareOptionalNumbers(combinedSpendUsd(left), combinedSpendUsd(right), "desc");
+  else if (sort === "payable") {
+    const leftSpend = combinedSpendUsd(left);
+    const rightSpend = combinedSpendUsd(right);
+    primary = compareOptionalNumbers(
+      leftSpend == null ? null : amountPayableUsd(leftSpend),
+      rightSpend == null ? null : amountPayableUsd(rightSpend),
+      "desc"
+    );
+  } else if (sort === "newapi-o1") primary = compareOptionalNumbers(portalSpendUsd(left, "O1"), portalSpendUsd(right, "O1"), "desc");
+  else if (sort === "newapi-o2") primary = compareOptionalNumbers(portalSpendUsd(left, "O2"), portalSpendUsd(right, "O2"), "desc");
+  else if (sort === "gateway") primary = compareOptionalNumbers(gatewayRank(left), gatewayRank(right), "asc");
+  else if (sort === "owner") primary = compareOptionalText(left.owner_tag, right.owner_tag);
+  else if (sort === "location") primary = compareOptionalText(left.location, right.location);
+  else if (sort === "created") primary = compareOptionalNumbers(createdTime(left), createdTime(right), "desc");
+  if (primary !== 0) return primary;
+  if (sort === "credits-left" || sort === "credits-left-desc") {
+    const direction = sort === "credits-left" ? "asc" : "desc";
+    const dollars = compareOptionalNumbers(creditRemainingUsd(left, usdInr), creditRemainingUsd(right, usdInr), direction);
+    if (dollars !== 0) return dollars;
+  }
+  return name;
 }
 
 function syncTime(account: Account): number | null {
   if (!account.last_synced_at) return null;
-  const value = new Date(account.last_synced_at).getTime();
-  return Number.isFinite(value) ? value : null;
+  return finiteNumber(new Date(account.last_synced_at).getTime());
 }
 
-function hasMonetaryCredits(account: Account): boolean {
-  return account.credits_available && account.credits_unit === "currency";
+function createdTime(account: Account): number | null {
+  if (!account.created_at) return null;
+  return finiteNumber(new Date(account.created_at).getTime());
 }
 
-function creditRemaining(account: Account): number | null {
-  if (!hasMonetaryCredits(account) || !Number.isFinite(account.credits_remaining)) return null;
-  return account.credits_remaining;
-}
-
-function creditOutstanding(account: Account): number | null {
-  if (!hasMonetaryCredits(account)) return null;
-  if (account.credits_used != null && Number.isFinite(account.credits_used)) return Math.max(account.credits_used, 0);
-  if (account.credits_limit != null && account.credits_remaining != null) {
-    return Math.max(account.credits_limit - account.credits_remaining, 0);
-  }
-  return null;
-}
-
-function compareNumbers(left: number | null, right: number | null, direction: "asc" | "desc"): number {
-  if (left == null && right == null) return 0;
-  if (left == null) return 1;
-  if (right == null) return -1;
-  const delta = left - right;
-  if (delta === 0) return 0;
-  return direction === "asc" ? delta : -delta;
-}
-
-function emptySortTitle(sort: AccountSort): string {
-  if (sort === "synced") return "No accounts have been synced yet";
-  if (sort === "credits-left") return "No accounts have credit balances";
-  if (sort === "outstanding") return "No accounts have outstanding amounts";
-  if (sort === "newapi-spend") return "No accounts are matched to NewAPI channels yet";
-  return "No accounts match";
-}
