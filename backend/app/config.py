@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     telegram_chat_id: str | None = None
     telegram_admin_ids: str = ""  # comma-separated Telegram user ids allowed to command the bot
 
+    redis_url: str = "redis://redis:6379/0"
+    kimi_azure_cache_ttl_seconds: int = 900
+    submit_session_ttl_seconds: int = 1800
+
     @property
     def telegram_admin_id_set(self) -> set[str]:
         return {part.strip() for part in self.telegram_admin_ids.split(",") if part.strip()}

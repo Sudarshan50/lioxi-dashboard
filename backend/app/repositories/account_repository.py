@@ -20,6 +20,19 @@ class AccountRepository:
         result = await self._session.execute(select(ProviderAccount).where(ProviderAccount.name == name))
         return result.scalar_one_or_none()
 
+    async def get_by_subscription_and_resource(
+        self, subscription_id: str, resource_name: str
+    ) -> ProviderAccount | None:
+        result = await self._session.execute(
+            select(ProviderAccount)
+            .where(
+                ProviderAccount.subscription_id == subscription_id,
+                func.lower(ProviderAccount.resource_name) == resource_name.lower(),
+            )
+            .order_by(ProviderAccount.id)
+        )
+        return result.scalars().first()
+
     async def create(self, account: ProviderAccount) -> ProviderAccount:
         self._session.add(account)
         try:

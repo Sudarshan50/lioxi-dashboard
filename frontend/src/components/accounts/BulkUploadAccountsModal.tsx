@@ -16,6 +16,7 @@ import { useAccounts, useCreateAccount, useDiscoverDeployments, useDiscoverResou
 import { useCreateModel } from "@/hooks/useModels";
 import { useRegisteredModels } from "@/hooks/useRegisteredModels";
 import { AzureAccountImport, parseAzureAccountImportArray } from "@/lib/parseAzureCredentials";
+import { allocateUniqueName } from "@/lib/uniqueName";
 import { parseCreditGrant } from "@/components/accounts/ManualResourceFields";
 import OwnerTagField from "@/components/accounts/OwnerTagField";
 import { Deployment, DiscoveredResource } from "@/types";
@@ -120,23 +121,12 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
       setError(parsed.error);
       return;
     }
-    const seen = new Map<string, number>();
-    for (let index = 0; index < parsed.accounts.length; index++) {
-      const key = parsed.accounts[index].name.toLowerCase();
-      if (seen.has(key)) {
-        setError(`Duplicate account_name "${parsed.accounts[index].name}" in the JSON array.`);
-        return;
-      }
-      seen.set(key, index);
-    }
-    const existing = new Set((existingAccounts ?? []).map((account) => account.name.toLowerCase()));
-    const clash = parsed.accounts.find((account) => existing.has(account.name.toLowerCase()));
-    if (clash) {
-      setError(`"${clash.name}" already exists. Remove it from the JSON or rename it.`);
-      return;
-    }
-
-    const nextRows = parsed.accounts.map((account, index) => toRow(account, index));
+    const used = new Set((existingAccounts ?? []).map((account) => account.name));
+    const nextRows = parsed.accounts.map((account, index) => {
+      const name = allocateUniqueName(account.name, used);
+      used.add(name);
+      return toRow({ ...account, name }, index);
+    });
     setRows(nextRows);
     setStep("configure");
     setIsDiscovering(true);
@@ -562,6 +552,6 @@ function toRow(account: AzureAccountImport, index: number): ImportRow {
     creditsLimit: account.creditsLimit != null ? String(account.creditsLimit) : "",
     deploymentName: account.deploymentName ?? "",
     registeredId: "",
-    ownerTag: "",
+    ownerTag: account.ownerTag ?? "",
   };
 }

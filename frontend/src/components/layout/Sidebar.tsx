@@ -1,13 +1,17 @@
 import clsx from "clsx";
-import { BellRing, Cloud, Cpu, LayoutDashboard, LogOut, Rocket, X } from "lucide-react";
+import { BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, X } from "lucide-react";
 import { NavLink } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 
 import { useAuth } from "@/context/AuthContext";
+import apiClient from "@/lib/apiClient";
+import { PendingListResponse } from "@/types";
 
 const navItems = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
   { to: "/accounts", label: "Accounts", icon: Cloud },
   { to: "/deploy", label: "Deploy K3", icon: Rocket },
+  { to: "/pending", label: "Pending", icon: Inbox },
   { to: "/models", label: "Models", icon: Cpu },
   { to: "/alerts", label: "Alerts", icon: BellRing },
 ];
@@ -19,6 +23,13 @@ interface SidebarProps {
 
 export default function Sidebar({ isOpen, onClose }: SidebarProps) {
   const { logout } = useAuth();
+  const pending = useQuery({
+    queryKey: ["pending-submits"],
+    queryFn: async () => (await apiClient.get<PendingListResponse>("/api/pending")).data,
+    refetchInterval: 30_000,
+  });
+  const failedCount = pending.data?.failed_count ?? 0;
+  const waitingCount = pending.data?.pending_count ?? 0;
 
   return (
     <>
@@ -67,7 +78,17 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
                     <span className="absolute left-0 top-1/2 h-5 w-0.5 -translate-y-1/2 rounded-full bg-accent-gradient" />
                   )}
                   <Icon size={17} className={clsx("transition-transform duration-150 group-hover:scale-110", isActive && "text-indigo-300")} />
-                  {label}
+                  <span className="flex-1">{label}</span>
+                  {to === "/pending" && (failedCount > 0 || waitingCount > 0) && (
+                    <span
+                      className={clsx(
+                        "min-w-[1.25rem] rounded-full px-1.5 py-0.5 text-center text-[10px] font-semibold",
+                        failedCount > 0 ? "bg-red-500/20 text-red-300" : "bg-accent/20 text-indigo-200"
+                      )}
+                    >
+                      {failedCount > 0 ? failedCount : waitingCount}
+                    </span>
+                  )}
                 </>
               )}
             </NavLink>

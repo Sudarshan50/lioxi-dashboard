@@ -10,6 +10,7 @@ export interface AzureCredentialParseResult {
   filled: (keyof AzureCredentialFields)[];
   missing: (keyof AzureCredentialFields)[];
   error?: string;
+  ownerTag?: string;
 }
 
 const FIELD_ALIASES: Record<keyof AzureCredentialFields, string[]> = {
@@ -20,6 +21,17 @@ const FIELD_ALIASES: Record<keyof AzureCredentialFields, string[]> = {
 };
 
 const NESTED_KEYS = ["credentials", "azure", "sp", "servicePrincipal", "service_principal"];
+const PERSON_ALIASES = [
+  "person_associated",
+  "person_assoicated",
+  "person_associted",
+  "personAssociated",
+  "personAssoicated",
+  "personAssocited",
+  "PERSON_ASSOCIATED",
+  "owner_tag",
+  "ownerTag",
+];
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (value && typeof value === "object" && !Array.isArray(value)) return value as Record<string, unknown>;
@@ -43,10 +55,50 @@ function firstNumber(source: Record<string, unknown>, aliases: string[]): number
   return null;
 }
 
+function firstInt(
+  source: Record<string, unknown>,
+  aliases: string[],
+  opts?: { min?: number; max?: number }
+): number | null {
+  const lookup = new Map(Object.entries(source).map(([key, value]) => [normalizeKey(key), value]));
+  for (const alias of aliases) {
+    const value = lookup.get(normalizeKey(alias));
+    let parsed: number | null = null;
+    if (typeof value === "number" && Number.isFinite(value)) parsed = Math.trunc(value);
+    else if (typeof value === "string" && value.trim()) {
+      const n = Number(value.replace(/,/g, "").trim());
+      if (Number.isFinite(n)) parsed = Math.trunc(n);
+    }
+    if (parsed == null) continue;
+    if (opts?.min != null && parsed < opts.min) continue;
+    if (opts?.max != null && parsed > opts.max) continue;
+    return parsed;
+  }
+  return null;
+}
+
 function firstString(source: Record<string, unknown>, aliases: string[]): string {
   const lookup = new Map(Object.entries(source).map(([key, value]) => [normalizeKey(key), value]));
   for (const alias of aliases) {
     const value = lookup.get(normalizeKey(alias));
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function isPersonFieldKey(key: string) {
+  const norm = normalizeKey(key);
+  if (norm === "ownertag" || norm === "ownertags") return true;
+  if (!norm.startsWith("person")) return false;
+  const rest = norm.slice("person".length);
+  return rest.startsWith("assoc") || rest.startsWith("assoic");
+}
+
+function firstPerson(source: Record<string, unknown>): string {
+  const aliased = firstString(source, PERSON_ALIASES);
+  if (aliased) return aliased;
+  for (const [key, value] of Object.entries(source)) {
+    if (!isPersonFieldKey(key)) continue;
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return "";
@@ -153,10 +205,20 @@ function credentialsFromSources(sources: Record<string, unknown>[]): AzureCreden
     };
   }
 
-  return { values, filled, missing };
+  const ownerTag = (() => {
+    for (const source of sources) {
+      const value = firstPerson(source);
+      if (value) return value;
+    }
+    return "";
+  })();
+  return { values, filled, missing, ownerTag: ownerTag || undefined };
 }
 
 const NAME_ALIASES = ["account_name", "accountName", "ACCOUNT_NAME", "name", "account"];
+const DISPLAY_NAME_ALIASES = ["name"];
+const FOUNDRY_ALIASES = ["foundry_account", "azure_account_name", "account_name", "accountName"];
+const ENDPOINT_ALIASES = ["azure_openai_endpoint", "endpoint", "AZURE_OPENAI_ENDPOINT"];
 
 export interface AzureAccountImport {
   name: string;
@@ -168,6 +230,7 @@ export interface AzureAccountImport {
   location?: string;
   creditsLimit?: number;
   deploymentName?: string;
+  ownerTag?: string;
 }
 
 export interface AzureDeploySecret {
@@ -175,9 +238,14 @@ export interface AzureDeploySecret {
   accountHolder?: string;
   tenantId: string;
   clientId: string;
-  clientSecret: string;
+  clientSecret?: string;
   subscriptionId: string;
   subscriptionName?: string;
+  personAssociated?: string;
+  priority?: number;
+  weight?: number;
+  accountName?: string;
+  endpoint?: string;
 }
 
 export function parseAzureAccountImportArray(raw: string): { accounts: AzureAccountImport[]; error?: string } {
@@ -231,6 +299,8 @@ export function parseAzureAccountImportArray(raw: string): { accounts: AzureAcco
     const location = firstString(record, ["location", "AZURE_LOCATION"]);
     const deploymentName = firstString(record, ["deployment_name", "deploymentName", "model_name", "modelName"]);
     const creditsLimit = firstNumber(record, ["credits_limit", "credit_limit", "creditsLimit", "grant"]);
+    const extra: Record<string, unknown> = Object.assign({}, ...sources, record);
+    const ownerTag = creds.ownerTag || firstPerson(extra);
     accounts.push({
       name,
       tenantId: creds.values.tenantId,
@@ -241,6 +311,7 @@ export function parseAzureAccountImportArray(raw: string): { accounts: AzureAcco
       location: location || undefined,
       creditsLimit: creditsLimit ?? undefined,
       deploymentName: deploymentName || undefined,
+      ownerTag: ownerTag || undefined,
     });
   }
   return { accounts };
@@ -299,17 +370,28 @@ export function parseAzureDeploySecretsArray(raw: string): { accounts: AzureDepl
       );
       return { accounts: [], error: `Entry ${index + 1} is missing ${labels.join(", ")}.` };
     }
-    const name = firstString(record, NAME_ALIASES);
-    const accountHolder = firstString(record, ["account_holder", "accountHolder", "email", "ACCOUNT_HOLDER"]);
-    const subscriptionName = firstString(record, ["subscription_name", "subscriptionName", "AZURE_SUBSCRIPTION_NAME"]);
+    const extra: Record<string, unknown> = Object.assign({}, ...sources, record);
+    const displayName = firstString(extra, DISPLAY_NAME_ALIASES);
+    const accountHolder = firstString(extra, ["account_holder", "accountHolder", "email", "ACCOUNT_HOLDER"]);
+    const accountName = firstString(extra, FOUNDRY_ALIASES);
+    const endpoint = firstString(extra, ENDPOINT_ALIASES).replace(/\/+$/, "");
+    const subscriptionName = firstString(extra, ["subscription_name", "subscriptionName", "AZURE_SUBSCRIPTION_NAME"]);
+    const personAssociated = creds.ownerTag || firstPerson(extra);
+    const priority = firstInt(extra, ["new_api_priority", "newApiPriority", "priority"], { min: 0, max: 10000 });
+    const weight = firstInt(extra, ["new_api_weight", "newApiWeight", "weight"], { min: 1, max: 10000 });
     accounts.push({
-      name: name || accountHolder || `account-${index + 1}`,
+      name: displayName || accountHolder || accountName || `account-${index + 1}`,
       accountHolder: accountHolder || undefined,
       tenantId: creds.values.tenantId,
       clientId: creds.values.clientId,
       clientSecret: creds.values.clientSecret,
       subscriptionId: creds.values.subscriptionId,
       subscriptionName: subscriptionName || undefined,
+      personAssociated: personAssociated || undefined,
+      priority: priority ?? undefined,
+      weight: weight ?? undefined,
+      accountName: accountName || undefined,
+      endpoint: endpoint || undefined,
     });
   }
   return { accounts };
@@ -319,13 +401,18 @@ export function toKimiDeployPayload(accounts: AzureDeploySecret[]): Record<strin
   return accounts.map((account) => {
     const row: Record<string, string> = {
       name: account.name,
-      AZURE_TENANT_ID: account.tenantId,
-      AZURE_CLIENT_ID: account.clientId,
-      AZURE_CLIENT_SECRET: account.clientSecret,
       AZURE_SUBSCRIPTION_ID: account.subscriptionId,
     };
+    if (account.tenantId) row.AZURE_TENANT_ID = account.tenantId;
+    if (account.clientId) row.AZURE_CLIENT_ID = account.clientId;
+    if (account.clientSecret) row.AZURE_CLIENT_SECRET = account.clientSecret;
     if (account.accountHolder) row.account_holder = account.accountHolder;
     if (account.subscriptionName) row.subscription_name = account.subscriptionName;
+    if (account.personAssociated) row.person_associated = account.personAssociated;
+    if (account.accountName) row.account_name = account.accountName;
+    if (account.endpoint) row.azure_openai_endpoint = account.endpoint;
+    if (account.priority != null) row.new_api_priority = String(account.priority);
+    if (account.weight != null) row.new_api_weight = String(account.weight);
     return row;
   });
 }

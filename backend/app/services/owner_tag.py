@@ -15,10 +15,43 @@ UNTAGGED = "__none__"
 
 
 OWNER_TAG_MAX = 64
+PERSON_ALIASES = (
+    "person_associated",
+    "person_assoicated",
+    "person_associted",
+    "personAssociated",
+    "personAssoicated",
+    "personAssocited",
+    "PERSON_ASSOCIATED",
+    "owner_tag",
+    "ownerTag",
+)
+
+
+def _norm_field_key(key: str) -> str:
+    return key.replace("_", "").replace("-", "").lower()
+
+
+def is_person_field_key(key: str) -> bool:
+    """Match person_associated and common typos (assoicated, associted)."""
+    norm = _norm_field_key(key)
+    if norm in {"ownertag", "ownertags"}:
+        return True
+    if not norm.startswith("person"):
+        return False
+    rest = norm[len("person") :]
+    return rest.startswith("assoc") or rest.startswith("assoic")
 
 
 def canonical_owner(name: str) -> str:
-    return " ".join((name or "").split()).title()
+    # Split on whitespace; tokens with - or ' stay as typed, else First-upper + rest-lower.
+    words: list[str] = []
+    for token in (name or "").split():
+        if "-" in token or "'" in token:
+            words.append(token)
+        else:
+            words.append(token[:1].upper() + token[1:].lower())
+    return " ".join(words)
 
 
 def parse_owner_tag(value: str | None) -> str | None:
@@ -28,6 +61,80 @@ def parse_owner_tag(value: str | None) -> str | None:
     if len(owner) > OWNER_TAG_MAX:
         raise ValueError(f"Name tag must be {OWNER_TAG_MAX} characters or fewer.")
     return owner
+
+
+def _payload_person_text(value: object) -> str | None:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list) and value and all(isinstance(item, str) for item in value):
+        return value[0]
+    return None
+
+
+def person_from_payload(raw: dict | None) -> str | None:
+    if not raw:
+        return None
+    lookup = {_norm_field_key(str(key)): value for key, value in raw.items()}
+    for alias in PERSON_ALIASES:
+        text = _payload_person_text(lookup.get(_norm_field_key(alias)))
+        if text and text.strip():
+            return parse_owner_tag(text)
+    for key, value in lookup.items():
+        if not is_person_field_key(key):
+            continue
+        text = _payload_person_text(value)
+        if text and text.strip():
+            return parse_owner_tag(text)
+    return None
+
+
+async def apply_person_associated_tags(session: AsyncSession, accounts: list[dict]) -> int:
+    """Stamp person_associated onto portal rows whose resource key is in the payload.
+
+    Never guess a sibling when wanted is empty or no resource matched; deploy upsert
+    tags the Kimi row. Empty tags are filled; a different existing tag is left alone.
+    """
+    if not accounts:
+        return 0
+    portal = await AccountRepository(session).list_all()
+    changed = 0
+    for payload in accounts:
+        person = person_from_payload(payload)
+        sub = str(payload.get("AZURE_SUBSCRIPTION_ID") or payload.get("subscription_id") or "").strip()
+        if not person or not sub:
+            continue
+        wanted = {
+            key
+            for value in (
+                payload.get("account_name"),
+                payload.get("azure_openai_endpoint"),
+                payload.get("resource_name"),
+            )
+            if (key := resource_key(str(value) if value else None))
+        }
+        if not wanted:
+            continue
+        client_id = str(payload.get("AZURE_CLIENT_ID") or payload.get("client_id") or "").strip()
+        candidates = [account for account in portal if (account.subscription_id or "").strip() == sub]
+        if client_id:
+            scoped = [account for account in candidates if account.client_id == client_id]
+            if scoped:
+                candidates = scoped
+        for account in candidates:
+            key = account_resource_key(account)
+            if not key or key not in wanted:
+                continue
+            if account.owner_tag:
+                continue
+            account.owner_tag = person
+            changed += 1
+    if changed:
+        await session.commit()
+    return changed
 
 
 def resource_key(value: str | None) -> str:
@@ -84,19 +191,32 @@ def account_resource_key(account: ProviderAccount) -> str:
     return from_name or from_endpoint
 
 
+def _owner_key(account: ProviderAccount) -> int:
+    """Database PK when persisted; object identity only for unsaved rows."""
+    pk = getattr(account, "id", None)
+    return pk if pk is not None else id(account)
+
+
 def unique_owners(accounts: list[ProviderAccount]) -> dict[int, str | None]:
     """Tag only when exactly one portal account has that CSV resource. Duplicates stay untagged."""
     mapping = owner_by_resource()
     keyed: dict[str, list[ProviderAccount]] = defaultdict(list)
+    seen: set[int] = set()
+    unique: list[ProviderAccount] = []
     for account in accounts:
+        pk = _owner_key(account)
+        if pk in seen:
+            continue
+        seen.add(pk)
+        unique.append(account)
         key = account_resource_key(account)
         if key and key in mapping:
             keyed[key].append(account)
-    result: dict[int, str | None] = {id(account): None for account in accounts}
+    result: dict[int, str | None] = {_owner_key(account): None for account in unique}
     for key, group in keyed.items():
         if len(group) != 1:
             continue
-        result[id(group[0])] = mapping[key]
+        result[_owner_key(group[0])] = mapping[key]
     return result
 
 
@@ -119,7 +239,7 @@ def apply_owner_to_account(account: ProviderAccount, accounts: list[ProviderAcco
     if accounts is None:
         owner = owner_for_account(account.endpoint, account.resource_name)
     else:
-        owner = unique_owners(accounts).get(id(account))
+        owner = unique_owners(accounts).get(_owner_key(account))
     if not owner:
         return False
     account.owner_tag = owner
@@ -134,7 +254,7 @@ async def apply_owner_tags(session: AsyncSession) -> int:
     for account in accounts:
         if account.owner_tag:
             continue
-        owner = desired.get(id(account))
+        owner = desired.get(_owner_key(account))
         if not owner:
             continue
         account.owner_tag = owner

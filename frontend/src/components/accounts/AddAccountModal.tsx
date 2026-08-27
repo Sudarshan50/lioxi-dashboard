@@ -110,6 +110,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
     if (result.values.clientId) setClientId(result.values.clientId);
     if (result.values.clientSecret) setClientSecret(result.values.clientSecret);
     if (result.values.subscriptionId) setSubscriptionId(result.values.subscriptionId);
+    if (result.ownerTag) setOwnerTag(result.ownerTag);
     setJsonHintTone("success");
     setJsonHint(describeParsedCredentials(result));
     setError(null);

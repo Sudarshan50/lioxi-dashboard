@@ -16,12 +16,27 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - portal_redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   backend:
     build: ./backend
     restart: unless-stopped
     env_file: .env
     environment:
       POSTGRES_HOST: db
+      REDIS_URL: redis://redis:6379/0
     volumes:
       - ./scripts:/app/scripts:ro
     extra_hosts:
@@ -30,8 +45,11 @@ services:
       - "arm-0001.arm-msedge.net:4.150.240.10"
       - "login.microsoftonline.com:20.190.145.142"
       - "login.microsoft.com:20.190.146.32"
+      - "graph.microsoft.com:20.190.175.24"
     depends_on:
       db:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     ports:
       - "8000:8000"
@@ -49,3 +67,4 @@ services:
 
 volumes:
   portal_db_data:
+  portal_redis_data:

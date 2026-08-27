@@ -30,6 +30,41 @@ class NewApiError(RuntimeError):
     pass
 
 
+class NewApiAuthError(NewApiError):
+    def __init__(self, label: str, status: int | None = None, detail: str = "") -> None:
+        self.label = label
+        self.status = status
+        suffix = f" ({status})" if status else ""
+        extra = f": {detail}" if detail else ""
+        super().__init__(f"{label} NewAPI token unauthorized{suffix}{extra}")
+
+
+def is_newapi_auth_failure(status: int | None, body: dict | None = None, text: str = "") -> bool:
+    if status in {401, 403}:
+        return True
+    message = " ".join(
+        part
+        for part in (
+            str((body or {}).get("message") or ""),
+            str((body or {}).get("msg") or ""),
+            text,
+        )
+        if part
+    ).lower()
+    hints = (
+        "unauthor",
+        "token is invalid",
+        "access token is invalid",
+        "token expired",
+        "expired token",
+        "not login",
+        "未登录",
+        "无权",
+        "认证失败",
+    )
+    return any(hint in message for hint in hints)
+
+
 @dataclass(frozen=True)
 class Gateway:
     label: str
@@ -203,7 +238,11 @@ async def fetch_channels(gateway: Gateway) -> list[dict]:
             try:
                 body = response.json()
             except ValueError as exc:
+                if is_newapi_auth_failure(response.status_code, text=response.text[:200]):
+                    raise NewApiAuthError(gateway.label, response.status_code, response.text[:200]) from exc
                 raise NewApiError(f"{gateway.label} channel list returned non-JSON ({response.status_code})") from exc
+            if is_newapi_auth_failure(response.status_code, body, response.text[:200]):
+                raise NewApiAuthError(gateway.label, response.status_code, str(body.get("message") or response.text)[:200])
             if response.status_code != 200 or body.get("success") is False:
                 raise NewApiError(
                     f"{gateway.label} channel list failed ({response.status_code}): {response.text[:200]}"
@@ -246,7 +285,11 @@ async def set_channel_status(gateway: Gateway, channel_id: int, status: int) -> 
     try:
         body = response.json()
     except ValueError as exc:
+        if is_newapi_auth_failure(response.status_code, text=response.text[:200]):
+            raise NewApiAuthError(gateway.label, response.status_code, response.text[:200]) from exc
         raise NewApiError(f"{gateway.label} status update returned non-JSON ({response.status_code})") from exc
+    if is_newapi_auth_failure(response.status_code, body, response.text[:200]):
+        raise NewApiAuthError(gateway.label, response.status_code, str(body.get("message") or response.text)[:200])
     if response.status_code != 200 or body.get("success") is False:
         raise NewApiError(f"{gateway.label} status update failed ({response.status_code}): {response.text[:200]}")
     return bool(body.get("data"))

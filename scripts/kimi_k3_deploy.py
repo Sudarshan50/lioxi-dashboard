@@ -4,8 +4,8 @@
 Usage
 -----
 # On an Owner `az login` (creates the SP, writes secrets JSON):
-python3 scripts/kimi_k3_deploy.py bootstrap --name ch7221499 --email ch7221499@gmail.com \\
-    --out /path/to/ch7221499.json
+python3 scripts/kimi_k3_deploy.py bootstrap --name alice --email alice@example.com \\
+    --out /path/to/alice.json
 
 # Current Owner `az login` → create/reset SP → append/update new_final.json:
 python3 scripts/add_login_sp.py
@@ -22,14 +22,19 @@ AZURE_SUBSCRIPTION_ID. Optional: name, account_holder.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import random
+import signal
 import string
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -64,6 +69,19 @@ ADMIN_ROLES = [
     "Azure AI Developer",
 ]
 ALL_ROLES = VIEWER_ROLES + ADMIN_ROLES
+# GUIDs skip Azure CLI's slow display-name lookup (and Graph retries).
+ROLE_DEFINITION_IDS = {
+    "Reader": "acdd72a7-3385-48ef-bd42-f606fba81ae7",
+    "Monitoring Reader": "43d0d8ad-25c7-4714-9337-8ba259a9fe05",
+    "Cost Management Reader": "72fafb9e-0641-4937-9268-a91bfd8191a3",
+    "Billing Reader": "fa23ad8b-c56e-40d8-ac0c-ce449e1d2c64",
+    "Cognitive Services Usages Reader": "bba48692-92b0-4667-a9ad-c31c7b334ac2",
+    "Contributor": "b24988ac-6180-42a0-ab88-20f7382dd24c",
+    "Cognitive Services Contributor": "25fbc0a9-bd7c-42a3-aa1a-3b75d497ee68",
+    "Foundry Owner": "c883944f-8b7b-4483-af10-35834be79c4a",
+    "Foundry User": "53ca6127-db72-4b80-b1b0-d745d6d5456d",
+    "Azure AI Developer": "64702f94-c441-49e6-a78b-ef80e0188fee",
+}
 PROVIDERS = [
     "Microsoft.CognitiveServices",
     "Microsoft.Insights",
@@ -76,13 +94,54 @@ class AzError(RuntimeError):
 
 
 def _run(cmd: list[str], env: dict[str, str] | None = None, timeout: int = 180) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        env=env or os.environ.copy(),
-        timeout=timeout,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            env=env or os.environ.copy(),
+            timeout=timeout,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        if getattr(exc, "pid", None):
+            with contextlib.suppress(OSError, ProcessLookupError):
+                os.killpg(exc.pid, signal.SIGKILL)
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
+
+
+def role_assignment_cmd(
+    role: str,
+    scope: str,
+    app_id: str,
+    object_id: str | None = None,
+) -> list[str]:
+    """Build `az role assignment create`. Prefer object id so Azure CLI skips Graph."""
+    role_ref = ROLE_DEFINITION_IDS.get(role, role)
+    cmd = [
+        "az",
+        "role",
+        "assignment",
+        "create",
+        "--role",
+        role_ref,
+        "--scope",
+        scope,
+        "-o",
+        "none",
+    ]
+    if object_id:
+        cmd.extend(
+            [
+                "--assignee-object-id",
+                str(object_id),
+                "--assignee-principal-type",
+                "ServicePrincipal",
+            ]
+        )
+    else:
+        cmd.extend(["--assignee", app_id])
+    return cmd
 
 
 def az_json(cmd: list[str], env: dict[str, str] | None = None, timeout: int = 180) -> Any:
@@ -110,8 +169,159 @@ def isolated_env(config_dir: Path) -> dict[str, str]:
     env = os.environ.copy()
     env["AZURE_CONFIG_DIR"] = str(config_dir)
     env["AZURE_CORE_COLLECT_TELEMETRY"] = "0"
-    env.pop("AZURE_ACCESS_TOKEN", None)
+    # Portal .env Azure identity must not leak into per-account `az login`.
+    for key in (
+        "AZURE_ACCESS_TOKEN",
+        "AZURE_CLIENT_ID",
+        "AZURE_CLIENT_SECRET",
+        "AZURE_TENANT_ID",
+        "AZURE_SUBSCRIPTION_ID",
+        "AZURE_CLIENT_CERTIFICATE_PATH",
+        "AZURE_CLIENT_CERTIFICATE_PASSWORD",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "ARM_CLIENT_ID",
+        "ARM_CLIENT_SECRET",
+        "ARM_TENANT_ID",
+        "ARM_SUBSCRIPTION_ID",
+        "MSI_ENDPOINT",
+        "MSI_SECRET",
+        "IDENTITY_ENDPOINT",
+        "IDENTITY_HEADER",
+    ):
+        env.pop(key, None)
     return env
+
+
+def sp_login(env: dict[str, str], tenant: str, client: str, secret: str, sub: str) -> dict[str, Any]:
+    """Service-principal login. Skip full tenant discovery; campus Graph/ARM listing hangs az."""
+    last: Exception | None = None
+    for attempt in range(1, 4):
+        try:
+            az_json(
+                [
+                    "az",
+                    "login",
+                    "--service-principal",
+                    "-u",
+                    client,
+                    "-p",
+                    secret,
+                    "--tenant",
+                    tenant,
+                    "--skip-subscription-discovery",
+                    "--subscription",
+                    sub,
+                    "-o",
+                    "json",
+                ],
+                env=env,
+                timeout=45,
+            )
+            current = az_json(["az", "account", "show", "-o", "json"], env=env, timeout=30) or {}
+            if current.get("id") != sub:
+                az_json(
+                    ["az", "account", "set", "--subscription", sub, "-o", "none"],
+                    env=env,
+                    timeout=30,
+                )
+                current = az_json(["az", "account", "show", "-o", "json"], env=env, timeout=30) or {}
+            if current.get("id") != sub:
+                raise AzError(
+                    f"SP logged into subscription {current.get('id')}, expected {sub} from secrets JSON"
+                )
+            return current
+        except AzError as exc:
+            last = exc
+            if attempt < 3:
+                time.sleep(2 * attempt)
+    raise AzError(str(last) if last else "SP login failed")
+
+
+def cli_arm_token(env: dict[str, str] | None = None) -> str:
+    data = az_json(
+        ["az", "account", "get-access-token", "--resource", "https://management.azure.com/", "-o", "json"],
+        env=env,
+        timeout=25,
+    ) or {}
+    token = str(data.get("accessToken") or "").strip()
+    if not token:
+        raise AzError("az account get-access-token returned no token")
+    return token
+
+
+def arm_json(
+    method: str,
+    url: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+    timeout: int = 20,
+) -> tuple[int, Any]:
+    req = urllib.request.Request(url, method=method.upper())
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Content-Type", "application/json")
+    payload = json.dumps(body).encode() if body is not None else None
+    try:
+        with urllib.request.urlopen(req, data=payload, timeout=timeout) as resp:
+            raw = resp.read()
+            return resp.status, json.loads(raw.decode()) if raw else None
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw) if raw else raw
+        except json.JSONDecodeError:
+            parsed = raw
+        return exc.code, parsed
+    except Exception as exc:  # noqa: BLE001
+        return 0, str(exc)
+
+
+def assign_role_arm(
+    env: dict[str, str] | None,
+    object_id: str,
+    role: str,
+    subscription_id: str,
+) -> tuple[bool, str]:
+    """Assign a role via ARM. Avoids az role assignment create hanging on Graph."""
+    role_id = ROLE_DEFINITION_IDS.get(role, role)
+    scope = f"/subscriptions/{subscription_id}"
+    assignment_id = str(uuid.uuid4())
+    url = (
+        f"https://management.azure.com{scope}/providers/Microsoft.Authorization"
+        f"/roleAssignments/{assignment_id}?api-version=2022-04-01"
+    )
+    body = {
+        "properties": {
+            "roleDefinitionId": f"{scope}/providers/Microsoft.Authorization/roleDefinitions/{role_id}",
+            "principalId": object_id,
+            "principalType": "ServicePrincipal",
+        }
+    }
+    attempts = 5 if role == "Contributor" else 3
+    last = "role assignment failed"
+    token = None
+    for attempt in range(1, attempts + 1):
+        try:
+            token = token or cli_arm_token(env)
+        except AzError as exc:
+            last = str(exc)
+            time.sleep(2 * attempt)
+            token = None
+            continue
+        status, data = arm_json("PUT", url, token, body, timeout=20)
+        text = json.dumps(data) if isinstance(data, (dict, list)) else str(data or "")
+        if status in {200, 201}:
+            return True, ""
+        if status == 409 or "already exists" in text.lower() or "roleassignmentexists" in text.lower():
+            return True, ""
+        if status in {401, 403}:
+            token = None
+        last = f"HTTP {status}: {text[-400:]}"
+        if "principalnotfound" in text.lower() or status in {0, 401, 429, 500, 502, 503, 504}:
+            time.sleep(2 * attempt)
+            continue
+        if attempt < attempts:
+            time.sleep(1)
+    return False, last
 
 
 def slugify(value: str, fallback: str = "acct") -> str:
@@ -470,22 +680,13 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
     failed: list[str] = []
     scope = f"/subscriptions/{sub}"
     for role in ALL_ROLES:
-        ok, err = az_ok(
-            [
-                "az",
-                "role",
-                "assignment",
-                "create",
-                "--assignee",
-                app_id,
-                "--role",
-                role,
-                "--scope",
-                scope,
-                "-o",
-                "none",
-            ]
-        )
+        if sp_oid:
+            ok, err = assign_role_arm(None, str(sp_oid), role, sub)
+        else:
+            ok, err = az_ok(
+                role_assignment_cmd(role, scope, app_id, None),
+                timeout=45,
+            )
         if ok:
             assigned.append(role)
         elif "already exists" in err.lower() or "exist" in err.lower():
@@ -575,23 +776,23 @@ def account_ready(env: dict[str, str], name: str, rg: str) -> tuple[bool, str]:
 
 def pick_or_create_account(env: dict[str, str], slug: str, sub: str) -> tuple[str, str, dict[str, Any]]:
     accounts = az_json(["az", "cognitiveservices", "account", "list", "-o", "json"], env=env) or []
-    us_accounts = [
-        a
-        for a in accounts
-        if a.get("kind") == KIND and (a.get("location") or "").replace(" ", "").lower() in {
-            "eastus2",
-            "eastus",
-            "westus",
-            "westus2",
-            "westus3",
-            "centralus",
-            "northcentralus",
-            "southcentralus",
-        }
-    ]
-    east = [a for a in us_accounts if (a.get("location") or "").lower() == LOCATION]
-    chosen = (east or us_accounts or [None])[0]
-    if chosen:
+    kimi_accounts: list[dict[str, Any]] = []
+    for item in accounts:
+        if item.get("kind") != KIND:
+            continue
+        rid = item.get("id") or ""
+        parts = rid.split("/")
+        rg = parts[parts.index("resourceGroups") + 1] if "resourceGroups" in parts else ""
+        name = item.get("name") or ""
+        if looks_like_kimi_stack(name, rg):
+            kimi_accounts.append(item)
+    if kimi_accounts:
+        east = [
+            item
+            for item in kimi_accounts
+            if (item.get("location") or "").replace(" ", "").lower() == LOCATION
+        ]
+        chosen = (east or kimi_accounts)[0]
         rid = chosen["id"]
         rg = rid.split("/")[rid.split("/").index("resourceGroups") + 1]
         return chosen["name"], rg, chosen
@@ -780,32 +981,7 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix=f"az-{slug}-") as tmp:
         env = isolated_env(Path(tmp))
-        login = az_json(
-            [
-                "az",
-                "login",
-                "--service-principal",
-                "-u",
-                client,
-                "-p",
-                secret,
-                "--tenant",
-                tenant,
-                "-o",
-                "json",
-            ],
-            env=env,
-            timeout=60,
-        )
-        if not login:
-            raise AzError("SP login returned empty")
-        az_json(["az", "account", "set", "--subscription", sub, "-o", "none"], env=env)
-        current = az_json(["az", "account", "show", "-o", "json"], env=env) or {}
-        current_id = current.get("id")
-        if current_id != sub:
-            raise AzError(
-                f"SP logged into subscription {current_id}, expected {sub} from secrets JSON"
-            )
+        current = sp_login(env, tenant, client, secret, sub)
 
         payg = ensure_payg_subscription(
             env, sub, create_if_needed=False, display_name=f"Lioxi-{name}"
@@ -966,31 +1142,7 @@ def delete_one(acct: dict[str, Any]) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix=f"az-del-{slugify(name)}-") as tmp:
         env = isolated_env(Path(tmp))
-        login = az_json(
-            [
-                "az",
-                "login",
-                "--service-principal",
-                "-u",
-                client,
-                "-p",
-                secret,
-                "--tenant",
-                tenant,
-                "-o",
-                "json",
-            ],
-            env=env,
-            timeout=60,
-        )
-        if not login:
-            raise AzError("SP login returned empty")
-        az_json(["az", "account", "set", "--subscription", sub, "-o", "none"], env=env)
-        current = az_json(["az", "account", "show", "-o", "json"], env=env) or {}
-        if current.get("id") != sub:
-            raise AzError(
-                f"SP logged into subscription {current.get('id')}, expected {sub} from secrets JSON"
-            )
+        current = sp_login(env, tenant, client, secret, sub)
 
         target = find_kimi_target(env, preferred_name, preferred_rg)
         if target is None:
@@ -1266,27 +1418,7 @@ def regenerate_one(acct: dict[str, Any]) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix=f"az-regen-{slugify(name)}-") as tmp:
         env = isolated_env(Path(tmp))
         try:
-            login = az_json(
-                [
-                    "az",
-                    "login",
-                    "--service-principal",
-                    "-u",
-                    client,
-                    "-p",
-                    secret,
-                    "--tenant",
-                    tenant,
-                    "-o",
-                    "json",
-                ],
-                env=env,
-                timeout=60,
-            )
-            if not login:
-                raise AzError("SP login returned empty")
-            az_json(["az", "account", "set", "--subscription", sub, "-o", "none"], env=env)
-            shown = az_json(["az", "account", "show", "-o", "json"], env=env) or {}
+            shown = sp_login(env, tenant, client, secret, sub)
             password = _reset_sp_password(env, client)
             return {
                 "ok": True,

@@ -2,15 +2,27 @@ import { Menu } from "lucide-react";
 import { useState } from "react";
 import { Outlet } from "react-router-dom";
 
+import { useO1NewApiAuth } from "@/hooks/useKimiDeploy";
+
 import Sidebar from "./Sidebar";
 
 export default function AppLayout() {
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const o1Auth = useO1NewApiAuth();
+  const tokenExpired = Boolean(o1Auth.data?.auth_expired);
 
   return (
     <div className="app-aurora flex h-screen bg-surface">
       <Sidebar isOpen={isSidebarOpen} onClose={() => setIsSidebarOpen(false)} />
       <div className="flex min-w-0 flex-1 flex-col">
+        {tokenExpired && (
+          <div
+            role="alert"
+            className="sticky top-0 z-50 animate-token-flash border-b border-red-400/50 bg-red-600/90 px-4 py-2.5 text-center text-sm font-semibold tracking-wide text-white shadow-glow"
+          >
+            O1 portal token expired
+          </div>
+        )}
         <header className="flex items-center gap-3 border-b border-white/[0.06] bg-surface-raised/70 px-4 py-3 backdrop-blur-xl lg:hidden">
           <button
             onClick={() => setIsSidebarOpen(true)}

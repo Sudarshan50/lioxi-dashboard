@@ -1,6 +1,20 @@
 export const UNTAGGED_OWNER = "__none__";
 export const UNTAGGED_LABEL = "Untagged";
 
+export function canonicalOwner(name: string) {
+  // Split on whitespace; tokens with - or ' stay as typed, else First-upper + rest-lower.
+  return name
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((word) =>
+      word.includes("-") || word.includes("'")
+        ? word
+        : word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+    )
+    .join(" ");
+}
+
 export function uniqueOwners(accounts: { owner_tag?: string | null }[]): string[] {
   const names = new Set<string>();
   for (const account of accounts) {

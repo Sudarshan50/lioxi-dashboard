@@ -10,7 +10,7 @@ from app.config import get_settings
 from app.database import SessionLocal, init_models
 from app.dependencies import get_sync_orchestrator
 from app.repositories.admin_repository import AdminRepository
-from app.routers import account_groups, accounts, alerts, auth, dashboard, kimi_deploy, models, registered_models
+from app.routers import account_groups, accounts, alerts, auth, dashboard, kimi_deploy, models, pending, registered_models, submit
 from app.services.alert_service import (
     DEFAULT_AZURE_SYNC_INTERVAL_MINUTES,
     DEFAULT_SYNC_INTERVAL_MINUTES,
@@ -32,7 +32,13 @@ async def lifespan(app: FastAPI):
     async with SessionLocal() as session:
         await ensure_admin_seeded(AdminRepository(session), settings.admin_username, settings.admin_password)
         await apply_owner_tags(session)
+        from app.services.submit_service import expire_stale
+
+        await expire_stale(session)
         config = await get_alert_config(session)
+    from app.services.az_cli_session import cleanup_stale_config_dirs
+
+    cleanup_stale_config_dirs()
     newapi_minutes = int(config.get("sync_interval_minutes") or DEFAULT_SYNC_INTERVAL_MINUTES)
     azure_minutes = int(
         config.get("azure_sync_interval_minutes")
@@ -70,6 +76,11 @@ async def lifespan(app: FastAPI):
         with suppress(asyncio.CancelledError):
             await bot_task
         scheduler.shutdown(wait=False)
+        from app.services.azure_inventory_cache import close_azure_inventory_cache
+        from app.services.az_cli_session import cleanup_stale_config_dirs
+
+        await close_azure_inventory_cache()
+        cleanup_stale_config_dirs()
 
 
 app = FastAPI(title="LLM Usage Monitoring Portal", lifespan=lifespan)
@@ -90,6 +101,8 @@ app.include_router(registered_models.router)
 app.include_router(models.router)
 app.include_router(dashboard.router)
 app.include_router(kimi_deploy.router)
+app.include_router(submit.router)
+app.include_router(pending.router)
 
 
 @app.get("/api/health")

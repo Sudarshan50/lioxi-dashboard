@@ -17,6 +17,7 @@ class ProviderAccount(Base, TimestampMixin):
     tenant_id: Mapped[str] = mapped_column(String(64))
     client_id: Mapped[str] = mapped_column(String(64))
     client_secret_encrypted: Mapped[str] = mapped_column(Text)
+    openai_api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     subscription_id: Mapped[str] = mapped_column(String(64))
 
     resource_id: Mapped[str] = mapped_column(Text)

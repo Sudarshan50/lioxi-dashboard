@@ -11,9 +11,10 @@ import time
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import httpx
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import AzureApiError
 from app.providers.azure.arm_client import AzureArmClient
@@ -28,14 +29,25 @@ from app.schemas.kimi_deploy import (
     KimiSecretsRow,
     KimiTestResult,
 )
+from app.services.azure_inventory_cache import (
+    credits_from_inventory,
+    drop_azure_inventory,
+    get_cached_azure_inventory,
+    store_azure_inventory,
+)
+from app.services.owner_tag import apply_person_associated_tags, person_from_payload, resource_key
 
 logger = logging.getLogger(__name__)
 
+ProgressFn = Callable[[dict[str, Any]], Awaitable[None]]
+
 REQUIRED_FIELDS = {
+    "AZURE_SUBSCRIPTION_ID": ("AZURE_SUBSCRIPTION_ID", "subscription_id", "subscriptionId", "subscription"),
+}
+HYDRATABLE_FIELDS = {
     "AZURE_TENANT_ID": ("AZURE_TENANT_ID", "tenant_id", "tenantId", "tenant"),
     "AZURE_CLIENT_ID": ("AZURE_CLIENT_ID", "client_id", "clientId", "appId", "app_id"),
     "AZURE_CLIENT_SECRET": ("AZURE_CLIENT_SECRET", "client_secret", "clientSecret", "password"),
-    "AZURE_SUBSCRIPTION_ID": ("AZURE_SUBSCRIPTION_ID", "subscription_id", "subscriptionId", "subscription"),
 }
 
 NAME_ALIASES = ("name", "account_name", "accountName", "ACCOUNT_NAME", "account")
@@ -75,6 +87,23 @@ def _pick(lookup: dict[str, Any], aliases: tuple[str, ...]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _pick_int(lookup: dict[str, Any], aliases: tuple[str, ...]) -> int | None:
+    for alias in aliases:
+        value = lookup.get(_norm_key(alias))
+        if isinstance(value, bool) or value is None or value == "":
+            continue
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        if isinstance(value, str) and value.strip():
+            try:
+                return int(value.strip())
+            except ValueError:
+                continue
+    return None
 
 
 def find_deploy_script() -> Path | None:
@@ -202,6 +231,10 @@ def normalize_account(raw: dict[str, Any], index: int) -> dict[str, str]:
             out[canonical] = value
     if missing:
         raise KimiDeployError(f"Entry {index + 1} is missing {', '.join(missing)}.")
+    for canonical, aliases in HYDRATABLE_FIELDS.items():
+        value = _pick(merged, aliases)
+        if value:
+            out[canonical] = value
 
     name = _pick(merged, NAME_ALIASES)
     holder = _pick(merged, HOLDER_ALIASES)
@@ -209,16 +242,13 @@ def normalize_account(raw: dict[str, Any], index: int) -> dict[str, str]:
     if holder:
         out["account_holder"] = holder
     rg = _pick(merged, ("resource_group", "resourceGroup", "AZURE_RESOURCE_GROUP"))
-    foundry = _pick(merged, ("foundry_account", "azure_account_name"))
-    acct_field = _pick(merged, ("account_name", "accountName"))
+    foundry = _pick(merged, ("foundry_account", "account_name", "accountName", "azure_account_name"))
     endpoint = _pick(merged, ("azure_openai_endpoint", "endpoint", "AZURE_OPENAI_ENDPOINT"))
     deployment = _pick(merged, ("deployment_name", "deploymentName", "DEPLOYMENT_NAME"))
     if rg:
         out["resource_group"] = rg
     if foundry:
         out["account_name"] = foundry
-    elif acct_field and (acct_field != out["name"] or "-kimi-" in acct_field):
-        out["account_name"] = acct_field
     if endpoint:
         out["azure_openai_endpoint"] = endpoint.rstrip("/")
     if deployment:
@@ -226,6 +256,25 @@ def normalize_account(raw: dict[str, Any], index: int) -> dict[str, str]:
     sub_name = _pick(merged, ("subscription_name", "subscriptionName", "AZURE_SUBSCRIPTION_NAME"))
     if sub_name:
         out["subscription_name"] = sub_name
+    try:
+        person = person_from_payload(merged) or person_from_payload(raw)
+    except ValueError as exc:
+        raise KimiDeployError(str(exc)) from exc
+    if person:
+        out["person_associated"] = person
+    new_api_name = _pick(merged, ("new_api_name", "newApiName", "channel_name", "channelName"))
+    if new_api_name:
+        out["new_api_name"] = new_api_name
+    priority = _pick_int(merged, ("new_api_priority", "newApiPriority", "priority"))
+    if priority is not None:
+        if priority < 0 or priority > 10000:
+            raise KimiDeployError(f"Entry {index + 1} priority must be 0–10000.")
+        out["new_api_priority"] = str(priority)
+    weight = _pick_int(merged, ("new_api_weight", "newApiWeight", "weight"))
+    if weight is not None:
+        if weight < 1 or weight > 10000:
+            raise KimiDeployError(f"Entry {index + 1} weight must be 1–10000.")
+        out["new_api_weight"] = str(weight)
     return out
 
 
@@ -233,6 +282,75 @@ def normalize_accounts(raw_accounts: list[dict[str, Any]]) -> list[dict[str, str
     if not raw_accounts:
         raise KimiDeployError("Paste at least one account object.")
     return [normalize_account(item, index) for index, item in enumerate(raw_accounts)]
+
+
+async def prepare_accounts(
+    raw_accounts: list[dict[str, Any]],
+    session: AsyncSession | None,
+) -> list[dict[str, str]]:
+    accounts = normalize_accounts(raw_accounts)
+    if session is not None:
+        from app.services.service_principal_store import hydrate_service_principals, persist_service_principals
+
+        accounts = await hydrate_service_principals(session, accounts)
+        await persist_service_principals(session, accounts)
+        try:
+            await apply_person_associated_tags(session, accounts)
+        except ValueError as exc:
+            raise KimiDeployError(str(exc)) from exc
+    incomplete: list[str] = []
+    for index, account in enumerate(accounts):
+        missing = [
+            field
+            for field in ("AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_SUBSCRIPTION_ID")
+            if not (account.get(field) or "").strip()
+        ]
+        if missing:
+            incomplete.append(f"Entry {index + 1} is missing {', '.join(missing)}.")
+    if incomplete:
+        raise KimiDeployError(
+            " ".join(incomplete) + " Paste the secrets JSON once so the service principal can be stored."
+        )
+    return accounts
+
+
+def _resource_identity(item: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for field in ("account_name", "resource_name", "azure_openai_endpoint", "endpoint"):
+        value = item.get(field)
+        if isinstance(value, str) and value.strip():
+            key = resource_key(value)
+            if key:
+                keys.add(key)
+    return keys
+
+
+def _same_subscription(left: str | None, right: str | None) -> bool:
+    a = (left or "").strip().lower()
+    b = (right or "").strip().lower()
+    return bool(a) and a == b
+
+
+def _with_person(rows: list[dict[str, Any]], accounts: list[dict[str, str]]) -> list[dict[str, Any]]:
+    tagged = [
+        (_resource_identity(account), account["person_associated"])
+        for account in accounts
+        if account.get("person_associated")
+    ]
+    stamped: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        person = item.get("person_associated")
+        row_keys = _resource_identity(item)
+        if not person and row_keys:
+            for acct_keys, tag in tagged:
+                if acct_keys and row_keys & acct_keys:
+                    person = tag
+                    break
+        if person:
+            item["person_associated"] = person
+        stamped.append(item)
+    return stamped
 
 
 def _safe_deploy(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
@@ -244,8 +362,9 @@ def _safe_deploy(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
             return result
         return {"ok": False, "name": name, "error": "Deploy returned an unexpected result."}
     except Exception as exc:  # noqa: BLE001 - surface Azure/CLI failures to the admin UI
-        logger.warning("Kimi K3 deploy failed for %s: %s", name, str(exc)[-300:])
-        return {"ok": False, "name": name, "error": str(exc)[-1500:]}
+        error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
+        logger.warning("Kimi K3 deploy failed for %s: %s", name, error[-300:])
+        return {"ok": False, "name": name, "error": error}
 
 
 def _safe_delete(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
@@ -257,8 +376,9 @@ def _safe_delete(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
             return result
         return {"ok": False, "name": name, "error": "Delete returned an unexpected result.", "deleted": []}
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Kimi K3 undeploy failed for %s: %s", name, str(exc)[-300:])
-        return {"ok": False, "name": name, "error": str(exc)[-1500:], "deleted": []}
+        error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
+        logger.warning("Kimi K3 undeploy failed for %s: %s", name, error[-300:])
+        return {"ok": False, "name": name, "error": error, "deleted": []}
 
 
 def _to_delete_result(raw: dict[str, Any]) -> KimiDeleteResult:
@@ -301,7 +421,7 @@ def _credits_error_message(exc: BaseException | str) -> str:
     return text[-400:]
 
 
-async def lookup_account_credits(account: dict[str, str]) -> KimiCreditSnapshot:
+async def _fetch_account_credits(account: dict[str, str]) -> KimiCreditSnapshot:
     name = account.get("name") or account.get("account_holder") or "account"
     subscription_id = account.get("AZURE_SUBSCRIPTION_ID") or ""
     try:
@@ -355,8 +475,24 @@ async def lookup_account_credits(account: dict[str, str]) -> KimiCreditSnapshot:
         )
 
 
-async def lookup_accounts_credits(raw_accounts: list[dict[str, Any]]) -> list[KimiCreditSnapshot]:
-    accounts = normalize_accounts(raw_accounts)
+async def lookup_account_credits(account: dict[str, str]) -> KimiCreditSnapshot:
+    name = account.get("name") or account.get("account_holder") or "account"
+    subscription_id = account.get("AZURE_SUBSCRIPTION_ID") or ""
+    resource_name = (account.get("account_name") or "").strip()
+    if resource_name:
+        cached = await get_cached_azure_inventory(subscription_id, resource_name)
+        if cached is not None:
+            snapshot = credits_from_inventory(cached, account)
+            snapshot.name = name
+            return snapshot
+    return await _fetch_account_credits(account)
+
+
+async def lookup_accounts_credits(
+    raw_accounts: list[dict[str, Any]],
+    session: AsyncSession | None = None,
+) -> list[KimiCreditSnapshot]:
+    accounts = await prepare_accounts(raw_accounts, session)
     return list(await asyncio.gather(*[lookup_account_credits(account) for account in accounts]))
 
 
@@ -465,10 +601,35 @@ async def _lookup_subscription_name(account: dict[str, str]) -> str:
         return fallback
 
 
+def _with_account_meta(result: KimiDeployResult, account: dict[str, str]) -> KimiDeployResult:
+    result.name = account.get("name") or result.name
+    result.email = account.get("account_holder") or result.email
+    if account.get("subscription_name") and not result.subscription_name:
+        result.subscription_name = account["subscription_name"]
+    if account.get("person_associated"):
+        result.owner_tag = account["person_associated"]
+    result.new_api_present = False
+    result.new_api_created = False
+    result.new_api_channel_id = None
+    result.new_api_name = None
+    result.new_api_status = None
+    result.new_api_status_label = None
+    result.new_api_priority = None
+    result.new_api_weight = None
+    result.new_api_error = None
+    return result
+
+
 async def lookup_account_inventory(account: dict[str, str]) -> KimiDeployResult:
+    cached = await get_cached_azure_inventory(
+        account.get("AZURE_SUBSCRIPTION_ID"),
+        account.get("account_name"),
+    )
+    if cached is not None:
+        return _with_account_meta(cached, account)
     stack, credits, subscription_name = await asyncio.gather(
         _find_kimi_stack(account),
-        lookup_account_credits(account),
+        _fetch_account_credits(account),
         _lookup_subscription_name(account),
     )
     result = _merge_credits(stack, credits)
@@ -476,12 +637,44 @@ async def lookup_account_inventory(account: dict[str, str]) -> KimiDeployResult:
         result.subscription_name = subscription_name
     elif not result.subscription_name:
         result.subscription_name = credits.subscription_name
+    result = _with_account_meta(result, account)
+    await store_azure_inventory(result)
     return result
 
 
-async def lookup_accounts_inventory(raw_accounts: list[dict[str, Any]]) -> list[KimiDeployResult]:
-    accounts = normalize_accounts(raw_accounts)
-    return list(await asyncio.gather(*[lookup_account_inventory(account) for account in accounts]))
+async def lookup_accounts_inventory(
+    raw_accounts: list[dict[str, Any]],
+    session: AsyncSession | None = None,
+) -> list[KimiDeployResult]:
+    accounts = await prepare_accounts(raw_accounts, session)
+    results = list(await asyncio.gather(*[lookup_account_inventory(account) for account in accounts]))
+    if session is not None:
+        from app.repositories.account_repository import AccountRepository
+        from app.services.kimi_newapi import attach_kimi_newapi_status
+
+        await attach_kimi_newapi_status(session, results, accounts)
+        repo = AccountRepository(session)
+        portal_rows = await repo.list_all()
+        for result, account in zip(results, accounts, strict=True):
+            if result.owner_tag:
+                continue
+            if account.get("person_associated"):
+                result.owner_tag = account["person_associated"]
+                continue
+            sub = (result.subscription_id or account.get("AZURE_SUBSCRIPTION_ID") or "").strip()
+            resource = (result.account_name or account.get("account_name") or "").strip()
+            if not sub or not resource:
+                continue
+            wanted_res = resource.lower()
+            for portal in portal_rows:
+                if not _same_subscription(portal.subscription_id, sub):
+                    continue
+                if (portal.resource_name or "").strip().lower() != wanted_res:
+                    continue
+                if portal.owner_tag:
+                    result.owner_tag = portal.owner_tag
+                break
+    return results
 
 
 def _merge_credits(result: KimiDeployResult, credits: KimiCreditSnapshot) -> KimiDeployResult:
@@ -502,7 +695,6 @@ def _to_result(raw: dict[str, Any]) -> KimiDeployResult:
         name=raw.get("name"),
         email=raw.get("email"),
         azure_openai_endpoint=_as_openai_endpoint(raw.get("azure_openai_endpoint")),
-        api_key=raw.get("api_key"),
         deployment_name=raw.get("deployment_name"),
         model=raw.get("model"),
         sku=raw.get("sku"),
@@ -522,6 +714,7 @@ def _to_result(raw: dict[str, Any]) -> KimiDeployResult:
         credits_label=raw.get("credits_label"),
         credits_available=bool(raw.get("credits_available")),
         error=raw.get("error"),
+        owner_tag=raw.get("owner_tag") or raw.get("person_associated"),
     )
 
 
@@ -532,7 +725,7 @@ def _to_secrets_row(raw: dict[str, Any]) -> KimiSecretsRow:
         account_holder=raw.get("account_holder") or raw.get("email"),
         AZURE_TENANT_ID=raw.get("AZURE_TENANT_ID"),
         AZURE_CLIENT_ID=raw.get("AZURE_CLIENT_ID"),
-        AZURE_CLIENT_SECRET=raw.get("AZURE_CLIENT_SECRET"),
+        AZURE_CLIENT_SECRET=None,
         AZURE_SUBSCRIPTION_ID=raw.get("AZURE_SUBSCRIPTION_ID"),
         subscription_name=raw.get("subscription_name"),
         error=raw.get("error"),
@@ -554,35 +747,191 @@ def _secrets_public(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def deploy_accounts(raw_accounts: list[dict[str, Any]], jobs: int) -> list[KimiDeployResult]:
+async def deploy_accounts(
+    raw_accounts: list[dict[str, Any]],
+    jobs: int,
+    session: AsyncSession | None = None,
+    new_api_priority: int = 13,
+    new_api_weight: int = 1,
+    on_progress: ProgressFn | None = None,
+) -> list[KimiDeployResult]:
     status = deploy_status()
     if not status.ready:
         raise KimiDeployError(status.message)
 
-    accounts = normalize_accounts(raw_accounts)
+    accounts = await prepare_accounts(raw_accounts, session)
     module = load_deploy_module()
     workers = min(max(1, jobs), len(accounts))
     logger.info("Kimi K3 deploy started for %s account(s), jobs=%s", len(accounts), workers)
+    if on_progress is not None:
+        await on_progress({"type": "start", "total": len(accounts), "phase": "azure", "message": "Deploying Azure stacks in parallel"})
 
     sem = asyncio.Semaphore(workers)
+    finished = 0
+    progress_lock = asyncio.Lock()
+    persist_lock = asyncio.Lock()
+    portal_service = None
+    persist_foundry_api_keys = None
+    if session is not None:
+        from app.core.crypto import get_secret_box
+        from app.repositories.account_repository import AccountRepository
+        from app.services.account_service import AccountService
+        from app.services.openai_key_store import persist_foundry_api_keys as _persist_keys
 
-    async def run_one(account: dict[str, str]) -> dict[str, Any]:
+        persist_foundry_api_keys = _persist_keys
+        portal_service = AccountService(AccountRepository(session), get_secret_box())
+
+    async def persist_one(account: dict[str, str], raw: dict[str, Any], result: KimiDeployResult) -> None:
+        if session is None or not result.ok:
+            return
+        async with persist_lock:
+            row = dict(raw)
+            if account.get("person_associated"):
+                row["person_associated"] = account["person_associated"]
+            if persist_foundry_api_keys is not None:
+                try:
+                    await persist_foundry_api_keys(session, [row])
+                except Exception:
+                    logger.exception("Could not store Foundry API keys after deploy")
+            if portal_service is None or not result.account_name:
+                return
+            try:
+                await portal_service.upsert_from_kimi_deploy(
+                    payload=account,
+                    resource_name=result.account_name,
+                    resource_group=result.resource_group or "",
+                    endpoint=result.azure_openai_endpoint or "",
+                    location=result.region or "",
+                    owner_tag=result.owner_tag,
+                    credits_limit=result.credits_limit,
+                    credits_remaining=result.credits_remaining,
+                    credits_used=result.credits_used,
+                    credits_currency=result.credits_currency,
+                    credits_label=result.credits_label,
+                    deployment_name=result.deployment_name,
+                )
+            except Exception:
+                logger.exception("Could not create portal account after Kimi deploy for %s", result.account_name)
+
+    async def run_one(index: int, account: dict[str, str]) -> dict[str, Any]:
+        nonlocal finished
         async with sem:
-            return await asyncio.to_thread(_safe_deploy, module, account)
+            raw = await asyncio.to_thread(_safe_deploy, module, account)
+        result = _to_result(raw)
+        if account.get("person_associated"):
+            result.owner_tag = account["person_associated"]
+        result.name = result.name or account.get("name")
+        result.email = result.email or account.get("account_holder")
+        await persist_one(account, raw, result)
+        async with progress_lock:
+            finished += 1
+            done = finished
+        if on_progress is not None:
+            await on_progress(
+                {
+                    "type": "account",
+                    "index": index,
+                    "done": done,
+                    "total": len(accounts),
+                    "phase": "azure",
+                    "result": result.model_dump(mode="json"),
+                }
+            )
+        return raw
 
     raw_results, credit_results = await asyncio.gather(
-        asyncio.gather(*[run_one(account) for account in accounts]),
-        asyncio.gather(*[lookup_account_credits(account) for account in accounts]),
+        asyncio.gather(*[run_one(index, account) for index, account in enumerate(accounts)]),
+        asyncio.gather(*[_fetch_account_credits(account) for account in accounts]),
     )
-    return [_merge_credits(_to_result(item), credits) for item, credits in zip(raw_results, credit_results, strict=True)]
+    results = [_merge_credits(_to_result(item), credits) for item, credits in zip(raw_results, credit_results, strict=True)]
+    for result, account in zip(results, accounts, strict=True):
+        if account.get("person_associated"):
+            result.owner_tag = account["person_associated"]
+        result.name = result.name or account.get("name")
+        result.email = result.email or account.get("account_holder")
+        await store_azure_inventory(result)
+        if portal_service is None or not result.ok or not result.account_name or not result.credits_available:
+            continue
+        try:
+            await portal_service.upsert_from_kimi_deploy(
+                payload=account,
+                resource_name=result.account_name,
+                resource_group=result.resource_group or "",
+                endpoint=result.azure_openai_endpoint or "",
+                location=result.region or "",
+                owner_tag=result.owner_tag,
+                credits_limit=result.credits_limit,
+                credits_remaining=result.credits_remaining,
+                credits_used=result.credits_used,
+                credits_currency=result.credits_currency,
+                credits_label=result.credits_label,
+                deployment_name=result.deployment_name,
+            )
+        except Exception:
+            logger.exception("Could not update portal credits after Kimi deploy for %s", result.account_name)
+    if session is not None:
+        from app.services.kimi_newapi import ensure_kimi_newapi_channels
+
+        if on_progress is not None:
+            await on_progress({"type": "phase", "phase": "newapi", "message": "Adding O1 NewAPI channels", "total": len(accounts)})
+        try:
+            await ensure_kimi_newapi_channels(
+                session,
+                results,
+                accounts,
+                priority=new_api_priority,
+                weight=new_api_weight,
+                only_ok=True,
+            )
+        except Exception:
+            logger.exception("Could not add NewAPI channels after Kimi deploy")
+            for result in results:
+                if result.ok and not result.new_api_present and not result.new_api_error:
+                    result.new_api_error = "Could not add NewAPI channel."
+    return results
 
 
-async def regenerate_accounts(raw_accounts: list[dict[str, Any]], jobs: int) -> list[KimiSecretsRow]:
+async def add_kimi_newapi_channels(
+    raw_accounts: list[dict[str, Any]],
+    session: AsyncSession,
+    *,
+    priority: int = 13,
+    weight: int = 1,
+) -> list[KimiDeployResult]:
+    accounts = await prepare_accounts(raw_accounts, session)
+    results = list(await asyncio.gather(*[lookup_account_inventory(account) for account in accounts]))
+    for result, account in zip(results, accounts, strict=True):
+        if not result.account_name and account.get("account_name"):
+            result.account_name = account["account_name"]
+        if not result.azure_openai_endpoint and account.get("azure_openai_endpoint"):
+            result.azure_openai_endpoint = account["azure_openai_endpoint"]
+        if not result.resource_group and account.get("resource_group"):
+            result.resource_group = account["resource_group"]
+        if account.get("person_associated"):
+            result.owner_tag = account["person_associated"]
+    from app.services.kimi_newapi import ensure_kimi_newapi_channels
+
+    await ensure_kimi_newapi_channels(
+        session,
+        results,
+        accounts,
+        priority=priority,
+        weight=weight,
+        only_ok=False,
+    )
+    return results
+
+
+async def regenerate_accounts(
+    raw_accounts: list[dict[str, Any]],
+    jobs: int,
+    session: AsyncSession | None = None,
+) -> list[KimiSecretsRow]:
     status = deploy_status()
     if not status.ready:
         raise KimiDeployError(status.message)
 
-    accounts = normalize_accounts(raw_accounts)
+    accounts = await prepare_accounts(raw_accounts, session)
     module = load_deploy_module()
     workers = min(max(1, jobs), len(accounts))
     logger.info("Kimi K3 key regen started for %s account(s), jobs=%s", len(accounts), workers)
@@ -594,15 +943,36 @@ async def regenerate_accounts(raw_accounts: list[dict[str, Any]], jobs: int) -> 
             return await asyncio.to_thread(_safe_regenerate, module, account)
 
     raw_results = await asyncio.gather(*[run_one(account) for account in accounts])
+    if session is not None:
+        from app.services.service_principal_store import persist_service_principals
+
+        rotated: list[dict[str, str]] = []
+        for item, account in zip(raw_results, accounts, strict=True):
+            secret = item.get("AZURE_CLIENT_SECRET") if isinstance(item, dict) else None
+            if item.get("ok") and secret:
+                row = dict(account)
+                row["AZURE_CLIENT_SECRET"] = str(secret)
+                rotated.append(row)
+        if rotated:
+            try:
+                await persist_service_principals(session, rotated)
+            except Exception:
+                logger.exception("Could not store rotated service principal secrets")
+    for account in accounts:
+        await drop_azure_inventory(account.get("AZURE_SUBSCRIPTION_ID"), account.get("account_name"))
     return [_to_secrets_row(item) for item in raw_results]
 
 
-async def delete_accounts(raw_accounts: list[dict[str, Any]], jobs: int) -> list[KimiDeleteResult]:
+async def delete_accounts(
+    raw_accounts: list[dict[str, Any]],
+    jobs: int,
+    session: AsyncSession | None = None,
+) -> list[KimiDeleteResult]:
     status = deploy_status()
     if not status.ready:
         raise KimiDeployError(status.message)
 
-    accounts = normalize_accounts(raw_accounts)
+    accounts = await prepare_accounts(raw_accounts, session)
     module = load_deploy_module()
     workers = min(max(1, jobs), len(accounts))
     logger.info("Kimi K3 undeploy started for %s account(s), jobs=%s", len(accounts), workers)
@@ -614,7 +984,13 @@ async def delete_accounts(raw_accounts: list[dict[str, Any]], jobs: int) -> list
             return await asyncio.to_thread(_safe_delete, module, account)
 
     raw_results = await asyncio.gather(*[run_one(account) for account in accounts])
-    return [_to_delete_result(item) for item in raw_results]
+    results = [_to_delete_result(item) for item in raw_results]
+    for account, result in zip(accounts, results, strict=True):
+        sub = account.get("AZURE_SUBSCRIPTION_ID") or result.subscription_id
+        await drop_azure_inventory(sub, account.get("account_name"))
+        if result.account_name:
+            await drop_azure_inventory(result.subscription_id or sub, result.account_name)
+    return results
 
 
 def _run_bootstrap(name: str, email: str) -> dict[str, Any]:
@@ -745,7 +1121,10 @@ async def _post_chat(url: str, headers: dict[str, str], body: dict[str, Any]) ->
     return response.status_code, payload, text, latency_ms
 
 
-async def test_account_model(account: dict[str, str]) -> KimiTestResult:
+async def test_account_model(
+    account: dict[str, str],
+    collected_keys: list[dict[str, Any]] | None = None,
+) -> KimiTestResult:
     name = account.get("name") or account.get("account_holder") or "account"
     client_secret = account.get("AZURE_CLIENT_SECRET") or ""
     account_name = account.get("account_name") or ""
@@ -812,6 +1191,17 @@ async def test_account_model(account: dict[str, str]) -> KimiTestResult:
             *extra_endpoints,
         ]
     )
+    if collected_keys is not None and api_key and subscription_id and account_name:
+        collected_keys.append(
+            {
+                "api_key": api_key,
+                "subscription_id": subscription_id,
+                "resource_name": account_name,
+                "resource_group": resource_group,
+                "endpoint": _as_openai_endpoint(endpoint) or (bases[0] if bases else endpoint),
+                "deployment_name": deployment,
+            }
+        )
     if not bases:
         return KimiTestResult(
             ok=False,
@@ -892,6 +1282,18 @@ async def test_account_model(account: dict[str, str]) -> KimiTestResult:
     )
 
 
-async def test_accounts(raw_accounts: list[dict[str, Any]]) -> list[KimiTestResult]:
-    accounts = normalize_accounts(raw_accounts)
-    return list(await asyncio.gather(*[test_account_model(account) for account in accounts]))
+async def test_accounts(
+    raw_accounts: list[dict[str, Any]],
+    session: AsyncSession | None = None,
+) -> list[KimiTestResult]:
+    accounts = await prepare_accounts(raw_accounts, session)
+    collected_keys: list[dict[str, Any]] = []
+    results = list(await asyncio.gather(*[test_account_model(account, collected_keys) for account in accounts]))
+    if session is not None and collected_keys:
+        from app.services.openai_key_store import persist_foundry_api_keys
+
+        try:
+            await persist_foundry_api_keys(session, _with_person(collected_keys, accounts))
+        except Exception:
+            logger.exception("Could not store Foundry API keys after model test")
+    return results

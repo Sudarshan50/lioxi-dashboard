@@ -1,11 +1,13 @@
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class KimiDeployRequest(BaseModel):
     accounts: list[dict[str, Any]] = Field(min_length=1)
     jobs: int = Field(default=32, ge=1, le=64)
+    new_api_priority: int = Field(default=13, ge=0, le=10000)
+    new_api_weight: int = Field(default=1, ge=1, le=10000)
 
 
 class KimiCreditsRequest(BaseModel):
@@ -45,7 +47,6 @@ class KimiDeployResult(BaseModel):
     name: str | None = None
     email: str | None = None
     azure_openai_endpoint: str | None = None
-    api_key: str | None = None
     deployment_name: str | None = None
     model: str | None = None
     sku: str | None = None
@@ -65,12 +66,88 @@ class KimiDeployResult(BaseModel):
     credits_label: str | None = None
     credits_available: bool = False
     error: str | None = None
+    owner_tag: str | None = None
+    new_api_present: bool = False
+    new_api_created: bool = False
+    new_api_channel_id: int | None = None
+    new_api_name: str | None = None
+    new_api_status: int | None = None
+    new_api_status_label: str | None = None
+    new_api_priority: int | None = None
+    new_api_weight: int | None = None
+    new_api_error: str | None = None
 
 
 class KimiDeployResponse(BaseModel):
     ok_count: int
     fail_count: int
     results: list[KimiDeployResult]
+
+
+class KimiNewApiChannel(BaseModel):
+    id: int | None = None
+    name: str | None = None
+    status: int | None = None
+    status_label: str | None = None
+    tag: str | None = None
+    group: str | None = None
+    priority: int | None = None
+    weight: int | None = None
+    base_url: str | None = None
+    resource_name: str | None = None
+    models: str | None = None
+
+
+class KimiNewApiPool(BaseModel):
+    ok: bool
+    gateway: str | None = None
+    next_name: str | None = None
+    channels: list[KimiNewApiChannel] = Field(default_factory=list)
+    error: str | None = None
+    auth_expired: bool = False
+
+
+class KimiNewApiAuth(BaseModel):
+    ok: bool
+    gateway: str = "O1"
+    auth_expired: bool = False
+    error: str | None = None
+
+
+class KimiNewApiRequest(BaseModel):
+    accounts: list[dict[str, Any]] = Field(min_length=1)
+    priority: int = Field(default=13, ge=0, le=10000)
+    weight: int = Field(default=1, ge=1, le=10000)
+
+
+class KimiNewApiRenameRequest(BaseModel):
+    name: str = Field(default="", max_length=128)
+    priority: int | None = Field(default=None, ge=0, le=10000)
+    weight: int | None = Field(default=None, ge=1, le=10000)
+    channel_id: int | None = None
+    subscription_id: str = ""
+    account_name: str = ""
+    azure_openai_endpoint: str = ""
+
+    @model_validator(mode="after")
+    def require_update(self):
+        if not self.name.strip() and self.priority is None and self.weight is None:
+            raise ValueError("Provide a channel name, priority, or weight.")
+        return self
+
+
+class KimiStoredAccount(BaseModel):
+    name: str | None = None
+    account_holder: str | None = None
+    AZURE_TENANT_ID: str | None = None
+    AZURE_CLIENT_ID: str | None = None
+    AZURE_SUBSCRIPTION_ID: str
+    subscription_name: str | None = None
+    owner_tag: str | None = None
+
+
+class KimiStoredResponse(BaseModel):
+    accounts: list[KimiStoredAccount]
 
 
 class KimiSecretsRow(BaseModel):

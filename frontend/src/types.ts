@@ -228,6 +228,20 @@ export interface KimiDeployStatus {
   bootstrap_message?: string;
 }
 
+export interface KimiStoredAccount {
+  name?: string | null;
+  account_holder?: string | null;
+  AZURE_TENANT_ID?: string | null;
+  AZURE_CLIENT_ID?: string | null;
+  AZURE_SUBSCRIPTION_ID: string;
+  subscription_name?: string | null;
+  owner_tag?: string | null;
+}
+
+export interface KimiStoredResponse {
+  accounts: KimiStoredAccount[];
+}
+
 export interface KimiSecretsRow {
   ok: boolean;
   name?: string | null;
@@ -269,7 +283,6 @@ export interface KimiDeployResult {
   name?: string | null;
   email?: string | null;
   azure_openai_endpoint?: string | null;
-  api_key?: string | null;
   deployment_name?: string | null;
   model?: string | null;
   sku?: string | null;
@@ -289,6 +302,16 @@ export interface KimiDeployResult {
   credits_label?: string | null;
   credits_available?: boolean;
   error?: string | null;
+  owner_tag?: string | null;
+  new_api_present?: boolean;
+  new_api_created?: boolean;
+  new_api_channel_id?: number | null;
+  new_api_name?: string | null;
+  new_api_status?: number | null;
+  new_api_status_label?: string | null;
+  new_api_priority?: number | null;
+  new_api_weight?: number | null;
+  new_api_error?: string | null;
   removed?: boolean;
   deleted_resources?: string[];
   deleted_message?: string | null;
@@ -335,3 +358,98 @@ export interface KimiDeployResponse {
   fail_count: number;
   results: KimiDeployResult[];
 }
+
+export interface KimiDeployProgressEvent {
+  type: "start" | "account" | "phase" | "done" | "error";
+  total?: number;
+  index?: number;
+  done?: number;
+  phase?: string;
+  message?: string;
+  result?: KimiDeployResult;
+  results?: KimiDeployResult[];
+  detail?: string;
+}
+
+export interface KimiNewApiChannel {
+  id?: number | null;
+  name?: string | null;
+  status?: number | null;
+  status_label?: string | null;
+  tag?: string | null;
+  group?: string | null;
+  priority?: number | null;
+  weight?: number | null;
+  base_url?: string | null;
+  resource_name?: string | null;
+  models?: string | null;
+}
+
+export interface KimiNewApiPool {
+  ok: boolean;
+  gateway?: string | null;
+  next_name?: string | null;
+  channels: KimiNewApiChannel[];
+  error?: string | null;
+  auth_expired?: boolean;
+}
+
+export interface KimiNewApiAuth {
+  ok: boolean;
+  gateway?: string | null;
+  auth_expired: boolean;
+  error?: string | null;
+}
+
+export interface SubmitSubscription {
+  subscription_id: string;
+  name: string;
+  tenant_id: string;
+  is_default: boolean;
+}
+
+export interface SubmitSessionSnapshot {
+  type?: string;
+  session_id: string;
+  status: string;
+  account_holder?: string | null;
+  person_associated?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  device_user_code?: string | null;
+  device_verification_uri?: string | null;
+  subscriptions?: SubmitSubscription[];
+  error?: string | null;
+  billing_error?: string | null;
+  message?: string | null;
+  user_code?: string;
+  verification_uri?: string;
+  detail?: string;
+  phase?: string;
+}
+
+export interface PendingSubmitRequest {
+  id: number;
+  status: string;
+  person_associated?: string | null;
+  account_holder?: string | null;
+  name?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  tenant_id?: string | null;
+  billing_error?: string | null;
+  error_message?: string | null;
+  error_kind?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  approved_at?: string | null;
+  rejected_at?: string | null;
+  can_retry_deploy?: boolean;
+}
+
+export interface PendingListResponse {
+  requests: PendingSubmitRequest[];
+  pending_count: number;
+  failed_count: number;
+}
+

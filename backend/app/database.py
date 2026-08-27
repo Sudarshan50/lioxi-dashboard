@@ -46,6 +46,7 @@ _ACCOUNT_EXTRA_COLUMNS = (
     ("payable_settled", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("payable_settled_at", "TIMESTAMPTZ"),
     ("at_cap_manual", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("openai_api_key_encrypted", "TEXT"),
 )
 
 
@@ -54,9 +55,49 @@ async def _ensure_account_columns(conn) -> None:
         await conn.execute(text(f"ALTER TABLE provider_accounts ADD COLUMN IF NOT EXISTS {name} {definition}"))
 
 
+async def _ensure_azure_openai_key_columns(conn) -> None:
+    await conn.execute(text("ALTER TABLE azure_openai_keys ADD COLUMN IF NOT EXISTS owner_tag VARCHAR(64)"))
+
+
+async def _ensure_submit_columns(conn) -> None:
+    await conn.execute(text("ALTER TABLE sp_submit_requests ADD COLUMN IF NOT EXISTS error_kind VARCHAR(16)"))
+
+
+async def _ensure_submit_indexes(conn) -> None:
+    # Drop extras so the unique live-subscription index can be created.
+    await conn.execute(
+        text(
+            """
+            DELETE FROM sp_submit_requests AS extra
+            USING sp_submit_requests AS kept
+            WHERE extra.status IN ('pending_approval', 'creating_sp')
+              AND kept.status IN ('pending_approval', 'creating_sp')
+              AND extra.subscription_id IS NOT NULL
+              AND btrim(extra.subscription_id) <> ''
+              AND lower(extra.subscription_id) = lower(kept.subscription_id)
+              AND extra.id > kept.id
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_sp_submit_live_subscription
+            ON sp_submit_requests (lower(subscription_id))
+            WHERE status IN ('pending_approval', 'creating_sp')
+              AND subscription_id IS NOT NULL
+              AND btrim(subscription_id) <> ''
+            """
+        )
+    )
+
+
 async def init_models() -> None:
     import app.models  # noqa: F401 - registers ORM models on Base.metadata before create_all
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_account_columns(conn)
+        await _ensure_azure_openai_key_columns(conn)
+        await _ensure_submit_columns(conn)
+        await _ensure_submit_indexes(conn)

@@ -1,5 +1,5 @@
-import { Check, Copy, Play, RefreshCw, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { Check, Copy, Pencil, Play, Radio, RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
@@ -11,39 +11,94 @@ export default function DeployedKimiCard({
   item,
   email,
   busy,
+  deploying = false,
   rotating,
   testing,
   deleting,
+  addingNewApi,
+  renamingNewApi,
+  nextNewApiName,
+  defaultPriority = 13,
+  defaultWeight = 1,
+  jsonPriority,
+  jsonWeight,
   testResult,
   onRotate,
   onTest,
   onDelete,
+  onAddNewApi,
+  onSaveNewApi,
 }: {
   item: KimiDeployResult;
   email?: string | null;
   busy: boolean;
+  deploying?: boolean;
   rotating: boolean;
   testing: boolean;
   deleting: boolean;
+  addingNewApi: boolean;
+  renamingNewApi: boolean;
+  nextNewApiName?: string | null;
+  defaultPriority?: number;
+  defaultWeight?: number;
+  jsonPriority?: number;
+  jsonWeight?: number;
   testResult?: KimiTestResult | null;
   onRotate: () => void;
   onTest: () => void;
   onDelete: () => void;
+  onAddNewApi: (opts?: { name?: string; priority?: number; weight?: number }) => void;
+  onSaveNewApi: (opts: { name: string; priority: number; weight: number }) => void;
 }) {
   const live = item.ok && !item.removed;
   const grant = formatGrant(item);
   const endpoint = openaiEndpoint(item.azure_openai_endpoint);
+  const canAddNewApi = Boolean((live || item.account_name) && !item.removed && !item.pending && !item.new_api_present);
+  const seedPriority = item.new_api_priority ?? jsonPriority ?? defaultPriority;
+  const seedWeight = item.new_api_weight ?? jsonWeight ?? defaultWeight;
+  const [draftName, setDraftName] = useState(item.new_api_name || "");
+  const [draftPriority, setDraftPriority] = useState(String(seedPriority));
+  const [draftWeight, setDraftWeight] = useState(String(seedWeight));
+
+  useEffect(() => {
+    setDraftName(item.new_api_name || "");
+    setDraftPriority(String(seedPriority));
+    setDraftWeight(String(seedWeight));
+  }, [
+    item.new_api_channel_id,
+    item.new_api_name,
+    seedPriority,
+    seedWeight,
+  ]);
+
+  const trimmedName = draftName.trim();
+  const parsedPriority = clampInt(draftPriority, seedPriority, 0, 10000);
+  const parsedWeight = clampInt(draftWeight, seedWeight, 1, 10000);
+  const nameToSave = trimmedName || (item.new_api_name || "").trim();
+  const nameChanged = nameToSave !== (item.new_api_name || "").trim();
+  const priChanged = parsedPriority !== seedPriority;
+  const wtChanged = parsedWeight !== seedWeight;
+  const canSaveRouting = Boolean(
+    item.new_api_present && nameToSave && (nameChanged || priChanged || wtChanged) && !item.pending && !item.removed
+  );
 
   return (
-    <Card className="flex flex-col gap-4">
+    <Card className={`flex flex-col gap-4 ${deploying ? "!border-accent/40 shadow-glow" : ""}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
-          <div className="flex min-w-0 items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <p className="truncate font-medium text-gray-100">{item.name || item.account_name || "Account"}</p>
+            {item.owner_tag && (
+              <Badge tone="info" className="max-w-[8rem] shrink-0 truncate" title="Name tag">
+                {item.owner_tag}
+              </Badge>
+            )}
             {item.removed ? (
               <Badge tone="warning">deleted</Badge>
             ) : item.pending ? (
-              <Badge tone="info">looking up</Badge>
+              <Badge tone="info" className={deploying ? "animate-pulse" : undefined}>
+                {deploying ? "deploying" : "looking up"}
+              </Badge>
             ) : item.ok ? (
               <Badge tone="success">deployed</Badge>
             ) : item.error ? (
@@ -51,6 +106,7 @@ export default function DeployedKimiCard({
             ) : (
               <Badge tone="neutral">not deployed</Badge>
             )}
+            <NewApiBadge item={item} />
           </div>
           <p className="mt-0.5 truncate text-xs text-gray-500">{email || "No email"}</p>
         </div>
@@ -76,6 +132,18 @@ export default function DeployedKimiCard({
               {!testing && <Play size={13} />}
               Test model
             </Button>
+            {canAddNewApi && (
+              <Button
+                variant="secondary"
+                className="px-2.5 py-1.5 text-xs"
+                onClick={() => onAddNewApi({ name: trimmedName || undefined, priority: parsedPriority, weight: parsedWeight })}
+                isLoading={addingNewApi}
+                disabled={busy}
+              >
+                {!addingNewApi && <Radio size={13} />}
+                Add to NewAPI
+              </Button>
+            )}
             {live && (
               <Button
                 variant="danger"
@@ -93,9 +161,12 @@ export default function DeployedKimiCard({
       </div>
 
       {item.pending && (
-        <div className="flex items-center gap-2 text-xs text-gray-500">
-          <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-gray-500/40 border-t-gray-100" />
-          Looking up this subscription…
+        <div className="flex items-center gap-2 text-xs text-gray-400">
+          <span className="relative flex h-2.5 w-2.5">
+            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent/70" />
+            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-accent" />
+          </span>
+          {deploying ? "Deploying this Azure stack in parallel…" : "Looking up this subscription…"}
         </div>
       )}
       {item.error && <p className="break-words text-xs text-red-400">{item.error}</p>}
@@ -113,6 +184,64 @@ export default function DeployedKimiCard({
             value={[item.deployment_name || "FW-Kimi-K3", item.region].filter(Boolean).join(" · ")}
           />
           <Meta label="Subscription" value={item.subscription_name || item.subscription_id} />
+          <div className="sm:col-span-2">
+            <p className="text-gray-500">NewAPI</p>
+            {item.pending ? (
+              <p className="mt-0.5 text-gray-100">{deploying ? "Waiting on Azure…" : "Looking up…"}</p>
+            ) : item.new_api_present || canAddNewApi ? (
+              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                <input
+                  value={draftName}
+                  onChange={(event) => setDraftName(event.target.value)}
+                  disabled={busy}
+                  maxLength={128}
+                  placeholder={item.new_api_present ? "Channel name" : nextNewApiName || "kimi-k3-500k-proxy-…"}
+                  className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-surface px-2.5 py-1.5 font-mono text-xs text-gray-100 outline-none placeholder:text-gray-600 focus:border-accent disabled:opacity-60"
+                />
+                <label className="flex items-center gap-1 text-[11px] text-gray-500">
+                  P
+                  <input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    value={draftPriority}
+                    onChange={(event) => setDraftPriority(event.target.value)}
+                    disabled={busy}
+                    className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 font-mono text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
+                  />
+                </label>
+                <label className="flex items-center gap-1 text-[11px] text-gray-500">
+                  W
+                  <input
+                    type="number"
+                    min={1}
+                    max={10000}
+                    value={draftWeight}
+                    onChange={(event) => setDraftWeight(event.target.value)}
+                    disabled={busy}
+                    className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 font-mono text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
+                  />
+                </label>
+                {item.new_api_present ? (
+                  <Button
+                    variant="secondary"
+                    className="px-2.5 py-1.5 text-xs"
+                    onClick={() => onSaveNewApi({ name: nameToSave, priority: parsedPriority, weight: parsedWeight })}
+                    isLoading={renamingNewApi}
+                    disabled={busy || !canSaveRouting}
+                  >
+                    {!renamingNewApi && <Pencil size={13} />}
+                    Save
+                  </Button>
+                ) : null}
+              </div>
+            ) : (
+              <p className="mt-0.5 truncate text-gray-100">{item.new_api_error || "Not in NewAPI"}</p>
+            )}
+            {item.new_api_present && item.new_api_status_label && (
+              <p className="mt-1 truncate text-[11px] text-gray-500">{item.new_api_status_label}</p>
+            )}
+          </div>
           <div className="sm:col-span-2">
             <p className="text-gray-500">OpenAI endpoint</p>
             {endpoint ? (
@@ -164,6 +293,40 @@ export default function DeployedKimiCard({
       )}
     </Card>
   );
+}
+
+function NewApiBadge({ item }: { item: KimiDeployResult }) {
+  if (item.pending) return null;
+  if (item.new_api_present) {
+    const label = item.new_api_status_label || "in NewAPI";
+    const tone = item.new_api_status === 1 ? "success" : item.new_api_status === 3 ? "error" : "warning";
+    return (
+      <Badge tone={tone} title={item.new_api_name || "NewAPI channel"}>
+        NewAPI {label}
+      </Badge>
+    );
+  }
+  if (item.new_api_error) {
+    return (
+      <Badge tone="error" title={item.new_api_error}>
+        NewAPI failed
+      </Badge>
+    );
+  }
+  if (item.ok || item.account_name) {
+    return (
+      <Badge tone="warning" title="No matching channel on O1 NewAPI">
+        not in NewAPI
+      </Badge>
+    );
+  }
+  return null;
+}
+
+function clampInt(raw: string, fallback: number, min: number, max: number) {
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(parsed)));
 }
 
 function Meta({ label, value, mono }: { label: string; value?: string | null; mono?: boolean }) {

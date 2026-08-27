@@ -11,6 +11,9 @@
 *.pfx
 credentials.json
 credentials*.json
+secrets.json
+results.json
+*_result.json
 # Repo-root JSON is always an SP/secrets dump. Package JSON lives under frontend/.
 /*.json
 *_kimi_*.json
@@ -21,8 +24,15 @@ cursor-cli-monitor-setup-prompt.md
 *.dump
 
 # Member/endpoint mapping sheet (names + Azure resource hosts). Local only.
+*.csv
+!*.csv.example
+!**/*.csv.example
 imp_data.csv
 **/imp_data.csv
+
+# Local Azure CLI config if copied into the tree
+.azure/
+az-submit/
 
 # Python
 __pycache__/
