@@ -39,6 +39,7 @@ services:
       REDIS_URL: redis://redis:6379/0
     volumes:
       - ./scripts:/app/scripts:ro
+      - ./secrets:/run/secrets:ro
     extra_hosts:
       # Campus DNS also returns IPv6 for ARM that this network cannot reach.
       - "management.azure.com:4.150.240.10"

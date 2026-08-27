@@ -16,6 +16,9 @@ import {
   useKimiNewApiPool,
   useKimiRenameNewApi,
   useKimiRegenerateKeys,
+  useKimiRefreshInventory,
+  useKimiSheetStatus,
+  useKimiSheetSync,
   useKimiStoredAccounts,
   useKimiTestModel,
   useKimiUndeploy,
@@ -54,6 +57,9 @@ export default function DeployK3Page() {
   const testModel = useKimiTestModel();
   const addNewApi = useKimiAddNewApi();
   const renameNewApi = useKimiRenameNewApi();
+  const sheetStatus = useKimiSheetStatus();
+  const sheetSync = useKimiSheetSync();
+  const refreshInventory = useKimiRefreshInventory();
   const [jsonText, setJsonText] = useState("");
   const [jsonLocked, setJsonLocked] = useState(false);
   const [loadedAccounts, setLoadedAccounts] = useState<AzureDeploySecret[]>([]);
@@ -65,6 +71,8 @@ export default function DeployK3Page() {
   const [testingIndex, setTestingIndex] = useState<number | "all" | null>(null);
   const [addingNewApiIndex, setAddingNewApiIndex] = useState<number | "all" | null>(null);
   const [renamingNewApiIndex, setRenamingNewApiIndex] = useState<number | null>(null);
+  const [syncingSheetIndex, setSyncingSheetIndex] = useState<number | "all" | null>(null);
+  const [refreshingIndex, setRefreshingIndex] = useState<number | null>(null);
   const [testByIndex, setTestByIndex] = useState<Record<number, KimiTestResult>>({});
   const [dragging, setDragging] = useState(false);
   const [newApiPriority, setNewApiPriority] = useState(13);
@@ -136,7 +144,8 @@ export default function DeployK3Page() {
     undeploy.isPending ||
     testModel.isPending ||
     addNewApi.isPending ||
-    renameNewApi.isPending;
+    renameNewApi.isPending ||
+    sheetSync.isPending;
   const liveResults = displayed.filter((item) => item.ok && !item.removed);
   const testableResults = displayed.filter((item) => !item.removed && !item.error && !item.pending);
   const pendingCount = displayed.filter((item) => item.pending).length;
@@ -433,6 +442,64 @@ export default function DeployK3Page() {
     }
   }
 
+  async function handleSyncSheet(items: { item: KimiDeployResult; index: number }[], bulk: boolean) {
+    setError(null);
+    setNotice(null);
+    if (!items.length) return;
+    setSyncingSheetIndex(bulk ? "all" : items[0].index);
+    try {
+      const response = await sheetSync.mutateAsync({
+        results: items.map(({ item }) => ({
+          ...item,
+          ok: true,
+          email: item.email || holderFromPaste(item) || item.email,
+        })),
+      });
+      const count = response.synced;
+      setNotice(
+        count === 1
+          ? "Synced 1 row to the inventory sheet."
+          : `Synced ${count} rows to the inventory sheet.`
+      );
+    } catch (err: any) {
+      setError(apiErrorMessage(err, "Could not sync to the Google Sheet."));
+    } finally {
+      setSyncingSheetIndex(null);
+    }
+  }
+
+  async function handleRefreshOne(item: KimiDeployResult, index: number) {
+    setError(null);
+    setNotice(null);
+    const accounts = secretsForActions();
+    if (!accounts) return;
+    const payload = payloadForResult(item, accounts) || deployPayload[index];
+    if (!payload) {
+      setError(`Need the matching account to refresh ${displayName(item)}.`);
+      return;
+    }
+    setRefreshingIndex(index);
+    try {
+      const response = await refreshInventory.mutateAsync({ accounts: [payload] });
+      const row = response.results[0];
+      if (!row) {
+        setError("Could not refresh this account.");
+        return;
+      }
+      setResults((prev) => {
+        if (!prev) return prev;
+        return prev.map((current, currentIndex) =>
+          currentIndex === index ? { ...current, ...row, pending: false, removed: false } : current
+        );
+      });
+      setNotice(`Refreshed ${displayName(row) || displayName(item)}.`);
+    } catch (err: any) {
+      setError(apiErrorMessage(err, "Could not refresh this account."));
+    } finally {
+      setRefreshingIndex(null);
+    }
+  }
+
   async function rotateAccounts(items: { item: KimiDeployResult; index: number }[], bulk: boolean) {
     setError(null);
     setNotice(null);
@@ -660,54 +727,19 @@ export default function DeployK3Page() {
             Reloading clears the JSON; already-deployed stacks stay listed below.
           </p>
         </div>
-        <div className="flex w-full flex-col gap-2 sm:w-auto sm:items-end">
-          <div className="flex items-end gap-2">
-            <label className="flex flex-col gap-1 text-[11px] text-gray-500">
-              Priority
-              <input
-                type="number"
-                min={0}
-                max={10000}
-                value={newApiPriority}
-                onChange={(event) => setNewApiPriority(Number(event.target.value) || 0)}
-                disabled={busy}
-                className="w-20 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
-              />
-            </label>
-            <label className="flex flex-col gap-1 text-[11px] text-gray-500">
-              Weight
-              <input
-                type="number"
-                min={1}
-                max={10000}
-                value={newApiWeight}
-                onChange={(event) => setNewApiWeight(Math.max(1, Number(event.target.value) || 1))}
-                disabled={busy}
-                className="w-20 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
-              />
-            </label>
-            <Button onClick={() => void handleDeploy()} isLoading={deploying} disabled={busy || !canDeploy} className="sm:w-auto">
-              {!deploying && <Rocket size={16} />}
-              {deploying
-                ? deployProgress
-                  ? `Deploying ${deployProgress.done}/${deployProgress.total}…`
-                  : `Deploying ${loadedAccounts.length || parsed.accounts.length}…`
-                : (jsonLocked ? loadedAccounts.length : parsed.accounts.length)
-                  ? `Deploy ${jsonLocked ? loadedAccounts.length : parsed.accounts.length}`
-                  : "Deploy"}
-            </Button>
-          </div>
+        <div className="flex w-full shrink-0 flex-col items-stretch gap-2 sm:w-auto sm:items-end">
+          <Button onClick={() => void handleDeploy()} isLoading={deploying} disabled={busy || !canDeploy} className="sm:w-auto">
+            {!deploying && <Rocket size={16} />}
+            {deploying
+              ? deployProgress
+                ? `Deploying ${deployProgress.done}/${deployProgress.total}…`
+                : `Deploying ${loadedAccounts.length || parsed.accounts.length}…`
+              : (jsonLocked ? loadedAccounts.length : parsed.accounts.length)
+                ? `Deploy ${jsonLocked ? loadedAccounts.length : parsed.accounts.length}`
+                : "Deploy"}
+          </Button>
           {newApiPool.data?.auth_expired && (
             <p className="text-[11px] text-red-400">O1 portal token expired — NewAPI create/update will fail until it is updated.</p>
-          )}
-          <p className="text-[11px] text-gray-500">
-            Priority / weight apply to new O1 channels. Per-card values and JSON <span className="font-mono">priority</span>/<span className="font-mono">weight</span> override these.
-          </p>
-          {newApiPool.data?.next_name && !newApiPool.data.auth_expired && (
-            <p className="text-[11px] text-gray-500">
-              Next NewAPI name <span className="font-mono text-gray-400">{newApiPool.data.next_name}</span>
-              {newApiPool.data.ok === false && newApiPool.data.error ? ` · ${newApiPool.data.error}` : ""}
-            </p>
           )}
         </div>
       </div>
@@ -774,7 +806,7 @@ export default function DeployK3Page() {
               setJsonText(e.target.value);
               setError(null);
             }}
-            rows={12}
+            rows={8}
             spellCheck={false}
             disabled={busy || jsonLocked}
             placeholder="Paste or drop a JSON array of service principals. It stays here until you click Deploy."
@@ -806,31 +838,87 @@ export default function DeployK3Page() {
 
       {showDeployed && (
         <section className="flex flex-col gap-3">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="min-w-0">
-              <h2 className="text-sm font-semibold text-gray-200">Deployed</h2>
-              <p className="text-xs text-gray-500">
-                {deploying && pendingCount > 0
-                  ? `Deploying ${pendingCount} of ${displayed.length} in parallel…`
-                  : pendingCount > 0
-                    ? `Looking up ${pendingCount} subscription${pendingCount === 1 ? "" : "s"} in parallel…`
-                    : `${liveResults.length} live${
-                        displayed.filter((item) => !item.ok && item.error).length
-                          ? ` · ${displayed.filter((item) => !item.ok && item.error).length} failed`
-                          : ""
-                      }${
-                        displayed.filter((item) => item.new_api_present).length
-                          ? ` · ${displayed.filter((item) => item.new_api_present).length} in NewAPI`
-                          : ""
-                      }${
-                        displayed.filter((item) => item.removed).length
-                          ? ` · ${displayed.filter((item) => item.removed).length} deleted`
-                          : ""
-                      }`}
-              </p>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+              <div className="min-w-0">
+                <h2 className="text-sm font-semibold text-gray-200">Deployed</h2>
+                <p className="text-xs text-gray-500">
+                  {deploying && pendingCount > 0
+                    ? `Deploying ${pendingCount} of ${displayed.length} in parallel…`
+                    : pendingCount > 0
+                      ? `Looking up ${pendingCount} subscription${pendingCount === 1 ? "" : "s"} in parallel…`
+                      : `${liveResults.length} live${
+                          displayed.filter((item) => !item.ok && item.error).length
+                            ? ` · ${displayed.filter((item) => !item.ok && item.error).length} failed`
+                            : ""
+                        }${
+                          displayed.filter((item) => item.new_api_present).length
+                            ? ` · ${displayed.filter((item) => item.new_api_present).length} in NewAPI`
+                            : ""
+                        }${
+                          displayed.filter((item) => item.removed).length
+                            ? ` · ${displayed.filter((item) => item.removed).length} deleted`
+                            : ""
+                        }`}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="flex flex-col gap-1 text-[11px] text-gray-500">
+                  P
+                  <input
+                    type="number"
+                    min={0}
+                    max={10000}
+                    value={newApiPriority}
+                    onChange={(event) => setNewApiPriority(Number(event.target.value) || 0)}
+                    disabled={busy}
+                    className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-[11px] text-gray-500">
+                  W
+                  <input
+                    type="number"
+                    min={1}
+                    max={10000}
+                    value={newApiWeight}
+                    onChange={(event) => setNewApiWeight(Math.max(1, Number(event.target.value) || 1))}
+                    disabled={busy}
+                    className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
+                  />
+                </label>
+                {newApiPool.data?.next_name && !newApiPool.data.auth_expired && (
+                  <p className="pb-2 text-[11px] text-gray-500">
+                    Next <span className="font-mono text-gray-400">{newApiPool.data.next_name}</span>
+                  </p>
+                )}
+              </div>
             </div>
             {testableResults.length > 0 && (
-              <div className="flex gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                {liveResults.length > 0 && (
+                  <Button
+                    variant="secondary"
+                    className="px-3 py-1.5 text-xs"
+                    onClick={() =>
+                      void handleSyncSheet(
+                        displayed
+                          .map((item, index) => ({ item, index }))
+                          .filter(({ item }) => item.ok && !item.removed),
+                        true
+                      )
+                    }
+                    isLoading={sheetSync.isPending && syncingSheetIndex === "all"}
+                    disabled={busy}
+                    title={
+                      sheetStatus.data?.configured === false
+                        ? "Google Sheet is not configured"
+                        : "Write live stacks to Sheet1"
+                    }
+                  >
+                    Sync all to sheet
+                  </Button>
+                )}
                 <Button
                   variant="secondary"
                   className="px-3 py-1.5 text-xs"
@@ -868,7 +956,7 @@ export default function DeployK3Page() {
                 {liveResults.length > 0 && (
                   <>
                     <Button
-                      variant="secondary"
+                      variant="ghost"
                       className="px-3 py-1.5 text-xs"
                       onClick={() =>
                         void rotateAccounts(
@@ -883,7 +971,7 @@ export default function DeployK3Page() {
                     </Button>
                     <Button
                       variant="danger"
-                      className="px-3 py-1.5 text-xs"
+                      className="ml-auto px-3 py-1.5 text-xs"
                       onClick={() => void handleDeleteAll()}
                       isLoading={undeploy.isPending && deletingIndex === "all"}
                       disabled={busy}
@@ -898,19 +986,21 @@ export default function DeployK3Page() {
           {displayed.length === 0 ? (
             <p className="text-sm text-gray-500">No FW-Kimi-K3 found on these subscriptions yet.</p>
           ) : (
-            <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+            <div className="grid grid-cols-1 gap-3">
               {displayed.map((item, index) => (
                 <DeployedKimiCard
                   key={`${item.subscription_id ?? item.name ?? "row"}-${index}`}
                   item={item}
                   email={item.email || holderFromPaste(item)}
-                  busy={busy}
+                  busy={busy || refreshingIndex === index}
                   deploying={deploying && Boolean(item.pending)}
                   rotating={regenerate.isPending && rotatingIndex === index}
                   testing={testModel.isPending && (testingIndex === index || testingIndex === "all")}
                   deleting={undeploy.isPending && deletingIndex === index}
                   addingNewApi={addNewApi.isPending && (addingNewApiIndex === index || addingNewApiIndex === "all")}
                   renamingNewApi={renameNewApi.isPending && renamingNewApiIndex === index}
+                  syncingSheet={sheetSync.isPending && (syncingSheetIndex === index || syncingSheetIndex === "all")}
+                  refreshing={refreshingIndex === index}
                   nextNewApiName={newApiPool.data?.next_name}
                   defaultPriority={newApiPriority}
                   defaultWeight={newApiWeight}
@@ -922,6 +1012,8 @@ export default function DeployK3Page() {
                   onDelete={() => void handleDeleteOne(item, index)}
                   onAddNewApi={(opts) => void handleAddNewApi([{ item, index, ...opts }], false)}
                   onSaveNewApi={(patch) => void handleSaveNewApi(item, index, patch)}
+                  onSyncSheet={() => void handleSyncSheet([{ item, index }], false)}
+                  onRefresh={() => void handleRefreshOne(item, index)}
                 />
               ))}
             </div>

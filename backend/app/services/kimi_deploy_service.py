@@ -645,8 +645,16 @@ async def lookup_account_inventory(account: dict[str, str]) -> KimiDeployResult:
 async def lookup_accounts_inventory(
     raw_accounts: list[dict[str, Any]],
     session: AsyncSession | None = None,
+    refresh: bool = False,
 ) -> list[KimiDeployResult]:
     accounts = await prepare_accounts(raw_accounts, session)
+    if refresh:
+        from app.services.azure_inventory_cache import drop_azure_inventory
+        from app.services.kimi_newapi import invalidate_kimi_pool_cache
+
+        invalidate_kimi_pool_cache()
+        for account in accounts:
+            await drop_azure_inventory(account.get("AZURE_SUBSCRIPTION_ID"), account.get("account_name"))
     results = list(await asyncio.gather(*[lookup_account_inventory(account) for account in accounts]))
     if session is not None:
         from app.repositories.account_repository import AccountRepository
@@ -888,6 +896,9 @@ async def deploy_accounts(
             for result in results:
                 if result.ok and not result.new_api_present and not result.new_api_error:
                     result.new_api_error = "Could not add NewAPI channel."
+    from app.services.google_sheet_inventory import sync_deploy_results
+
+    await sync_deploy_results(results)
     return results
 
 
@@ -919,6 +930,9 @@ async def add_kimi_newapi_channels(
         weight=weight,
         only_ok=False,
     )
+    from app.services.google_sheet_inventory import sync_deploy_results
+
+    await sync_deploy_results(results)
     return results
 
 

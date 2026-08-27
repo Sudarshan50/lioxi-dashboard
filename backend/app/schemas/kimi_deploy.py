@@ -12,6 +12,7 @@ class KimiDeployRequest(BaseModel):
 
 class KimiCreditsRequest(BaseModel):
     accounts: list[dict[str, Any]] = Field(min_length=1)
+    refresh: bool = False
 
 
 class KimiBootstrapRequest(BaseModel):
@@ -216,3 +217,18 @@ class KimiDeployStatus(BaseModel):
     subscription_id: str | None = None
     subscription_name: str | None = None
     bootstrap_message: str = ""
+
+
+class KimiSheetStatus(BaseModel):
+    configured: bool
+
+
+class KimiSheetSyncRequest(BaseModel):
+    results: list[KimiDeployResult] = Field(min_length=1)
+
+
+class KimiSheetSyncResponse(BaseModel):
+    ok: bool
+    configured: bool
+    synced: int = 0
+    error: str | None = None

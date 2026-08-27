@@ -24,6 +24,9 @@ from app.schemas.kimi_deploy import (
     KimiRegenerateRequest,
     KimiRegenerateResponse,
     KimiSecretsRow,
+    KimiSheetStatus,
+    KimiSheetSyncRequest,
+    KimiSheetSyncResponse,
     KimiStoredAccount,
     KimiStoredResponse,
     KimiTestResponse,
@@ -90,7 +93,7 @@ async def credits(payload: KimiCreditsRequest, db: AsyncSession = Depends(get_db
 @router.post("/inventory", response_model=KimiDeployResponse)
 async def inventory(payload: KimiCreditsRequest, db: AsyncSession = Depends(get_db)) -> KimiDeployResponse:
     try:
-        results = await lookup_accounts_inventory(payload.accounts, session=db)
+        results = await lookup_accounts_inventory(payload.accounts, session=db, refresh=payload.refresh)
     except KimiDeployError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ok_count = sum(1 for item in results if item.ok)
@@ -130,6 +133,29 @@ async def add_newapi(payload: KimiNewApiRequest, db: AsyncSession = Depends(get_
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ok_count = sum(1 for item in results if item.new_api_present)
     return KimiDeployResponse(ok_count=ok_count, fail_count=len(results) - ok_count, results=results)
+
+
+@router.get("/sheet", response_model=KimiSheetStatus)
+async def sheet_status() -> KimiSheetStatus:
+    from app.services.google_sheet_inventory import configured
+
+    return KimiSheetStatus(configured=configured())
+
+
+@router.post("/sheet", response_model=KimiSheetSyncResponse)
+async def sync_sheet(payload: KimiSheetSyncRequest) -> KimiSheetSyncResponse:
+    from app.services.google_sheet_inventory import SheetSyncError, configured, push_inventory
+
+    if not configured():
+        raise HTTPException(
+            status_code=400,
+            detail="Google Sheet is not configured. Set GOOGLE_SHEETS_SPREADSHEET_ID and a service-account key.",
+        )
+    try:
+        synced = await push_inventory(payload.results)
+    except SheetSyncError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return KimiSheetSyncResponse(ok=True, configured=True, synced=synced)
 
 
 @router.post("/newapi/rename", response_model=KimiDeployResult)

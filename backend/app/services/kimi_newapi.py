@@ -739,4 +739,8 @@ async def rename_kimi_newapi_channel(
             logger.warning("NewAPI channel update failed: %s", exc)
             result.ok = False
             result.new_api_error = str(exc)[:300]
+    if result.ok:
+        from app.services.google_sheet_inventory import sync_deploy_results
+
+        await sync_deploy_results([result])
     return result

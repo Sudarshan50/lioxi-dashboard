@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     kimi_azure_cache_ttl_seconds: int = 900
     submit_session_ttl_seconds: int = 1800
 
+    google_sheets_spreadsheet_id: str = ""
+    google_sheets_tab: str = "Sheet1"
+    google_sheets_credentials_path: str = ""
+    google_sheets_credentials_json: str = ""
+
     @property
     def telegram_admin_id_set(self) -> set[str]:
         return {part.strip() for part in self.telegram_admin_ids.split(",") if part.strip()}

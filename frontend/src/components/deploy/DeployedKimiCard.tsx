@@ -1,4 +1,4 @@
-import { Check, Copy, Pencil, Play, Radio, RefreshCw, Trash2 } from "lucide-react";
+import { Check, Copy, FileSpreadsheet, KeyRound, Play, Radio, RefreshCw, Pencil, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
@@ -17,6 +17,8 @@ export default function DeployedKimiCard({
   deleting,
   addingNewApi,
   renamingNewApi,
+  syncingSheet,
+  refreshing,
   nextNewApiName,
   defaultPriority = 13,
   defaultWeight = 1,
@@ -28,6 +30,8 @@ export default function DeployedKimiCard({
   onDelete,
   onAddNewApi,
   onSaveNewApi,
+  onSyncSheet,
+  onRefresh,
 }: {
   item: KimiDeployResult;
   email?: string | null;
@@ -38,6 +42,8 @@ export default function DeployedKimiCard({
   deleting: boolean;
   addingNewApi: boolean;
   renamingNewApi: boolean;
+  syncingSheet: boolean;
+  refreshing: boolean;
   nextNewApiName?: string | null;
   defaultPriority?: number;
   defaultWeight?: number;
@@ -49,6 +55,8 @@ export default function DeployedKimiCard({
   onDelete: () => void;
   onAddNewApi: (opts?: { name?: string; priority?: number; weight?: number }) => void;
   onSaveNewApi: (opts: { name: string; priority: number; weight: number }) => void;
+  onSyncSheet: () => void;
+  onRefresh: () => void;
 }) {
   const live = item.ok && !item.removed;
   const grant = formatGrant(item);
@@ -82,14 +90,17 @@ export default function DeployedKimiCard({
     item.new_api_present && nameToSave && (nameChanged || priChanged || wtChanged) && !item.pending && !item.removed
   );
 
+  const showActions = !item.removed && !item.error && !item.pending;
+  const canRefresh = !item.removed && !deploying;
+
   return (
-    <Card className={`flex flex-col gap-4 ${deploying ? "!border-accent/40 shadow-glow" : ""}`}>
-      <div className="flex items-start justify-between gap-3">
+    <Card className={`flex flex-col gap-0 !p-0 ${deploying ? "!border-accent/40 shadow-glow" : ""}`}>
+      <div className="flex flex-col gap-4 p-4 sm:p-5">
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
-            <p className="truncate font-medium text-gray-100">{item.name || item.account_name || "Account"}</p>
+            <p className="truncate text-base font-medium text-gray-100">{item.name || item.account_name || "Account"}</p>
             {item.owner_tag && (
-              <Badge tone="info" className="max-w-[8rem] shrink-0 truncate" title="Name tag">
+              <Badge tone="info" className="max-w-[9rem] shrink-0 truncate" title="Name tag">
                 {item.owner_tag}
               </Badge>
             )}
@@ -108,186 +119,201 @@ export default function DeployedKimiCard({
             )}
             <NewApiBadge item={item} />
           </div>
-          <p className="mt-0.5 truncate text-xs text-gray-500">{email || "No email"}</p>
+          <p className="mt-1 truncate text-xs text-gray-500">{email || "No email"}</p>
         </div>
-        {!item.removed && !item.error && !item.pending && (
-          <div className="flex shrink-0 flex-wrap justify-end gap-1.5">
-            <Button
-              variant="secondary"
-              className="px-2.5 py-1.5 text-xs"
-              onClick={onRotate}
-              isLoading={rotating}
-              disabled={busy}
-            >
-              {!rotating && <RefreshCw size={13} />}
-              Rotate keys
-            </Button>
-            <Button
-              variant="secondary"
-              className="px-2.5 py-1.5 text-xs"
-              onClick={onTest}
-              isLoading={testing}
-              disabled={busy}
-            >
-              {!testing && <Play size={13} />}
-              Test model
-            </Button>
-            {canAddNewApi && (
-              <Button
-                variant="secondary"
-                className="px-2.5 py-1.5 text-xs"
-                onClick={() => onAddNewApi({ name: trimmedName || undefined, priority: parsedPriority, weight: parsedWeight })}
-                isLoading={addingNewApi}
-                disabled={busy}
-              >
-                {!addingNewApi && <Radio size={13} />}
-                Add to NewAPI
-              </Button>
-            )}
-            {live && (
-              <Button
-                variant="danger"
-                className="px-2.5 py-1.5 text-xs"
-                onClick={onDelete}
-                isLoading={deleting}
-                disabled={busy}
-              >
-                {!deleting && <Trash2 size={13} />}
-                Delete
-              </Button>
+
+        {item.pending && (
+          <div className="flex items-center gap-2 text-xs text-gray-400">
+            <span className="relative flex h-2.5 w-2.5">
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent/70" />
+              <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-accent" />
+            </span>
+            {deploying ? "Deploying this Azure stack in parallel…" : "Looking up this subscription…"}
+          </div>
+        )}
+        {item.error && <p className="break-words text-xs text-red-400">{item.error}</p>}
+        {item.deleted_message && <p className="break-words text-xs text-amber-300">{item.deleted_message}</p>}
+        {!live && !item.removed && !item.error && !item.pending && (
+          <p className="text-xs text-gray-500">No FW-Kimi-K3 on this subscription yet.</p>
+        )}
+
+        {(live || item.removed || item.account_name || item.subscription_id) && (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="min-w-0 sm:col-span-2">
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">Endpoint</p>
+              {endpoint ? <CopyLine value={endpoint} /> : <p className="mt-0.5 text-xs text-gray-600">—</p>}
+            </div>
+            <div className="min-w-0 sm:col-span-2">
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">NewAPI channel</p>
+              {item.pending ? (
+                <p className="mt-1 text-xs text-gray-100">{deploying ? "Waiting on Azure…" : "Looking up…"}</p>
+              ) : item.new_api_present || canAddNewApi ? (
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  <input
+                    value={draftName}
+                    onChange={(event) => setDraftName(event.target.value)}
+                    disabled={busy}
+                    maxLength={128}
+                    placeholder={item.new_api_present ? "Channel name" : nextNewApiName || "kimi-k3-500k-proxy-…"}
+                    className="min-w-[12rem] flex-1 rounded-lg border border-white/[0.08] bg-surface px-2.5 py-1.5 font-mono text-xs text-gray-100 outline-none placeholder:text-gray-600 focus:border-accent disabled:opacity-60"
+                  />
+                  <label className="flex items-center gap-1 text-[11px] text-gray-500">
+                    P
+                    <input
+                      type="number"
+                      min={0}
+                      max={10000}
+                      value={draftPriority}
+                      onChange={(event) => setDraftPriority(event.target.value)}
+                      disabled={busy}
+                      className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 font-mono text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
+                    />
+                  </label>
+                  <label className="flex items-center gap-1 text-[11px] text-gray-500">
+                    W
+                    <input
+                      type="number"
+                      min={1}
+                      max={10000}
+                      value={draftWeight}
+                      onChange={(event) => setDraftWeight(event.target.value)}
+                      disabled={busy}
+                      className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 font-mono text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
+                    />
+                  </label>
+                  {item.new_api_present ? (
+                    <Button
+                      variant="secondary"
+                      className="px-2.5 py-1.5 text-xs"
+                      onClick={() => onSaveNewApi({ name: nameToSave, priority: parsedPriority, weight: parsedWeight })}
+                      isLoading={renamingNewApi}
+                      disabled={busy || !canSaveRouting}
+                    >
+                      {!renamingNewApi && <Pencil size={13} />}
+                      Save
+                    </Button>
+                  ) : null}
+                </div>
+              ) : (
+                <p className="mt-1 truncate text-xs text-gray-100">{item.new_api_error || "Not in NewAPI"}</p>
+              )}
+              {item.new_api_present && item.new_api_status_label && (
+                <p className="mt-1 truncate text-[11px] text-gray-500">{item.new_api_status_label}</p>
+              )}
+            </div>
+            <Meta label="Foundry" value={item.account_name} />
+            <Meta label="Subscription" value={item.subscription_name || item.subscription_id} />
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">Credit grant</p>
+              <p className="mt-0.5 text-sm tabular-nums text-gray-100">{grant.primary}</p>
+              {grant.secondary && <p className="text-xs tabular-nums text-gray-500">{grant.secondary}</p>}
+            </div>
+            <div>
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">TPM / RPM</p>
+              <p className="mt-0.5 text-sm tabular-nums text-gray-100">
+                {live && item.tpm != null ? formatTokens(item.tpm) : "—"} / {live ? item.rpm ?? "—" : "—"}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {testResult && (
+          <div
+            className={`rounded-lg border px-3 py-2 text-xs ${
+              testResult.ok
+                ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-300"
+                : "border-red-500/25 bg-red-500/10 text-red-300"
+            }`}
+          >
+            {testResult.ok ? (
+              <>
+                <p className="font-medium">
+                  Model replied{testResult.latency_ms != null ? ` · ${testResult.latency_ms}ms` : ""}
+                </p>
+                <p className="mt-1 break-words text-emerald-100/90">{testResult.reply || "(empty reply)"}</p>
+              </>
+            ) : (
+              <p className="break-words">{testResult.error || "Test failed."}</p>
             )}
           </div>
         )}
       </div>
 
-      {item.pending && (
-        <div className="flex items-center gap-2 text-xs text-gray-400">
-          <span className="relative flex h-2.5 w-2.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-accent/70" />
-            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-accent" />
-          </span>
-          {deploying ? "Deploying this Azure stack in parallel…" : "Looking up this subscription…"}
-        </div>
-      )}
-      {item.error && <p className="break-words text-xs text-red-400">{item.error}</p>}
-      {item.deleted_message && <p className="break-words text-xs text-amber-300">{item.deleted_message}</p>}
-      {!live && !item.removed && !item.error && !item.pending && (
-        <p className="text-xs text-gray-500">No FW-Kimi-K3 on this subscription yet.</p>
-      )}
-
-      {(live || item.removed || item.account_name || item.subscription_id) && (
-        <dl className="grid grid-cols-1 gap-3 text-xs sm:grid-cols-2">
-          <Meta label="Foundry account" value={item.account_name} />
-          <Meta label="Resource group" value={item.resource_group} />
-          <Meta
-            label="Deployment"
-            value={[item.deployment_name || "FW-Kimi-K3", item.region].filter(Boolean).join(" · ")}
-          />
-          <Meta label="Subscription" value={item.subscription_name || item.subscription_id} />
-          <div className="sm:col-span-2">
-            <p className="text-gray-500">NewAPI</p>
-            {item.pending ? (
-              <p className="mt-0.5 text-gray-100">{deploying ? "Waiting on Azure…" : "Looking up…"}</p>
-            ) : item.new_api_present || canAddNewApi ? (
-              <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                <input
-                  value={draftName}
-                  onChange={(event) => setDraftName(event.target.value)}
-                  disabled={busy}
-                  maxLength={128}
-                  placeholder={item.new_api_present ? "Channel name" : nextNewApiName || "kimi-k3-500k-proxy-…"}
-                  className="min-w-0 flex-1 rounded-lg border border-white/[0.08] bg-surface px-2.5 py-1.5 font-mono text-xs text-gray-100 outline-none placeholder:text-gray-600 focus:border-accent disabled:opacity-60"
-                />
-                <label className="flex items-center gap-1 text-[11px] text-gray-500">
-                  P
-                  <input
-                    type="number"
-                    min={0}
-                    max={10000}
-                    value={draftPriority}
-                    onChange={(event) => setDraftPriority(event.target.value)}
-                    disabled={busy}
-                    className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 font-mono text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
-                  />
-                </label>
-                <label className="flex items-center gap-1 text-[11px] text-gray-500">
-                  W
-                  <input
-                    type="number"
-                    min={1}
-                    max={10000}
-                    value={draftWeight}
-                    onChange={(event) => setDraftWeight(event.target.value)}
-                    disabled={busy}
-                    className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 font-mono text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
-                  />
-                </label>
-                {item.new_api_present ? (
-                  <Button
-                    variant="secondary"
-                    className="px-2.5 py-1.5 text-xs"
-                    onClick={() => onSaveNewApi({ name: nameToSave, priority: parsedPriority, weight: parsedWeight })}
-                    isLoading={renamingNewApi}
-                    disabled={busy || !canSaveRouting}
-                  >
-                    {!renamingNewApi && <Pencil size={13} />}
-                    Save
-                  </Button>
-                ) : null}
-              </div>
-            ) : (
-              <p className="mt-0.5 truncate text-gray-100">{item.new_api_error || "Not in NewAPI"}</p>
-            )}
-            {item.new_api_present && item.new_api_status_label && (
-              <p className="mt-1 truncate text-[11px] text-gray-500">{item.new_api_status_label}</p>
-            )}
-          </div>
-          <div className="sm:col-span-2">
-            <p className="text-gray-500">OpenAI endpoint</p>
-            {endpoint ? (
-              <CopyLine value={endpoint} />
-            ) : (
-              <p className="mt-0.5 text-gray-600">—</p>
-            )}
-          </div>
-        </dl>
-      )}
-
-      {testResult && (
-        <div
-          className={`rounded-lg border px-3 py-2 text-xs ${
-            testResult.ok
-              ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-300"
-              : "border-red-500/25 bg-red-500/10 text-red-300"
-          }`}
-        >
-          {testResult.ok ? (
-            <>
-              <p className="font-medium">
-                Model replied{testResult.latency_ms != null ? ` · ${testResult.latency_ms}ms` : ""}
-              </p>
-              <p className="mt-1 break-words text-emerald-100/90">{testResult.reply || "(empty reply)"}</p>
-            </>
-          ) : (
-            <p className="break-words">{testResult.error || "Test failed."}</p>
+      {(showActions || canRefresh) && (
+        <div className="flex flex-wrap items-center gap-2 border-t border-white/[0.06] bg-black/20 px-4 py-3 sm:px-5">
+          {canRefresh && (
+            <Button
+              variant="secondary"
+              className="px-3 py-1.5 text-xs"
+              onClick={onRefresh}
+              isLoading={refreshing}
+              disabled={busy && !refreshing}
+              title="Re-check Azure inventory and NewAPI for this stack"
+            >
+              {!refreshing && <RefreshCw size={13} />}
+              Refresh
+            </Button>
           )}
-        </div>
-      )}
-
-      {(live || item.credits_available) && (
-        <div className="flex flex-wrap gap-x-6 gap-y-2 border-t border-white/[0.06] pt-3 text-xs">
-          <div>
-            <p className="text-gray-500">Credit grant</p>
-            <p className="mt-0.5 tabular-nums text-gray-100">{grant.primary}</p>
-            {grant.secondary && <p className="tabular-nums text-gray-500">{grant.secondary}</p>}
-          </div>
           {live && (
-            <div>
-              <p className="text-gray-500">TPM / RPM</p>
-              <p className="mt-0.5 tabular-nums text-gray-100">
-                {item.tpm != null ? formatTokens(item.tpm) : "—"} / {item.rpm ?? "—"}
-              </p>
-            </div>
+            <Button
+              variant="secondary"
+              className="px-3 py-1.5 text-xs"
+              onClick={onSyncSheet}
+              isLoading={syncingSheet}
+              disabled={busy}
+              title="Write Email, Endpoint, TPM, Proxy_Name, and Pool to Sheet1"
+            >
+              {!syncingSheet && <FileSpreadsheet size={13} />}
+              Sync to sheet
+            </Button>
+          )}
+          {showActions && (
+            <>
+          <Button
+            variant="secondary"
+            className="px-3 py-1.5 text-xs"
+            onClick={onTest}
+            isLoading={testing}
+            disabled={busy}
+          >
+            {!testing && <Play size={13} />}
+            Test
+          </Button>
+          {canAddNewApi && (
+            <Button
+              variant="secondary"
+              className="px-3 py-1.5 text-xs"
+              onClick={() => onAddNewApi({ name: trimmedName || undefined, priority: parsedPriority, weight: parsedWeight })}
+              isLoading={addingNewApi}
+              disabled={busy}
+            >
+              {!addingNewApi && <Radio size={13} />}
+              Add to NewAPI
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            className="px-3 py-1.5 text-xs"
+            onClick={onRotate}
+            isLoading={rotating}
+            disabled={busy}
+          >
+            {!rotating && <KeyRound size={13} />}
+            Rotate keys
+          </Button>
+          {live && (
+            <Button
+              variant="danger"
+              className="ml-auto px-3 py-1.5 text-xs"
+              onClick={onDelete}
+              isLoading={deleting}
+              disabled={busy}
+            >
+              {!deleting && <Trash2 size={13} />}
+              Delete
+            </Button>
+          )}
+            </>
           )}
         </div>
       )}
@@ -332,8 +358,8 @@ function clampInt(raw: string, fallback: number, min: number, max: number) {
 function Meta({ label, value, mono }: { label: string; value?: string | null; mono?: boolean }) {
   return (
     <div className="min-w-0">
-      <p className="text-gray-500">{label}</p>
-      <p className={`mt-0.5 truncate ${mono ? "font-mono text-gray-400" : "text-gray-100"}`}>{value || "—"}</p>
+      <p className="text-[11px] uppercase tracking-wide text-gray-500">{label}</p>
+      <p className={`mt-0.5 truncate text-sm ${mono ? "font-mono text-gray-400" : "text-gray-100"}`}>{value || "—"}</p>
     </div>
   );
 }

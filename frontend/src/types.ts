@@ -228,6 +228,17 @@ export interface KimiDeployStatus {
   bootstrap_message?: string;
 }
 
+export interface KimiSheetStatus {
+  configured: boolean;
+}
+
+export interface KimiSheetSyncResponse {
+  ok: boolean;
+  configured: boolean;
+  synced: number;
+  error?: string | null;
+}
+
 export interface KimiStoredAccount {
   name?: string | null;
   account_holder?: string | null;

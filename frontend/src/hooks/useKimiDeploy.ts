@@ -1,7 +1,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/lib/apiClient";
-import { KimiDeleteResponse, KimiDeployProgressEvent, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
+import { KimiDeleteResponse, KimiDeployProgressEvent, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
 
 const DEPLOY_TIMEOUT_MS = 45 * 60 * 1000;
 const KEYS_TIMEOUT_MS = 15 * 60 * 1000;
@@ -215,6 +215,47 @@ export function useKimiTestModel() {
   return useMutation({
     mutationFn: async (payload: { accounts: Record<string, string>[] }) =>
       (await apiClient.post<KimiTestResponse>("/api/kimi-deploy/test", payload, { timeout: LOOKUP_TIMEOUT_MS })).data,
+  });
+}
+
+export function useKimiSheetStatus() {
+  return useQuery({
+    queryKey: ["kimi-sheet"],
+    queryFn: async () => (await apiClient.get<KimiSheetStatus>("/api/kimi-deploy/sheet")).data,
+    staleTime: 30_000,
+  });
+}
+
+export function useKimiSheetSync() {
+  return useMutation({
+    mutationFn: async (payload: { results: KimiDeployResult[] }) =>
+      (await apiClient.post<KimiSheetSyncResponse>("/api/kimi-deploy/sheet", payload, { timeout: LOOKUP_TIMEOUT_MS })).data,
+  });
+}
+
+export function useKimiRefreshInventory() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { accounts: Record<string, string>[] }) =>
+      (
+        await apiClient.post<KimiDeployResponse>(
+          "/api/kimi-deploy/inventory",
+          { accounts: payload.accounts, refresh: true },
+          { timeout: LOOKUP_TIMEOUT_MS }
+        )
+      ).data,
+    onSuccess: (data, variables) => {
+      variables.accounts.forEach((account, index) => {
+        const row = data.results[index];
+        if (!row) return;
+        queryClient.setQueryData(["kimi-inventory", accountFingerprint(account)], {
+          ok_count: row.ok ? 1 : 0,
+          fail_count: row.ok ? 0 : 1,
+          results: [row],
+        });
+      });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
+    },
   });
 }
 
