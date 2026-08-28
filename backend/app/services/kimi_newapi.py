@@ -500,6 +500,44 @@ async def ensure_kimi_newapi_channels(
                 resource_name = next(iter(hosts), "")
             existing = match_channel(channels, hosts)
             if existing is not None:
+                current_pri = _as_int(existing.get("priority"))
+                current_wt = _as_int(existing.get("weight"))
+                if current_pri != row_priority or current_wt != row_weight:
+                    try:
+                        await _put_channel(
+                            gateway,
+                            _channel_update_body(
+                                existing,
+                                (existing.get("name") or "").strip(),
+                                priority=row_priority,
+                                weight=row_weight,
+                            ),
+                        )
+                        invalidate_kimi_pool_cache()
+                        channels = await list_kimi_pool_channels(force=True)
+                        next_index = next_kimi_index(channels)
+                        refreshed = next(
+                            (item for item in channels if _as_int(item.get("id")) == _as_int(existing.get("id"))),
+                            None,
+                        )
+                        existing = refreshed or {
+                            **existing,
+                            "priority": row_priority,
+                            "weight": row_weight,
+                        }
+                        if subscription_id and resource_name:
+                            try:
+                                await _stamp_portal_account(session, subscription_id, resource_name, existing)
+                            except Exception:
+                                logger.exception(
+                                    "Could not stamp portal account after NewAPI routing update for %s",
+                                    resource_name,
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("NewAPI routing update failed for %s: %s", resource_name, exc)
+                        result.new_api_error = str(exc)[:300]
+                        _apply_channel(result, existing)
+                        continue
                 _apply_channel(result, existing)
                 continue
             if not resource_name or not subscription_id:
@@ -622,11 +660,9 @@ def _channel_update_body(
     pri = channel.get("priority") if priority is None else priority
     wt = channel.get("weight") if weight is None else weight
     if pri is not None:
-        body["priority"] = pri
+        body["priority"] = int(pri)
     if wt is not None:
-        body["weight"] = wt
-    if channel.get("status") is not None:
-        body["status"] = channel.get("status")
+        body["weight"] = int(wt)
     if channel.get("auto_ban") is not None:
         body["auto_ban"] = channel.get("auto_ban")
     return body

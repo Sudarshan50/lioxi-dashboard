@@ -8,8 +8,8 @@ python3 scripts/kimi_k3_deploy.py bootstrap --name alice --email alice@example.c
     --out /path/to/alice.json
 
 # Current Owner `az login` → create/reset SP → append/update new_final.json:
-python3 scripts/add_login_sp.py
-python3 scripts/kimi_k3_deploy.py add-login --out new_final.json
+python3 scripts/add_login_sp.py --name sudarshan
+python3 scripts/kimi_k3_deploy.py add-login --name sudarshan
 
 # From an array of those SP secrets (runs in parallel):
 python3 scripts/kimi_k3_deploy.py deploy --input secrets.json --out results.json
@@ -93,6 +93,10 @@ class AzError(RuntimeError):
     pass
 
 
+def progress(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
 def _run(cmd: list[str], env: dict[str, str] | None = None, timeout: int = 180) -> subprocess.CompletedProcess[str]:
     try:
         return subprocess.run(
@@ -165,10 +169,40 @@ def az_ok(cmd: list[str], env: dict[str, str] | None = None, timeout: int = 180)
     return False, ((r.stderr or r.stdout or "").strip())[-1200:]
 
 
+def ensure_provider(namespace: str, env: dict[str, str] | None = None) -> None:
+    """Kick off provider registration without --wait. --wait can sit silent for minutes."""
+    try:
+        state = az_json(
+            ["az", "provider", "show", "--namespace", namespace, "--query", "registrationState", "-o", "json"],
+            env=env,
+            timeout=45,
+        )
+    except AzError:
+        state = None
+    if str(state or "").strip('"').lower() == "registered":
+        progress(f"  {namespace}: already registered")
+        return
+    progress(f"  {namespace}: registering (not waiting)")
+    az_ok(["az", "provider", "register", "--namespace", namespace], env=env, timeout=60)
+
+
 def isolated_env(config_dir: Path) -> dict[str, str]:
+    """Per-session Azure CLI env. Never reuse the host ~/.azure or OS keyring."""
+    root = Path(config_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    home = root / "home"
+    cache = root / "cache"
+    xdg = root / "xdg-config"
+    for path in (home, cache, xdg):
+        path.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    env["AZURE_CONFIG_DIR"] = str(config_dir)
+    env["AZURE_CONFIG_DIR"] = str(root)
+    env["HOME"] = str(home)
+    env["XDG_CACHE_HOME"] = str(cache)
+    env["XDG_CONFIG_HOME"] = str(xdg)
     env["AZURE_CORE_COLLECT_TELEMETRY"] = "0"
+    # File cache only — a shared keyring would mix concurrent join logins.
+    env["PYTHON_KEYRING_BACKEND"] = "keyring.backends.null.Keyring"
     # Portal .env Azure identity must not leak into per-account `az login`.
     for key in (
         "AZURE_ACCESS_TOKEN",
@@ -612,13 +646,15 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
     tenant = acc["tenantId"]
     holder = email or user.get("name") or ""
 
+    progress("checking subscription …")
     payg = ensure_payg_subscription(
         None, sub, create_if_needed=False, display_name=f"Lioxi-{name}"
     )
     az_json(["az", "account", "set", "--subscription", sub, "-o", "none"])
 
+    progress("resource providers …")
     for ns in PROVIDERS:
-        az_ok(["az", "provider", "register", "--namespace", ns, "--wait"], timeout=300)
+        ensure_provider(ns)
     az_ok(
         [
             "az",
@@ -628,21 +664,27 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
             "Microsoft.CognitiveServices",
             "--name",
             FIREWORKS_FEATURE,
-        ]
+        ],
+        timeout=60,
     )
-    az_ok(["az", "provider", "register", "--namespace", "Microsoft.CognitiveServices"], timeout=120)
+    az_ok(["az", "provider", "register", "--namespace", "Microsoft.CognitiveServices"], timeout=60)
 
+    progress(f"service principal {SP_NAME} …")
     existing = az_json(
-        ["az", "ad", "sp", "list", "--display-name", SP_NAME, "--query", "[].{appId:appId,id:id}", "-o", "json"]
+        ["az", "ad", "sp", "list", "--display-name", SP_NAME, "--query", "[].{appId:appId,id:id}", "-o", "json"],
+        timeout=90,
     ) or []
     if existing:
         app_id = existing[0]["appId"]
+        progress("resetting existing SP credential …")
         reset = az_json(
-            ["az", "ad", "sp", "credential", "reset", "--id", app_id, "--years", "1", "-o", "json"]
+            ["az", "ad", "sp", "credential", "reset", "--id", app_id, "--years", "1", "-o", "json"],
+            timeout=90,
         )
         secret = reset["password"]
         created = {"appId": app_id, "password": secret}
     else:
+        progress("creating SP …")
         created = az_json(
             [
                 "az",
@@ -656,11 +698,12 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
                 "1",
                 "-o",
                 "json",
-            ]
+            ],
+            timeout=90,
         )
         app_id = created["appId"]
         secret = created["password"]
-    sp_oid = az_json(["az", "ad", "sp", "show", "--id", app_id, "--query", "id", "-o", "json"])
+    sp_oid = az_json(["az", "ad", "sp", "show", "--id", app_id, "--query", "id", "-o", "json"], timeout=60)
     if sp_oid:
         az_ok(
             [
@@ -673,9 +716,11 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
                 app_id,
                 "--owner-object-id",
                 str(sp_oid),
-            ]
+            ],
+            timeout=60,
         )
 
+    progress("assigning roles …")
     assigned: list[str] = []
     failed: list[str] = []
     scope = f"/subscriptions/{sub}"
@@ -694,11 +739,12 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
         else:
             failed.append(f"{role}: {err}")
 
+    progress("billing account reader …")
     billing_ok = False
     billing_err = None
     ba_name = None
     try:
-        bas = az_json(["az", "billing", "account", "list", "-o", "json"]) or []
+        bas = az_json(["az", "billing", "account", "list", "-o", "json"], timeout=60) or []
         if isinstance(bas, dict):
             bas = bas.get("value") or []
         if bas:
@@ -1291,6 +1337,8 @@ def secrets_row(record: dict[str, Any]) -> dict[str, Any]:
         row["account_name"] = record["account_name"]
     if record.get("service_principal_name"):
         row["service_principal_name"] = record["service_principal_name"]
+    if record.get("person_associated"):
+        row["person_associated"] = record["person_associated"]
     return row
 
 
@@ -1348,7 +1396,10 @@ def _login_identity() -> tuple[str, str, str, str]:
 def cmd_add_login(args: argparse.Namespace) -> int:
     login_email, login_slug, sub_id, sub_name = _login_identity()
     email = (args.email or login_email).strip()
-    name = (args.name or slugify(email) or login_slug).strip()
+    person = (args.name or "").strip()
+    if not person:
+        raise AzError("Pass --name so this row can store person_associated.")
+    slug = slugify(person) or slugify(email) or login_slug
     out = Path(args.out).expanduser().resolve()
     print(
         json.dumps(
@@ -1356,7 +1407,8 @@ def cmd_add_login(args: argparse.Namespace) -> int:
                 "login": login_email,
                 "subscription_id": sub_id,
                 "subscription_name": sub_name,
-                "name": name,
+                "person_associated": person,
+                "name": slug,
                 "email": email,
                 "out": str(out),
             },
@@ -1364,17 +1416,20 @@ def cmd_add_login(args: argparse.Namespace) -> int:
         ),
         file=sys.stderr,
     )
-    with tempfile.NamedTemporaryFile(prefix=f"kimi-{name}-", suffix=".json", delete=False) as handle:
+    progress("creating/resetting service principal (this can take a minute) …")
+    with tempfile.NamedTemporaryFile(prefix=f"kimi-{slug}-", suffix=".json", delete=False) as handle:
         tmp = Path(handle.name)
     try:
-        record = bootstrap(name, email, tmp)
+        record = bootstrap(slug, email, tmp)
     finally:
         tmp.unlink(missing_ok=True)
+    record["person_associated"] = person
     row = secrets_row(record)
     accounts, replaced = upsert_secrets_file(out, row)
     summary = {
         "ok": True,
         "action": "updated" if replaced else "added",
+        "person_associated": person,
         "name": record.get("name"),
         "account_holder": record.get("account_holder"),
         "account_name": record.get("account_name"),
@@ -1648,9 +1703,17 @@ def build_parser() -> argparse.ArgumentParser:
         "add-login",
         help="Create/reset the combined SP for the current Owner az login and upsert into new_final.json",
     )
-    add.add_argument("--name", default="", help="Slug stored as name. Default: email local-part")
+    add.add_argument(
+        "--name",
+        required=True,
+        help="Stored on every row as person_associated (who this login belongs to)",
+    )
     add.add_argument("--email", default="", help="account_holder. Default: az login user")
-    add.add_argument("--out", default=str(DEFAULT_SECRETS_FILE), help="Shared JSON array to append/update")
+    add.add_argument(
+        "--out",
+        default=str(DEFAULT_SECRETS_FILE),
+        help="Shared JSON array to append/update (default: repo-root new_final.json)",
+    )
     add.set_defaults(func=cmd_add_login)
 
     d = sub.add_parser("deploy", help="Deploy FW-Kimi-K3 from a JSON array of SP secrets")

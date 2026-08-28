@@ -27,6 +27,7 @@ from app.services.az_cli_session import (
     AzCliError,
     drop_az_session,
     get_az_session,
+    normalize_tenant_id,
     scrub_az_text,
 )
 from app.services.kimi_deploy_service import load_deploy_module
@@ -193,26 +194,30 @@ def _subscriptions_from_az(accounts: list[dict[str, Any]]) -> list[dict[str, Any
 
 
 async def _publish(session_id: str, event: dict[str, Any]) -> None:
+    sid = (session_id or "").strip().lower()
+    payload = {**event, "session_id": sid}
     async with _bus_guard:
-        queues = list(_buses.get(session_id, []))
+        queues = list(_buses.get(sid, []))
     for queue in queues:
-        await queue.put(event)
+        await queue.put(payload)
 
 
 async def subscribe(session_id: str) -> asyncio.Queue[dict | None]:
+    sid = (session_id or "").strip().lower()
     queue: asyncio.Queue[dict | None] = asyncio.Queue()
     async with _bus_guard:
-        _buses.setdefault(session_id, []).append(queue)
+        _buses.setdefault(sid, []).append(queue)
     return queue
 
 
 async def unsubscribe(session_id: str, queue: asyncio.Queue[dict | None]) -> None:
+    sid = (session_id or "").strip().lower()
     async with _bus_guard:
-        holders = _buses.get(session_id) or []
+        holders = _buses.get(sid) or []
         if queue in holders:
             holders.remove(queue)
         if not holders:
-            _buses.pop(session_id, None)
+            _buses.pop(sid, None)
 
 
 async def get_request(db: AsyncSession, session_id: str) -> SpSubmitRequest | None:
@@ -366,6 +371,9 @@ async def expire_stale(db: AsyncSession) -> int:
         _wipe_secret(row)
         row.status = STATUS_EXPIRED
         row.error_message = row.error_message or "Session expired."
+        task = _login_tasks.pop((row.session_id or "").lower(), None)
+        if task is not None and not task.done():
+            task.cancel()
         await drop_az_session(row.session_id)
         row.az_config_dir = None
         count += 1
@@ -375,35 +383,49 @@ async def expire_stale(db: AsyncSession) -> int:
     return count
 
 
-async def create_session(db: AsyncSession) -> SpSubmitRequest:
+def parse_submit_tenant_id(value: str | None) -> str | None:
+    text = (value or "").strip()
+    if not text:
+        return None
+    tid = normalize_tenant_id(text)
+    if not tid:
+        raise SubmitError(
+            "Directory (tenant) ID must be a GUID from Azure Portal → Microsoft Entra ID → Overview."
+        )
+    return tid
+
+
+async def create_session(db: AsyncSession, tenant_id: str | None = None) -> SpSubmitRequest:
     await expire_stale(db)
     if not shutil.which("az"):
         raise SubmitError("Azure CLI (az) is not on the backend PATH.")
     session_id = str(uuid.uuid4())
+    tid = parse_submit_tenant_id(tenant_id)
     az = await get_az_session(session_id)
     row = SpSubmitRequest(
         session_id=session_id,
         status=STATUS_LOGIN_STARTED,
         az_config_dir=str(az.config_dir),
+        tenant_id=tid,
     )
     db.add(row)
     await db.commit()
     await db.refresh(row)
-    task = asyncio.create_task(_run_login(session_id))
-    _login_tasks[session_id] = task
-    task.add_done_callback(lambda _t, sid=session_id: _login_tasks.pop(sid, None))
+    task = asyncio.create_task(_run_login(session_id, tenant_id=tid))
+    _login_tasks[session_id.lower()] = task
+    task.add_done_callback(lambda _t, sid=session_id.lower(): _login_tasks.pop(sid, None))
     return row
 
 
-async def _run_login(session_id: str) -> None:
+async def _run_login(session_id: str, tenant_id: str | None = None) -> None:
     from app.database import SessionLocal
 
     async def on_event(event: dict[str, Any]) -> None:
-        async with SessionLocal() as db:
-            row = await get_request(db, session_id)
-            if row is None:
-                return
-            if event.get("type") == "device_code":
+        if event.get("type") == "device_code":
+            async with SessionLocal() as db:
+                row = await get_request(db, session_id)
+                if row is None:
+                    return
                 row.device_user_code = str(event.get("user_code") or "")[:32] or None
                 row.device_verification_uri = str(event.get("verification_uri") or "")[:256] or None
                 await db.commit()
@@ -411,7 +433,8 @@ async def _run_login(session_id: str) -> None:
 
     try:
         az = await get_az_session(session_id)
-        accounts = await az.device_login(on_event)
+        az.set_log(on_event)
+        accounts = await az.device_login(on_event, tenant_id=tenant_id)
         identity = await az.account_show()
         user = identity.get("user") or {}
         email = str(user.get("name") or "").strip() or None
@@ -425,12 +448,12 @@ async def _run_login(session_id: str) -> None:
             if not subs:
                 row.status = STATUS_FAILED
                 row.error_kind = ERROR_KIND_ACCOUNT
-                row.error_message = "No enabled Azure subscriptions on this login."
+                row.error_message = "No Azure subscription was found on this Microsoft account."
                 await db.commit()
                 await drop_az_session(session_id)
                 await _publish(
                     session_id,
-                    {"type": "error", "detail": "No enabled Azure subscriptions on this login."},
+                    {"type": "error", "detail": "No Azure subscription was found on this Microsoft account."},
                 )
                 return
             row.status = STATUS_LOGGED_IN
@@ -475,9 +498,15 @@ async def commit_session(
     on_progress: ProgressFn | None = None,
 ) -> SpSubmitRequest:
     await expire_stale(db)
-    row = await get_request(db, session_id)
+    row = (
+        await db.execute(
+            select(SpSubmitRequest).where(SpSubmitRequest.session_id == session_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if row is None:
         raise SubmitError("Unknown submit session.")
+    if row.status == STATUS_CREATING_SP:
+        raise SubmitError("This sign-in is already submitting.")
     if row.status == STATUS_PENDING:
         raise SubmitError("This session is already waiting for admin approval.")
     if row.status == STATUS_FAILED:
@@ -535,9 +564,10 @@ async def commit_session(
         raise SubmitError(DUPLICATE_SUB_MESSAGE) from exc
 
     async def emit(event: dict[str, Any]) -> None:
-        await _publish(session_id, event)
+        payload = {**event, "session_id": session_id}
+        await _publish(session_id, payload)
         if on_progress is not None:
-            await on_progress(event)
+            await on_progress(payload)
 
     await emit({"type": "phase", "phase": "sp", "message": "Creating monitor identity…"})
     try:
@@ -569,6 +599,7 @@ async def _provision_sp(
     emit: ProgressFn,
 ) -> None:
     az = await get_az_session(row.session_id, row.az_config_dir)
+    az.set_log(emit)
     sub = str(row.subscription_id or "")
     await az.set_subscription(sub)
 

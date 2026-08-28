@@ -3,7 +3,7 @@ import { KimiDeployProgressEvent, PendingSubmitRequest, SubmitSessionSnapshot } 
 export const SUBMIT_SESSION_KEY = "submit_session_id";
 
 export function submitBaseUrl() {
-  return String(import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
+  return "";
 }
 
 async function readError(response: Response, fallback: string) {

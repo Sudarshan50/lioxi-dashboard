@@ -1,6 +1,7 @@
 import { Check, Copy, KeyRound } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
+import JoinTerminal, { JoinTermLine } from "@/components/join/JoinTerminal";
 import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
@@ -17,26 +18,6 @@ import {
 import { SubmitSessionSnapshot, SubmitSubscription } from "@/types";
 
 type Step = "welcome" | "signin" | "subscription" | "name" | "working" | "done";
-
-function WaitOrbit({ label }: { label: string }) {
-  return (
-    <div className="flex flex-col items-center gap-4 py-2">
-      <div className="relative h-28 w-28">
-        <span className="absolute inset-0 rounded-full border border-accent/25" />
-        <span className="absolute inset-2 rounded-full border border-accent/20" />
-        <span className="absolute inset-0 animate-pulse-ring rounded-full bg-accent/20" />
-        <span className="absolute inset-[18%] animate-pulse-ring rounded-full bg-violet-500/15 [animation-delay:400ms]" />
-        <div className="absolute inset-0 animate-orbit">
-          <span className="absolute left-1/2 top-0 h-2.5 w-2.5 -translate-x-1/2 rounded-full bg-accent shadow-glow-sm" />
-        </div>
-        <div className="absolute inset-0 flex items-center justify-center">
-          <span className="h-3 w-3 rounded-full bg-accent-gradient shadow-glow-sm" />
-        </div>
-      </div>
-      <p className="text-center text-sm text-gray-300">{label}</p>
-    </div>
-  );
-}
 
 async function copyText(value: string): Promise<boolean> {
   const text = value.trim();
@@ -121,6 +102,8 @@ export default function JoinPage() {
   const [phaseMessage, setPhaseMessage] = useState("Working…");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [signinHint, setSigninHint] = useState<string | null>(null);
+  const [termLines, setTermLines] = useState<JoinTermLine[]>([]);
 
   const selected = useMemo(
     () => subscriptions.find((item) => item.subscription_id === subscriptionId) ?? null,
@@ -194,17 +177,31 @@ export default function JoinPage() {
 
   function applyEvent(event: SubmitSessionSnapshot & Record<string, unknown>) {
     const sid = sessionIdRef.current || "";
+    const eventSid = String(event.session_id || "");
+    if (eventSid && sid && eventSid !== sid) return;
     const kind = String(event.type || "");
     if (kind === "snapshot") {
       applySnapshot(event);
       return;
     }
+    if (kind === "terminal") {
+      const text = String(event.line || "").trim();
+      if (!text) return;
+      const lineKind = String(event.kind || "out");
+      const safeKind: JoinTermLine["kind"] =
+        lineKind === "cmd" || lineKind === "err" || lineKind === "ok" ? lineKind : "out";
+      setTermLines((prev) => [...prev, { kind: safeKind, text }].slice(-120));
+      return;
+    }
     if (kind === "device_code") {
+      const hint = String(event.message || "").trim();
+      setSigninHint(hint || null);
+      const supplied = event.user_code ?? event.device_user_code;
       setSnapshot((prev) => ({
         ...(prev ?? { session_id: sid, status: "login_started" }),
         session_id: sid || prev?.session_id || "",
         status: "login_started",
-        device_user_code: String(event.user_code || event.device_user_code || prev?.device_user_code || ""),
+        device_user_code: supplied != null ? String(supplied) : prev?.device_user_code || "",
         device_verification_uri: String(
           event.verification_uri || event.device_verification_uri || prev?.device_verification_uri || ""
         ),
@@ -254,11 +251,13 @@ export default function JoinPage() {
     sessionIdRef.current = null;
     setSessionId(null);
     setSnapshot(null);
+    setTermLines([]);
   }
 
   async function startSignIn() {
     setError(null);
     setBusy(true);
+    setSigninHint(null);
     clearJoinSession();
     try {
       const created = await startSubmitSession();
@@ -378,11 +377,10 @@ export default function JoinPage() {
                 >
                   Open Microsoft device login
                 </a>
-                <WaitOrbit label="Waiting for you to finish sign-in in the browser…" />
               </>
-            ) : (
-              <WaitOrbit label="Starting Azure sign-in…" />
-            )}
+            ) : null}
+            {signinHint && <p className="text-center text-xs text-gray-400">{signinHint}</p>}
+            <JoinTerminal lines={termLines} waiting />
           </div>
         )}
         {step === "subscription" && (
@@ -443,7 +441,12 @@ export default function JoinPage() {
             </Button>
           </form>
         )}
-        {step === "working" && <WaitOrbit label={phaseMessage} />}
+        {step === "working" && (
+          <div className="flex flex-col gap-3">
+            <p className="text-center text-xs text-gray-400">{phaseMessage}</p>
+            <JoinTerminal lines={termLines} waiting />
+          </div>
+        )}
         {step === "done" && (
           <div className="flex flex-col items-center gap-3 py-2 text-center">
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400">

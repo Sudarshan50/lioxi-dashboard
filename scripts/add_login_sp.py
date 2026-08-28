@@ -4,14 +4,15 @@
 Usage
 -----
 az login   # the user whose subscription should get the SP
-python3 scripts/add_login_sp.py
+python3 scripts/add_login_sp.py --name sudarshan
 
 Optional:
-  python3 scripts/add_login_sp.py --email you@gmail.com --name you --out new_final.json
+  python3 scripts/add_login_sp.py --name sudarshan --email you@gmail.com
+  python3 scripts/add_login_sp.py --name sudarshan --out new_final.json
 
-The file is a JSON array the Deploy K3 page can paste. Re-running for the same
-subscription replaces that row (bootstrap resets the existing SP secret).
-Never prints AZURE_CLIENT_SECRET.
+--name is required. It is stored on every JSON row as person_associated.
+Rows are appended to repo-root new_final.json by default (same subscription
+replaces that row). Never prints AZURE_CLIENT_SECRET.
 """
 
 from __future__ import annotations

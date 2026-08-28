@@ -120,3 +120,121 @@ body {
   animation: brokerage-out 0.38s cubic-bezier(0.4, 0, 0.2, 1) both;
   pointer-events: none;
 }
+
+@keyframes join-breathe {
+  0%,
+  100% {
+    opacity: 0.38;
+    transform: scale(0.88);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.08);
+  }
+}
+
+@keyframes join-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes join-spin-rev {
+  to {
+    transform: rotate(-360deg);
+  }
+}
+
+@keyframes join-core {
+  0%,
+  100% {
+    transform: scale(1);
+    filter: brightness(1);
+  }
+  50% {
+    transform: scale(1.06);
+    filter: brightness(1.18);
+  }
+}
+
+@keyframes join-mote {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
+  50% {
+    opacity: 1;
+    transform: translateY(-7px);
+  }
+}
+
+@keyframes join-sweep {
+  0% {
+    transform: translateX(-130%);
+  }
+  100% {
+    transform: translateX(260%);
+  }
+}
+
+.join-wait-bloom {
+  background:
+    radial-gradient(circle at 50% 42%, rgba(165, 180, 252, 0.55), rgba(139, 92, 246, 0.18) 38%, transparent 68%);
+  filter: blur(22px);
+  animation: join-breathe 4.8s ease-in-out infinite;
+}
+
+.join-wait-arc {
+  animation: join-spin 9.5s linear infinite;
+}
+
+.join-wait-arc-rev {
+  animation: join-spin-rev 14s linear infinite;
+}
+
+.join-wait-core {
+  animation: join-core 3.4s ease-in-out infinite;
+}
+
+.join-wait-mote {
+  animation: join-mote 3.6s ease-in-out infinite;
+}
+
+.join-wait-sweep {
+  animation: join-sweep 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .join-wait-bloom,
+  .join-wait-arc,
+  .join-wait-arc-rev,
+  .join-wait-core,
+  .join-wait-mote,
+  .join-wait-sweep {
+    animation: none;
+  }
+
+  .join-wait-bloom {
+    opacity: 0.55;
+  }
+}
+
+@keyframes join-term-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  55%,
+  100% {
+    opacity: 0;
+  }
+}
+
+.join-term-cursor {
+  animation: join-term-blink 1s step-end infinite;
+}
+
+.join-term-scroll::-webkit-scrollbar {
+  width: 6px;
+}

@@ -2,7 +2,7 @@ import asyncio
 import contextlib
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -63,9 +63,12 @@ async def _event_stream(session_id: str, db: AsyncSession):
 
 
 @router.post("/sessions", response_model=SubmitSessionCreated)
-async def start_session(db: AsyncSession = Depends(get_db)) -> SubmitSessionCreated:
+async def start_session(
+    db: AsyncSession = Depends(get_db),
+    tenant_id: str | None = Query(default=None, max_length=64),
+) -> SubmitSessionCreated:
     try:
-        row = await create_session(db)
+        row = await create_session(db, tenant_id=tenant_id)
     except SubmitError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
