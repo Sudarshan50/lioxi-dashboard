@@ -1,5 +1,5 @@
 import { Cloud, Layers, Pencil, Plus, RefreshCw, Rocket, Search, Trash2, Upload, X } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import AccountCard from "@/components/accounts/AccountCard";
@@ -7,7 +7,6 @@ import AddAccountModal from "@/components/accounts/AddAccountModal";
 import BulkUploadAccountsModal from "@/components/accounts/BulkUploadAccountsModal";
 import GroupFormModal from "@/components/accounts/GroupFormModal";
 import Badge from "@/components/ui/Badge";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import EmptyState from "@/components/ui/EmptyState";
@@ -32,6 +31,7 @@ import {
 import { amountPayableUsd } from "@/lib/payable";
 import { formatCurrency } from "@/lib/format";
 import { matchesOwner, ownerCounts, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
+import { toastError, toastSuccess } from "@/lib/toast";
 import { Account, AccountGroup } from "@/types";
 
 type AccountSort =
@@ -70,42 +70,43 @@ export default function AccountsPage() {
   const [ownerFilter, setOwnerFilter] = useState<string | null>(null);
   const [gatewayFilter, setGatewayFilter] = useState<GatewayFilter>("all");
   const [sort, setSort] = useState<AccountSort>("name");
-  const [syncAllMessage, setSyncAllMessage] = useState<string | null>(null);
-  const [syncAllError, setSyncAllError] = useState<string | null>(null);
-  const [groupError, setGroupError] = useState<string | null>(null);
   const [deletingGroupId, setDeletingGroupId] = useState<number | null>(null);
 
+  useEffect(() => {
+    if (accountsError || groupsError) {
+      toastError("Could not load accounts or groups. Try refreshing the page.", { toastId: "accounts-load" });
+    }
+  }, [accountsError, groupsError]);
+
   async function handleSyncAll() {
-    setSyncAllMessage(null);
-    setSyncAllError(null);
     const ids = (accounts ?? []).map((account) => account.id);
     if (ids.length === 0) {
-      setSyncAllError("No accounts to sync.");
+      toastError("No accounts to sync.");
       return;
     }
     try {
       const result = await syncAccounts(ids);
       const failedNames = (result.failed ?? []).map((item) => item.name).filter((name): name is string => Boolean(name));
       if (result.synced > 0) {
-        setSyncAllMessage(`Synced ${result.synced} account${result.synced === 1 ? "" : "s"}.`);
+        toastSuccess(`Synced ${result.synced} account${result.synced === 1 ? "" : "s"}.`);
       }
       if (failedNames.length > 0) {
-        setSyncAllError(`Sync failed for ${failedNames.join(", ")}.`);
+        toastError(`Sync failed for ${failedNames.join(", ")}.`);
       } else if (result.failed.length > 0) {
-        setSyncAllError("Sync failed for one or more accounts.");
+        toastError("Sync failed for one or more accounts.");
       }
     } catch (err: any) {
-      setSyncAllError(err?.response?.data?.detail ?? "Sync all failed - check individual accounts below.");
+      toastError(err?.response?.data?.detail ?? "Sync all failed - check individual accounts below.");
     }
   }
 
   async function handleDeleteGroup(group: AccountGroup) {
-    setGroupError(null);
     setDeletingGroupId(group.id);
     try {
       await deleteGroup.mutateAsync(group.id);
+      toastSuccess(`Deleted group ${group.name}.`);
     } catch (err: any) {
-      setGroupError(err?.response?.data?.detail ?? "Could not delete this group.");
+      toastError(err?.response?.data?.detail ?? "Could not delete this group.");
     } finally {
       setDeletingGroupId(null);
     }
@@ -195,9 +196,6 @@ export default function AccountsPage() {
           </Button>
         </div>
       </div>
-      {syncAllMessage && <Banner tone="success">{syncAllMessage}</Banner>}
-      {syncAllError && <Banner tone="error">{syncAllError}</Banner>}
-      {(accountsError || groupsError) && <Banner tone="error">Could not load accounts or groups. Try refreshing the page.</Banner>}
 
       <section className="flex flex-col gap-3">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -206,8 +204,6 @@ export default function AccountsPage() {
             <Plus size={14} /> Create group
           </Button>
         </div>
-
-        {groupError && <Banner tone="error">{groupError}</Banner>}
 
         {isGroupsLoading ? (
           <Spinner />

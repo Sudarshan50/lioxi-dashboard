@@ -2,10 +2,12 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.runtime import DEPLOY_JOBS_DEFAULT, DEPLOY_JOBS_MAX
+
 
 class KimiDeployRequest(BaseModel):
     accounts: list[dict[str, Any]] = Field(min_length=1)
-    jobs: int = Field(default=32, ge=1, le=64)
+    jobs: int = Field(default=DEPLOY_JOBS_DEFAULT, ge=1, le=DEPLOY_JOBS_MAX)
     new_api_priority: int = Field(default=13, ge=0, le=10000)
     new_api_weight: int = Field(default=1, ge=1, le=10000)
 
@@ -22,7 +24,7 @@ class KimiBootstrapRequest(BaseModel):
 
 class KimiRegenerateRequest(BaseModel):
     accounts: list[dict[str, Any]] = Field(min_length=1)
-    jobs: int = Field(default=32, ge=1, le=64)
+    jobs: int = Field(default=DEPLOY_JOBS_DEFAULT, ge=1, le=DEPLOY_JOBS_MAX)
 
 
 class KimiCreditSnapshot(BaseModel):
@@ -77,6 +79,7 @@ class KimiDeployResult(BaseModel):
     new_api_priority: int | None = None
     new_api_weight: int | None = None
     new_api_error: str | None = None
+    rai_policy_name: str | None = None
 
 
 class KimiDeployResponse(BaseModel):
@@ -185,6 +188,26 @@ class KimiDeleteResponse(BaseModel):
     ok_count: int
     fail_count: int
     results: list[KimiDeleteResult]
+
+
+class KimiContentFilterResult(BaseModel):
+    ok: bool
+    name: str | None = None
+    account_name: str | None = None
+    resource_group: str | None = None
+    subscription_id: str | None = None
+    subscription_name: str | None = None
+    deployment_name: str | None = None
+    rai_policy_name: str | None = None
+    previous_rai_policy_name: str | None = None
+    message: str | None = None
+    error: str | None = None
+
+
+class KimiContentFilterResponse(BaseModel):
+    ok_count: int
+    fail_count: int
+    results: list[KimiContentFilterResult]
 
 
 class KimiTestResult(BaseModel):

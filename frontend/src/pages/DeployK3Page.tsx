@@ -3,7 +3,6 @@ import { Rocket, Upload } from "lucide-react";
 import { ChangeEvent, DragEvent, useEffect, useMemo, useState } from "react";
 
 import DeployedKimiCard from "@/components/deploy/DeployedKimiCard";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Spinner from "@/components/ui/Spinner";
@@ -11,6 +10,7 @@ import {
   invalidateAfterDeploy,
   streamKimiDeploy,
   useKimiAddNewApi,
+  useKimiContentFilter,
   useKimiDeployStatus,
   useKimiInventory,
   useKimiNewApiPool,
@@ -24,10 +24,11 @@ import {
   useKimiUndeploy,
 } from "@/hooks/useKimiDeploy";
 import { canonicalOwner } from "@/lib/ownerTag";
+import { toastDismiss, toastError, toastSuccess } from "@/lib/toast";
 import { AzureDeploySecret, parseAzureDeploySecretsArray, toKimiDeployPayload } from "@/lib/parseAzureCredentials";
 import { KimiDeployProgressEvent, KimiDeployResult, KimiNewApiPool, KimiStoredAccount, KimiTestResult } from "@/types";
 
-const PARALLEL_JOBS = 64;
+const PARALLEL_JOBS = 12;
 const LEFTOVER_SECRETS_KEY = "kimi-deploy-secrets";
 
 type DeployRunProgress = {
@@ -56,6 +57,7 @@ export default function DeployK3Page() {
   const undeploy = useKimiUndeploy();
   const testModel = useKimiTestModel();
   const addNewApi = useKimiAddNewApi();
+  const applyContentFilter = useKimiContentFilter();
   const renameNewApi = useKimiRenameNewApi();
   const sheetStatus = useKimiSheetStatus();
   const sheetSync = useKimiSheetSync();
@@ -86,6 +88,24 @@ export default function DeployK3Page() {
     const id = window.setInterval(() => setNow(Date.now()), 400);
     return () => window.clearInterval(id);
   }, [deploying]);
+
+  useEffect(() => {
+    if (error) toastError(error, { toastId: "deploy-err", persist: true });
+    else toastDismiss("deploy-err");
+  }, [error]);
+  useEffect(() => {
+    if (notice) toastSuccess(notice, "deploy-ok");
+    else toastDismiss("deploy-ok");
+  }, [notice]);
+  useEffect(() => {
+    if (status.isError) {
+      toastError(statusApiError(status.error), { toastId: "deploy-status", persist: true });
+    } else if (status.data && !status.data.ready && status.data.message) {
+      toastError(status.data.message, { toastId: "deploy-status", persist: true });
+    } else {
+      toastDismiss("deploy-status");
+    }
+  }, [status.isError, status.error, status.data]);
 
   const parsed = useMemo(() => parseAzureDeploySecretsArray(jsonText), [jsonText]);
   const parseError = jsonText.trim() ? parsed.error : null;
@@ -144,6 +164,7 @@ export default function DeployK3Page() {
     undeploy.isPending ||
     testModel.isPending ||
     addNewApi.isPending ||
+    applyContentFilter.isPending ||
     renameNewApi.isPending ||
     sheetSync.isPending;
   const liveResults = displayed.filter((item) => item.ok && !item.removed);
@@ -703,6 +724,47 @@ export default function DeployK3Page() {
     }
   }
 
+  async function handleApplyContentFilter() {
+    const accounts = (stored.data?.accounts ?? []).map((row) => ({
+      name: row.name || "",
+      account_holder: row.account_holder || "",
+      AZURE_TENANT_ID: row.AZURE_TENANT_ID || "",
+      AZURE_CLIENT_ID: row.AZURE_CLIENT_ID || "",
+      AZURE_SUBSCRIPTION_ID: row.AZURE_SUBSCRIPTION_ID,
+      person_associated: row.owner_tag || "",
+    }));
+    if (accounts.length === 0) {
+      setError("No stored identities. Nothing to attach the content filter to.");
+      return;
+    }
+    if (
+      !window.confirm(
+        `Apply the Lioxi custom content filter to ${accounts.length} K3 stack${accounts.length === 1 ? "" : "s"}? This matches Lioxi-Gaurav2: High on hate/sexual/violence/self-harm; jailbreak and protected material off.`
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    setNotice(null);
+    try {
+      const response = await applyContentFilter.mutateAsync({
+        accounts,
+        jobs: parallelJobs(accounts.length),
+      });
+      const failed = response.results.filter((row) => !row.ok);
+      setNotice(
+        failed.length > 0
+          ? `Content filter applied on ${response.ok_count}, failed ${response.fail_count}.`
+          : `Content filter LioxiCustom applied on ${response.ok_count} stack${response.ok_count === 1 ? "" : "s"}.`
+      );
+      if (failed.length > 0) {
+        setError(failed.map((row) => `${row.name ?? "account"}: ${row.error}`).join("; "));
+      }
+    } catch (err: any) {
+      setError(apiErrorMessage(err, "Could not apply the content filter."));
+    }
+  }
+
   function onDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     setDragging(false);
@@ -745,10 +807,6 @@ export default function DeployK3Page() {
       </div>
 
       {status.isLoading && <Spinner />}
-      {status.isError && <Banner tone="error">{statusApiError(status.error)}</Banner>}
-      {status.data && !status.data.ready && <Banner tone="error">{status.data.message}</Banner>}
-      {error && <Banner tone="error">{error}</Banner>}
-      {notice && <Banner tone="success">{notice}</Banner>}
       {deployProgress && deploying && (
         <DeployProgressBar
           progress={deployProgress}
@@ -922,8 +980,7 @@ export default function DeployK3Page() {
                 <Button
                   variant="secondary"
                   className="px-3 py-1.5 text-xs"
-                  onClick={() =>
-                    void handleTest(
+                  onClick={() => void handleTest(
                       displayed
                         .map((item, index) => ({ item, index }))
                         .filter(({ item }) => !item.removed && !item.error && !item.pending),
@@ -934,6 +991,16 @@ export default function DeployK3Page() {
                   disabled={busy}
                 >
                   Test all
+                </Button>
+                <Button
+                  variant="secondary"
+                  className="px-3 py-1.5 text-xs"
+                  onClick={() => void handleApplyContentFilter()}
+                  isLoading={applyContentFilter.isPending}
+                  disabled={busy || (stored.data?.accounts.length ?? 0) === 0}
+                  title="Attach the Lioxi-Gaurav2 custom content filter to every stored K3 stack"
+                >
+                  Apply content filter
                 </Button>
                 {liveResults.some((item) => !item.new_api_present) && (
                   <Button

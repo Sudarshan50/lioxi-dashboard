@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
 from app.database import SessionLocal, init_models
+from app.runtime import configure_runtime
 from app.dependencies import get_sync_orchestrator
 from app.repositories.admin_repository import AdminRepository
 from app.routers import account_groups, accounts, alerts, auth, dashboard, kimi_deploy, models, pending, registered_models, submit
@@ -27,6 +28,7 @@ scheduler = AsyncIOScheduler()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+    configure_runtime()
     await init_models()
 
     async with SessionLocal() as session:

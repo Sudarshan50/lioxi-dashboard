@@ -13,25 +13,39 @@ import logging
 import os
 import re
 import shutil
+import signal
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+
+from app.runtime import AZ_CLI_CONCURRENCY
 
 logger = logging.getLogger(__name__)
 
 CONFIG_ROOT = Path("/tmp/az-submit")
 LOGIN_TIMEOUT_SEC = 15 * 60
-_GLOBAL_SEM = asyncio.Semaphore(8)
+_GLOBAL_SEM = asyncio.Semaphore(max(1, AZ_CLI_CONCURRENCY))
 _sessions: dict[str, "AzCliSession"] = {}
 _sessions_guard = asyncio.Lock()
 
 DEVICE_URI_RE = re.compile(
-    r"https://(?:www\.)?(?:microsoft\.com/devicelogin|login\.microsoft(?:online)?\.com/device(?:s)?|aka\.ms/devicelogin)",
+    r"https://(?:www\.)?(?:microsoft\.com/(?:devicelogin|link)|login\.microsoft(?:online)?\.com/device(?:s)?|aka\.ms/devicelogin)(?:\?[^\s]*)?",
     re.I,
 )
 DEVICE_CODE_RE = re.compile(
-    r"(?:enter the code|enter code|code is|code:)\s+([A-Z0-9][A-Z0-9-]{7,20})",
+    r"(?:enter the code|enter code|code is|code:|user code(?: is|:)?)\s+([A-Z0-9][A-Z0-9-]{7,20})",
     re.I,
 )
+DEVICE_OTC_RE = re.compile(r"[?&]otc=([A-Z0-9][A-Z0-9-]{7,20})", re.I)
+DEVICE_UNLABELED_RE = re.compile(r"(?m)^[ \t]*([A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8,9})[ \t]*$")
+_BLOCKED_DEVICE_CODES = {
+    "MICROSOFT",
+    "WINDOWS",
+    "AZURE",
+    "DEVICE",
+    "LOGIN",
+    "ENTERCODE",
+    "AUTHENTIC",
+}
 PASSWORD_JSON_RE = re.compile(r'("password"\s*:\s*")[^"]+(")', re.I)
 TOKEN_RE = re.compile(r"eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
 SECRET_FLAGS = {"-p", "--password", "--secret", "--client-secret"}
@@ -132,20 +146,46 @@ def session_config_dir(session_id: str) -> Path:
     return path
 
 
+def _usable_device_code(raw: str | None) -> str | None:
+    code = (raw or "").strip().upper().rstrip(".,;:")
+    if not code or code in _BLOCKED_DEVICE_CODES:
+        return None
+    if re.match(r"^[0-9A-F]{8}-", code):
+        return None
+    if not re.fullmatch(r"[A-Z0-9]{8,9}|[A-Z0-9]{4}-[A-Z0-9]{4}", code):
+        return None
+    return code
+
+
 def parse_device_prompt(text: str) -> tuple[str | None, str | None]:
+    blob = text or ""
     uri = None
-    match = DEVICE_URI_RE.search(text or "")
+    match = DEVICE_URI_RE.search(blob)
     if match:
         uri = match.group(0)
     code = None
-    code_match = DEVICE_CODE_RE.search(text or "")
-    if code_match:
-        code = code_match.group(1).strip().upper()
+    labeled = DEVICE_CODE_RE.search(blob)
+    if labeled:
+        code = _usable_device_code(labeled.group(1))
+    if not code and uri:
+        otc_in_uri = DEVICE_OTC_RE.search(uri)
+        if otc_in_uri:
+            code = _usable_device_code(otc_in_uri.group(1))
     if not code:
-        loose = re.search(r"\b([A-Z0-9]{8,9})\b", (text or "").upper())
-        if loose and uri:
-            code = loose.group(1)
+        otc = DEVICE_OTC_RE.search(blob)
+        if otc:
+            code = _usable_device_code(otc.group(1))
+    if not code and uri:
+        for unlabeled in DEVICE_UNLABELED_RE.finditer(blob):
+            code = _usable_device_code(unlabeled.group(1))
+            if code:
+                break
     return uri, code
+
+
+def _role_already_assigned(err: str) -> bool:
+    text = (err or "").lower()
+    return "already exists" in text or "roleassignmentexists" in text
 
 
 def normalize_tenant_id(value: str | None) -> str | None:
@@ -317,12 +357,12 @@ class AzCliSession:
                 return silent
 
         for tid in tenants:
+            self._clear_login_cache()
+            await self.kill_login()
             await on_event(
                 {
-                    "type": "device_code",
-                    "user_code": "",
-                    "verification_uri": "https://microsoft.com/devicelogin",
-                    "message": "Microsoft needs one more sign-in. A new code is coming — use that one.",
+                    "type": "device_code_wait",
+                    "message": "Microsoft needs one more sign-in. Wait for a new code.",
                 }
             )
             accounts, buffer, ok = await self._device_login_once(
@@ -465,9 +505,11 @@ class AzCliSession:
         async with _GLOBAL_SEM:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                start_new_session=True,
             )
         self.login_proc = proc
         buffer = ""
@@ -544,9 +586,15 @@ class AzCliSession:
         if proc is None or proc.returncode is not None:
             return
         try:
-            proc.kill()
-        except ProcessLookupError:
-            return
+            if proc.pid:
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
         try:
             await asyncio.wait_for(proc.wait(), timeout=5)
         except (TimeoutError, ProcessLookupError):
@@ -673,7 +721,7 @@ class AzCliSession:
                         err = scrub_az_text(str(exc))
                         await self._relay(relay_output_line(err) or "failed", "err")
                         return False, err
-            if ok or "already exists" in err.lower() or "exist" in err.lower():
+            if ok or _role_already_assigned(err):
                 await self._relay("ok", "ok")
                 return True, ""
             await self._relay(relay_output_line(err) or "failed", "err")
@@ -681,7 +729,7 @@ class AzCliSession:
         scope = f"/subscriptions/{subscription_id}"
         cmd = mod.role_assignment_cmd(role, scope, app_id, None)
         ok, err = await self._run_ok(cmd, timeout=timeout)
-        if ok or "already exists" in err.lower() or "exist" in err.lower():
+        if ok or _role_already_assigned(err):
             return True, ""
         return False, err
 

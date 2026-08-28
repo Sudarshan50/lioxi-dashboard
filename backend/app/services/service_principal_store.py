@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import SecretBox, get_secret_box
@@ -133,6 +133,27 @@ async def hydrate_service_principals(
                     row["subscription_name"] = stored.subscription_name
         hydrated.append(row)
     return hydrated
+
+
+async def drop_orphan_service_principal(session: AsyncSession, subscription_id: str | None) -> None:
+    """Remove a stored SP when the subscription has no portal account, so /join can run again."""
+    sub = (subscription_id or "").strip().lower()
+    if not sub:
+        return
+    portal = (
+        await session.execute(
+            select(ProviderAccount.id).where(func.lower(ProviderAccount.subscription_id) == sub).limit(1)
+        )
+    ).scalar_one_or_none()
+    if portal is not None:
+        return
+    stored = (
+        await session.execute(
+            select(AzureServicePrincipal).where(func.lower(AzureServicePrincipal.subscription_id) == sub)
+        )
+    ).scalar_one_or_none()
+    if stored is not None:
+        await session.delete(stored)
 
 
 async def list_service_principals(session: AsyncSession) -> list[AzureServicePrincipal]:

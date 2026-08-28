@@ -2,22 +2,25 @@ import { Check, Copy, KeyRound } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import JoinTerminal, { JoinTermLine } from "@/components/join/JoinTerminal";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Input from "@/components/ui/Input";
 import { canonicalOwner } from "@/lib/ownerTag";
+import { toastDismiss, toastError } from "@/lib/toast";
 import {
+  JOIN_PASSWORD_KEY,
   SUBMIT_SESSION_KEY,
+  cancelSubmitSession,
   commitSubmitSession,
   fetchSubmitNames,
   fetchSubmitSnapshot,
   startSubmitSession,
   streamSubmitEvents,
+  unlockJoin,
 } from "@/lib/submitApi";
 import { SubmitSessionSnapshot, SubmitSubscription } from "@/types";
 
-type Step = "welcome" | "signin" | "subscription" | "name" | "working" | "done";
+type Step = "gate" | "welcome" | "signin" | "subscription" | "name" | "working" | "done";
 
 async function copyText(value: string): Promise<boolean> {
   const text = value.trim();
@@ -51,6 +54,27 @@ async function copyText(value: string): Promise<boolean> {
   }
   document.body.removeChild(field);
   return ok;
+}
+
+function subscriptionLabel(item: SubmitSubscription) {
+  const subSlice = item.subscription_id.slice(0, 8);
+  const tenantSlice = item.tenant_id ? item.tenant_id.slice(0, 8) : "—";
+  return `${item.name || "Subscription"} · ${subSlice} · tenant ${tenantSlice}`;
+}
+
+async function pollCreatingSp(sessionId: string, stillThisSession: () => boolean) {
+  while (stillThisSession()) {
+    await new Promise((resolve) => window.setTimeout(resolve, 2000));
+    if (!stillThisSession()) return null;
+    const next = await fetchSubmitSnapshot(sessionId);
+    if (!next) return { kind: "missing" as const };
+    if (next.status === "pending_approval" || next.status === "approved") return { kind: "done" as const, snap: next };
+    if (next.status === "failed" || next.status === "expired" || next.status === "rejected") {
+      return { kind: "failed" as const, snap: next };
+    }
+    if (next.status !== "creating_sp") return { kind: "other" as const, snap: next };
+  }
+  return null;
 }
 
 function CopyField({ label, value }: { label: string; value: string }) {
@@ -90,7 +114,9 @@ function CopyField({ label, value }: { label: string; value: string }) {
 }
 
 export default function JoinPage() {
-  const [step, setStep] = useState<Step>("welcome");
+  const [step, setStep] = useState<Step>(() => (sessionStorage.getItem(JOIN_PASSWORD_KEY) ? "welcome" : "gate"));
+  const [unlocked, setUnlocked] = useState(() => Boolean(sessionStorage.getItem(JOIN_PASSWORD_KEY)));
+  const [gatePassword, setGatePassword] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(() => sessionStorage.getItem(SUBMIT_SESSION_KEY));
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
@@ -111,13 +137,26 @@ export default function JoinPage() {
   );
 
   useEffect(() => {
-    void fetchSubmitNames()
-      .then(setNames)
-      .catch(() => setNames([]));
-  }, []);
+    if (error) toastError(error, { persist: true, toastId: "join-error" });
+    else toastDismiss("join-error");
+  }, [error]);
 
   useEffect(() => {
-    if (!sessionId) return;
+    if (!unlocked) return;
+    void fetchSubmitNames()
+      .then(setNames)
+      .catch((exc) => {
+        if (exc instanceof Error && exc.message.includes("join password")) {
+          setUnlocked(false);
+          setStep("gate");
+          return;
+        }
+        setNames([]);
+      });
+  }, [unlocked]);
+
+  useEffect(() => {
+    if (!unlocked || !sessionId) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -135,9 +174,39 @@ export default function JoinPage() {
             if (cancelled) return;
             applyEvent(event);
           });
+        } else if (current.status === "creating_sp") {
+          setStep("working");
+          setPhaseMessage(current.message || "Creating monitor identity…");
+          const settled = await pollCreatingSp(sessionId, () => !cancelled && sessionIdRef.current === sessionId);
+          if (cancelled) return;
+          if (!settled || settled.kind === "missing") {
+            sessionStorage.removeItem(SUBMIT_SESSION_KEY);
+            sessionIdRef.current = null;
+            setSessionId(null);
+            setStep("welcome");
+            return;
+          }
+          if (settled.kind === "done") {
+            applyEvent({
+              type: "done",
+              session_id: sessionId,
+              status: settled.snap.status,
+              message: settled.snap.message || "Submitted. An admin will deploy Kimi K3.",
+            });
+            return;
+          }
+          applySnapshot(settled.snap);
         }
       } catch (exc) {
-        if (!cancelled) setError(exc instanceof Error ? exc.message : "Could not resume session.");
+        if (!cancelled) {
+          const message = exc instanceof Error ? exc.message : "Could not resume session.";
+          if (message.includes("join password")) {
+            setUnlocked(false);
+            setStep("gate");
+            return;
+          }
+          setError(message);
+        }
       }
     })();
     return () => {
@@ -145,7 +214,21 @@ export default function JoinPage() {
     };
     // resume once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [unlocked]);
+
+  function pickSubscription(subs: SubmitSubscription[], currentId?: string | null) {
+    if (subs.length === 0) {
+      setError("No enabled Azure subscriptions on this login.");
+      setStep("welcome");
+      return;
+    }
+    const preferred =
+      (currentId && subs.some((item) => item.subscription_id === currentId) ? currentId : "") ||
+      subs.find((item) => item.is_default)?.subscription_id ||
+      subs[0].subscription_id;
+    setSubscriptionId(preferred);
+    setStep("subscription");
+  }
 
   function applySnapshot(current: SubmitSessionSnapshot) {
     setSnapshot(current);
@@ -154,16 +237,7 @@ export default function JoinPage() {
     if (current.person_associated) setPerson(current.person_associated);
     if (current.error) setError(current.error);
     if (current.status === "logged_in") {
-      const subs = current.subscriptions ?? [];
-      if (subs.length === 1) {
-        setSubscriptionId(subs[0].subscription_id);
-        setStep("name");
-      } else if (subs.length === 0) {
-        setError("No enabled Azure subscriptions on this login.");
-        setStep("welcome");
-      } else {
-        setStep("subscription");
-      }
+      pickSubscription(current.subscriptions ?? [], current.subscription_id);
     } else if (current.status === "pending_approval" || current.status === "approved") {
       setStep("done");
     } else if (current.status === "creating_sp") {
@@ -177,8 +251,9 @@ export default function JoinPage() {
 
   function applyEvent(event: SubmitSessionSnapshot & Record<string, unknown>) {
     const sid = sessionIdRef.current || "";
+    if (!sid) return;
     const eventSid = String(event.session_id || "");
-    if (eventSid && sid && eventSid !== sid) return;
+    if (eventSid && eventSid !== sid) return;
     const kind = String(event.type || "");
     if (kind === "snapshot") {
       applySnapshot(event);
@@ -193,15 +268,20 @@ export default function JoinPage() {
       setTermLines((prev) => [...prev, { kind: safeKind, text }].slice(-120));
       return;
     }
+    if (kind === "device_code_wait") {
+      const hint = String(event.message || "").trim();
+      setSigninHint(hint || null);
+      return;
+    }
     if (kind === "device_code") {
       const hint = String(event.message || "").trim();
       setSigninHint(hint || null);
-      const supplied = event.user_code ?? event.device_user_code;
+      const supplied = String(event.user_code ?? event.device_user_code ?? "").trim();
       setSnapshot((prev) => ({
         ...(prev ?? { session_id: sid, status: "login_started" }),
         session_id: sid || prev?.session_id || "",
         status: "login_started",
-        device_user_code: supplied != null ? String(supplied) : prev?.device_user_code || "",
+        device_user_code: supplied || prev?.device_user_code || "",
         device_verification_uri: String(
           event.verification_uri || event.device_verification_uri || prev?.device_verification_uri || ""
         ),
@@ -218,16 +298,7 @@ export default function JoinPage() {
         account_holder: (event.account_holder as string) || prev?.account_holder,
         subscriptions: subs,
       }));
-      if (subs.length === 1) {
-        setSubscriptionId(subs[0].subscription_id);
-        setStep("name");
-      } else if (subs.length === 0) {
-        setError("No enabled Azure subscriptions on this login.");
-        setStep("welcome");
-      } else {
-        if (subs[0]) setSubscriptionId(subs.find((item) => item.is_default)?.subscription_id || subs[0].subscription_id);
-        setStep("subscription");
-      }
+      pickSubscription(subs, event.subscription_id as string | undefined);
       return;
     }
     if (kind === "phase") {
@@ -236,6 +307,7 @@ export default function JoinPage() {
       return;
     }
     if (kind === "done") {
+      clearJoinSession();
       setStep("done");
       return;
     }
@@ -254,24 +326,76 @@ export default function JoinPage() {
     setTermLines([]);
   }
 
+  async function handleUnlock(event: FormEvent) {
+    event.preventDefault();
+    setError(null);
+    setBusy(true);
+    try {
+      await unlockJoin(gatePassword.trim());
+      setGatePassword("");
+      setUnlocked(true);
+      setStep("welcome");
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : "Wrong password.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function startSignIn() {
+    const previous = sessionIdRef.current;
     setError(null);
     setBusy(true);
     setSigninHint(null);
     clearJoinSession();
+    if (previous) {
+      await cancelSubmitSession(previous).catch(() => undefined);
+    }
+    let createdId: string | null = null;
     try {
       const created = await startSubmitSession();
+      createdId = created.session_id;
       sessionStorage.setItem(SUBMIT_SESSION_KEY, created.session_id);
       sessionIdRef.current = created.session_id;
       setSessionId(created.session_id);
       setStep("signin");
       await streamSubmitEvents(created.session_id, applyEvent);
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "Could not start Azure sign-in.");
-      setStep("welcome");
+      if (createdId) await cancelSubmitSession(createdId).catch(() => undefined);
+      if (createdId && sessionIdRef.current !== createdId) return;
+      const message = exc instanceof Error ? exc.message : "Could not start Azure sign-in.";
+      setError(message);
+      if (message.includes("join password")) {
+        setUnlocked(false);
+        setStep("gate");
+      } else {
+        clearJoinSession();
+        setStep("welcome");
+      }
     } finally {
-      setBusy(false);
+      if (!createdId || sessionIdRef.current === createdId) setBusy(false);
     }
+  }
+
+  async function handleCancelSignIn() {
+    const sid = sessionIdRef.current;
+    try {
+      if (sid) await cancelSubmitSession(sid);
+    } catch (exc) {
+      const message = exc instanceof Error ? exc.message : "";
+      if (message.includes("join password")) {
+        clearJoinSession();
+        setBusy(false);
+        setUnlocked(false);
+        setStep("gate");
+        return;
+      }
+    }
+    clearJoinSession();
+    setSigninHint(null);
+    setError(null);
+    setBusy(false);
+    setStep("welcome");
   }
 
   function continueFromSub() {
@@ -303,13 +427,35 @@ export default function JoinPage() {
       await commitSubmitSession(sessionId, { subscription_id: subscriptionId, person_associated: tag }, applyEvent);
     } catch (exc) {
       const snap = await fetchSubmitSnapshot(sessionId).catch(() => null);
-      if (snap?.status === "pending_approval") {
+      if (snap?.status === "pending_approval" || snap?.status === "approved") {
         applyEvent({
           type: "done",
           session_id: sessionId,
-          status: "pending_approval",
+          status: snap.status,
           message: "Submitted. An admin will deploy Kimi K3.",
         });
+        return;
+      }
+      if (snap?.status === "creating_sp") {
+        setError(null);
+        setPhaseMessage("Still creating the monitor identity…");
+        setStep("working");
+        const settled = await pollCreatingSp(sessionId, () => sessionIdRef.current === sessionId);
+        if (!settled || settled.kind === "missing") {
+          clearJoinSession();
+          setStep("welcome");
+          return;
+        }
+        if (settled.kind === "done") {
+          applyEvent({
+            type: "done",
+            session_id: sessionId,
+            status: settled.snap.status,
+            message: settled.snap.message || "Submitted. An admin will deploy Kimi K3.",
+          });
+          return;
+        }
+        applySnapshot(settled.snap);
         return;
       }
       setError(exc instanceof Error ? exc.message : "Submit failed.");
@@ -332,8 +478,11 @@ export default function JoinPage() {
             <KeyRound size={20} />
           </div>
           <h1 className="gradient-title text-xl font-semibold">Join Kimi K3</h1>
-          <p className="mt-1 text-sm text-gray-500">Sign in with Azure. An admin deploys Kimi K3 after you submit.</p>
+          <p className="mt-1 text-sm text-gray-500">
+            {step === "gate" ? "This page is password protected." : "Sign in with Azure. An admin deploys Kimi K3 after you submit."}
+          </p>
         </div>
+        {step !== "gate" && (
         <ol className="mb-5 grid grid-cols-4 gap-1.5 text-center text-[10px] uppercase tracking-wide text-gray-500">
           {["Sign in", "Subscription", "Name", "Submitted"].map((label, index) => (
             <li
@@ -346,10 +495,23 @@ export default function JoinPage() {
             </li>
           ))}
         </ol>
-        {error && (
-          <div className="mb-4">
-            <Banner tone="error">{error}</Banner>
-          </div>
+        )}
+        {step === "gate" && (
+          <form onSubmit={(event) => void handleUnlock(event)} className="flex flex-col gap-4">
+            <p className="text-sm text-gray-400">Enter the join password to continue.</p>
+            <Input
+              id="join-password"
+              label="Password"
+              type="password"
+              value={gatePassword}
+              onChange={(event) => setGatePassword(event.target.value)}
+              autoComplete="current-password"
+              required
+            />
+            <Button type="submit" isLoading={busy} className="w-full">
+              Continue
+            </Button>
+          </form>
         )}
         {step === "welcome" && (
           <div className="flex flex-col gap-4">
@@ -381,6 +543,9 @@ export default function JoinPage() {
             ) : null}
             {signinHint && <p className="text-center text-xs text-gray-400">{signinHint}</p>}
             <JoinTerminal lines={termLines} waiting />
+            <Button type="button" variant="secondary" onClick={() => void handleCancelSignIn()} className="w-full">
+              Cancel
+            </Button>
           </div>
         )}
         {step === "subscription" && (
@@ -400,7 +565,7 @@ export default function JoinPage() {
                 <option value="">Select…</option>
                 {subscriptions.map((item) => (
                   <option key={item.subscription_id} value={item.subscription_id}>
-                    {item.name || item.subscription_id}
+                    {subscriptionLabel(item)}
                   </option>
                 ))}
               </select>
@@ -414,7 +579,7 @@ export default function JoinPage() {
           <form onSubmit={(event) => void handleCommit(event)} className="flex flex-col gap-4">
             {selected && (
               <p className="text-xs text-gray-500">
-                Subscription <span className="text-gray-300">{selected.name || selected.subscription_id}</span>
+                Subscription <span className="text-gray-300">{subscriptionLabel(selected)}</span>
               </p>
             )}
             <div>
@@ -445,6 +610,9 @@ export default function JoinPage() {
           <div className="flex flex-col gap-3">
             <p className="text-center text-xs text-gray-400">{phaseMessage}</p>
             <JoinTerminal lines={termLines} waiting />
+            <Button type="button" variant="secondary" onClick={() => void handleCancelSignIn()} className="w-full">
+              Cancel
+            </Button>
           </div>
         )}
         {step === "done" && (
@@ -454,6 +622,17 @@ export default function JoinPage() {
             </div>
             <p className="text-sm font-medium text-gray-100">Submitted. An admin will deploy Kimi K3.</p>
             <p className="text-xs text-gray-500">You can close this page. No secrets were shown.</p>
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                clearJoinSession();
+                setStep("welcome");
+              }}
+              className="mt-1 w-full"
+            >
+              Join another account
+            </Button>
           </div>
         )}
       </Card>

@@ -1,12 +1,11 @@
 import { Cpu, Pencil, Plus, Search, Trash2 } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import AccountDeploymentGroup from "@/components/models/AccountDeploymentGroup";
 import AddModelModal from "@/components/models/AddModelModal";
 import EditRegisteredModelModal from "@/components/models/EditRegisteredModelModal";
 import RegisterModelModal from "@/components/models/RegisterModelModal";
 import Badge from "@/components/ui/Badge";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import CurrencyToggle from "@/components/ui/CurrencyToggle";
@@ -34,6 +33,7 @@ import {
 import { formatCurrency } from "@/lib/format";
 import { amountPayableUsd } from "@/lib/payable";
 import { matchesOwner, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
+import { toastError } from "@/lib/toast";
 import { Account, BreakdownItem, MonitoredModel, RegisteredModel } from "@/types";
 
 const ALL = "all";
@@ -70,12 +70,23 @@ export default function ModelsPage() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isRegisterModalOpen, setIsRegisterModalOpen] = useState(false);
   const [editingRegistered, setEditingRegistered] = useState<RegisteredModel | null>(null);
-  const [registryError, setRegistryError] = useState<string | null>(null);
   const [deletingRegisteredId, setDeletingRegisteredId] = useState<number | null>(null);
   const [accountFilter, setAccountFilter] = useState<string>(ALL);
   const [ownerFilter, setOwnerFilter] = useState<string>(ALL);
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<ModelSort>("account");
+
+  useEffect(() => {
+    if (registryLoadError) {
+      toastError("Could not load the model registry. Try refreshing the page.", { toastId: "models-registry" });
+    }
+  }, [registryLoadError]);
+  useEffect(() => {
+    if (modelsError) toastError("Could not load deployments. Try refreshing the page.", { toastId: "models-load" });
+  }, [modelsError]);
+  useEffect(() => {
+    if (usageError) toastError("Could not load 30-day usage for deployments.", { toastId: "models-usage" });
+  }, [usageError]);
 
   const usageById = useMemo(
     () => new Map((usageByDeployment ?? []).map((item) => [item.id, item])),
@@ -156,12 +167,11 @@ export default function ModelsPage() {
   }, [deploymentGroups]);
 
   async function handleDeleteRegistered(model: RegisteredModel) {
-    setRegistryError(null);
     setDeletingRegisteredId(model.id);
     try {
       await deleteRegisteredModel.mutateAsync(model.id);
     } catch (err: any) {
-      setRegistryError(err?.response?.data?.detail ?? "Could not delete this model.");
+      toastError(err?.response?.data?.detail ?? "Could not delete this model.");
     } finally {
       setDeletingRegisteredId(null);
     }
@@ -181,9 +191,6 @@ export default function ModelsPage() {
             <Plus size={14} /> Register model
           </Button>
         </div>
-
-        {registryError && <Banner tone="error">{registryError}</Banner>}
-        {registryLoadError && <Banner tone="error">Could not load the model registry. Try refreshing the page.</Banner>}
 
         {isRegistryLoading ? (
           <Spinner />
@@ -326,9 +333,6 @@ export default function ModelsPage() {
             )}
           </div>
         )}
-
-        {modelsError && <Banner tone="error">Could not load deployments. Try refreshing the page.</Banner>}
-        {usageError && <Banner tone="error">Could not load 30-day usage for deployments.</Banner>}
 
         {isLoading ? (
           <Spinner />

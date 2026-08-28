@@ -21,7 +21,9 @@ from app.providers.azure.arm_client import AzureArmClient
 from app.providers.azure.token_provider import AzureTokenProvider
 from app.providers.base import ProviderCredentials
 from app.providers.registry import get_provider
+from app.runtime import DEPLOY_JOBS_MAX
 from app.schemas.kimi_deploy import (
+    KimiContentFilterResult,
     KimiCreditSnapshot,
     KimiDeleteResult,
     KimiDeployResult,
@@ -287,13 +289,16 @@ def normalize_accounts(raw_accounts: list[dict[str, Any]]) -> list[dict[str, str
 async def prepare_accounts(
     raw_accounts: list[dict[str, Any]],
     session: AsyncSession | None,
+    *,
+    persist: bool = True,
 ) -> list[dict[str, str]]:
     accounts = normalize_accounts(raw_accounts)
     if session is not None:
         from app.services.service_principal_store import hydrate_service_principals, persist_service_principals
 
         accounts = await hydrate_service_principals(session, accounts)
-        await persist_service_principals(session, accounts)
+        if persist:
+            await persist_service_principals(session, accounts)
         try:
             await apply_person_associated_tags(session, accounts)
         except ValueError as exc:
@@ -364,6 +369,9 @@ def _safe_deploy(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 - surface Azure/CLI failures to the admin UI
         error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
         logger.warning("Kimi K3 deploy failed for %s: %s", name, error[-300:])
+        humanize = getattr(module, "humanize_kimi_deploy_error", None)
+        if callable(humanize):
+            error = humanize(error)
         return {"ok": False, "name": name, "error": error}
 
 
@@ -379,6 +387,26 @@ def _safe_delete(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
         error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
         logger.warning("Kimi K3 undeploy failed for %s: %s", name, error[-300:])
         return {"ok": False, "name": name, "error": error, "deleted": []}
+
+
+def _safe_apply_content_filter(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
+    name = account.get("name") or account.get("account_holder") or "account"
+    try:
+        result = module.apply_content_filter_one(account)
+        if isinstance(result, dict):
+            result.setdefault("ok", True)
+            return result
+        return {"ok": False, "name": name, "error": "Content filter returned an unexpected result."}
+    except Exception as exc:  # noqa: BLE001
+        error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
+        logger.warning("Kimi content filter failed for %s: %s", name, error[-300:])
+        lowered = error.lower()
+        if "raipolicies/write" in lowered or "authorizationfailed" in lowered:
+            error = (
+                "This identity cannot write content filters. It needs Cognitive Services Contributor "
+                "(join-pipeline SPs have that; older pasted SPs often do not)."
+            )
+        return {"ok": False, "name": name, "error": error}
 
 
 def _to_delete_result(raw: dict[str, Any]) -> KimiDeleteResult:
@@ -723,6 +751,7 @@ def _to_result(raw: dict[str, Any]) -> KimiDeployResult:
         credits_available=bool(raw.get("credits_available")),
         error=raw.get("error"),
         owner_tag=raw.get("owner_tag") or raw.get("person_associated"),
+        rai_policy_name=raw.get("rai_policy_name"),
     )
 
 
@@ -755,6 +784,10 @@ def _secrets_public(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _job_workers(jobs: int, count: int) -> int:
+    return min(max(1, jobs), max(1, count), DEPLOY_JOBS_MAX)
+
+
 async def deploy_accounts(
     raw_accounts: list[dict[str, Any]],
     jobs: int,
@@ -762,14 +795,15 @@ async def deploy_accounts(
     new_api_priority: int = 13,
     new_api_weight: int = 1,
     on_progress: ProgressFn | None = None,
+    persist_principals: bool = True,
 ) -> list[KimiDeployResult]:
     status = deploy_status()
     if not status.ready:
         raise KimiDeployError(status.message)
 
-    accounts = await prepare_accounts(raw_accounts, session)
+    accounts = await prepare_accounts(raw_accounts, session, persist=persist_principals)
     module = load_deploy_module()
-    workers = min(max(1, jobs), len(accounts))
+    workers = _job_workers(jobs, len(accounts))
     logger.info("Kimi K3 deploy started for %s account(s), jobs=%s", len(accounts), workers)
     if on_progress is not None:
         await on_progress({"type": "start", "total": len(accounts), "phase": "azure", "message": "Deploying Azure stacks in parallel"})
@@ -801,7 +835,13 @@ async def deploy_accounts(
                     await persist_foundry_api_keys(session, [row])
                 except Exception:
                     logger.exception("Could not store Foundry API keys after deploy")
-            if portal_service is None or not result.account_name:
+            if portal_service is None:
+                return
+            if not result.account_name:
+                raw["ok"] = False
+                raw["error"] = "K3 deploy did not return an account name. Retry deploy."
+                result.ok = False
+                result.error = raw["error"]
                 return
             try:
                 await portal_service.upsert_from_kimi_deploy(
@@ -818,8 +858,14 @@ async def deploy_accounts(
                     credits_label=result.credits_label,
                     deployment_name=result.deployment_name,
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Could not create portal account after Kimi deploy for %s", result.account_name)
+                raw["ok"] = False
+                raw["error"] = (
+                    "K3 is up in Azure but the portal could not store the account. Retry deploy. " + str(exc)
+                )[-400:]
+                result.ok = False
+                result.error = raw["error"]
 
     async def run_one(index: int, account: dict[str, str]) -> dict[str, Any]:
         nonlocal finished
@@ -947,7 +993,7 @@ async def regenerate_accounts(
 
     accounts = await prepare_accounts(raw_accounts, session)
     module = load_deploy_module()
-    workers = min(max(1, jobs), len(accounts))
+    workers = _job_workers(jobs, len(accounts))
     logger.info("Kimi K3 key regen started for %s account(s), jobs=%s", len(accounts), workers)
 
     sem = asyncio.Semaphore(workers)
@@ -988,7 +1034,7 @@ async def delete_accounts(
 
     accounts = await prepare_accounts(raw_accounts, session)
     module = load_deploy_module()
-    workers = min(max(1, jobs), len(accounts))
+    workers = _job_workers(jobs, len(accounts))
     logger.info("Kimi K3 undeploy started for %s account(s), jobs=%s", len(accounts), workers)
 
     sem = asyncio.Semaphore(workers)
@@ -1005,6 +1051,47 @@ async def delete_accounts(
         if result.account_name:
             await drop_azure_inventory(result.subscription_id or sub, result.account_name)
     return results
+
+
+async def apply_content_filters(
+    raw_accounts: list[dict[str, Any]],
+    jobs: int,
+    session: AsyncSession | None = None,
+) -> list[KimiContentFilterResult]:
+    status = deploy_status()
+    if not status.ready:
+        raise KimiDeployError(status.message)
+
+    accounts = await prepare_accounts(raw_accounts, session)
+    module = load_deploy_module()
+    if not hasattr(module, "apply_content_filter_one"):
+        raise KimiDeployError("Deploy script is missing apply_content_filter_one.")
+    workers = _job_workers(jobs, len(accounts))
+    logger.info("Kimi content filter started for %s account(s), jobs=%s", len(accounts), workers)
+
+    sem = asyncio.Semaphore(workers)
+
+    async def run_one(account: dict[str, str]) -> dict[str, Any]:
+        async with sem:
+            return await asyncio.to_thread(_safe_apply_content_filter, module, account)
+
+    raw_results = await asyncio.gather(*[run_one(account) for account in accounts])
+    return [
+        KimiContentFilterResult(
+            ok=bool(item.get("ok")),
+            name=item.get("name"),
+            account_name=item.get("account_name"),
+            resource_group=item.get("resource_group"),
+            subscription_id=item.get("subscription_id"),
+            subscription_name=item.get("subscription_name"),
+            deployment_name=item.get("deployment_name"),
+            rai_policy_name=item.get("rai_policy_name"),
+            previous_rai_policy_name=item.get("previous_rai_policy_name"),
+            message=item.get("message"),
+            error=item.get("error"),
+        )
+        for item in raw_results
+    ]
 
 
 def _run_bootstrap(name: str, email: str) -> dict[str, Any]:

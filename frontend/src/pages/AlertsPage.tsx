@@ -3,7 +3,6 @@ import { BellRing, FileDown, Play, Plus, Scissors, Search, Send, Users, X } from
 import { useEffect, useMemo, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Input from "@/components/ui/Input";
@@ -24,6 +23,7 @@ import {
 import { formatCurrency } from "@/lib/format";
 import { amountPayableUsd, brokerageUsd, downloadPayableCsv, payablePercentLabel } from "@/lib/payable";
 import { matchesOwner, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
+import { toastDismiss, toastError, toastSuccess } from "@/lib/toast";
 
 type AlertSort =
   | "percent"
@@ -139,6 +139,15 @@ export default function AlertsPage() {
   const [brokerageLeaving, setBrokerageLeaving] = useState(false);
   const showBrokerage = brokerageClicks >= 3 || brokerageLeaving;
   const payablePct = payablePercentLabel();
+
+  useEffect(() => {
+    if (message) toastSuccess(message, "alerts-ok");
+    else toastDismiss("alerts-ok");
+  }, [message]);
+  useEffect(() => {
+    if (error) toastError(error, { toastId: "alerts-err" });
+    else toastDismiss("alerts-err");
+  }, [error]);
 
   useEffect(() => {
     if (!config.data) return;
@@ -339,9 +348,6 @@ export default function AlertsPage() {
           )}
         </div>
       </div>
-
-      {message && <Banner tone="success">{message}</Banner>}
-      {error && <Banner tone="error">{error}</Banner>}
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2 lg:gap-6">
         <Card className="flex flex-col gap-4">

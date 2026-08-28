@@ -40,6 +40,10 @@ class SubmitCommitRequest(BaseModel):
     person_associated: str = Field(min_length=1, max_length=64)
 
 
+class JoinUnlockRequest(BaseModel):
+    password: str = Field(min_length=1, max_length=128)
+
+
 class PendingRequestPublic(BaseModel):
     id: int
     status: str

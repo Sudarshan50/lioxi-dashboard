@@ -1,12 +1,11 @@
 import { Clock, Coins, Download, FileDown, Gauge, HandCoins, MessageSquare, Receipt, RefreshCw, Router, Timer, Upload } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import BreakdownBarChart from "@/components/charts/BreakdownBarChart";
 import CostComparisonChart from "@/components/charts/CostComparisonChart";
 import TpmByAccountChart from "@/components/charts/TpmByAccountChart";
 import UsageAreaChart from "@/components/charts/UsageAreaChart";
 import ExportCsvModal from "@/components/dashboard/ExportCsvModal";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import CurrencyToggle from "@/components/ui/CurrencyToggle";
@@ -27,6 +26,7 @@ import {
 import { useEstimateCurrency } from "@/hooks/useEstimateCurrency";
 import { useModels } from "@/hooks/useModels";
 import { convertUsd, formatCurrency, formatDateTime, formatEstimatedCost, formatRate, formatRelative, formatTokens } from "@/lib/format";
+import { toastError, toastSuccess } from "@/lib/toast";
 import { amountPayableUsd, downloadPayableCsv } from "@/lib/payable";
 import { matchesOwner, rollupBreakdownByTag, rollupTpmByTag, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
 
@@ -50,8 +50,6 @@ export default function OverviewPage() {
   const { data: models, isLoading: modelsLoading, isError: modelsError } = useModels();
   const { data: groups, isLoading: groupsLoading, isError: groupsError } = useAccountGroups();
   const { syncAccounts, progress, isSyncing } = useSyncAccounts();
-  const [syncMessage, setSyncMessage] = useState<string | null>(null);
-  const [syncError, setSyncError] = useState<string | null>(null);
   const [isExportOpen, setIsExportOpen] = useState(false);
   const { currency: estimateCurrency, setCurrency: setEstimateCurrency } = useEstimateCurrency();
   const [gatewayView, setGatewayView] = useState<GatewayView>("ALL");
@@ -114,6 +112,18 @@ export default function OverviewPage() {
   }, [accountId, accounts, tpmByAccount.data]);
   const breakdownHint = accountId ? "per account" : "combined by tag (name from endpoint map)";
   const dashboardError = overview.isError || timeseries.isError || tpmByAccount.isError || byAccount.isError || byModel.isError;
+
+  useEffect(() => {
+    if (accountsError || modelsError || groupsError) {
+      toastError("Could not load accounts, models, or groups. Try refreshing the page.", { toastId: "overview-load" });
+    }
+  }, [accountsError, modelsError, groupsError]);
+  useEffect(() => {
+    if (dashboardError) {
+      toastError("Could not load dashboard data. Try refreshing the page.", { toastId: "overview-dash" });
+    }
+  }, [dashboardError]);
+
   const actualCurrency = overview.data?.actual_cost_currency || "INR";
   const tpmByAccountBars = useMemo(
     () =>
@@ -241,28 +251,24 @@ export default function OverviewPage() {
   );
 
   async function handleSync() {
-    setSyncMessage(null);
-    setSyncError(null);
     const ids = scopedAccounts.map((account) => account.id);
     if (ids.length === 0) {
-      setSyncError("No accounts to sync.");
+      toastError("No accounts to sync.");
       return;
     }
     try {
       const result = await syncAccounts(ids);
       const failedNames = (result.failed ?? []).map((item) => item.name).filter((name): name is string => Boolean(name));
       if (result.synced > 0) {
-        setSyncMessage(
-          ids.length === 1 ? "Synced." : `Synced ${result.synced} account${result.synced === 1 ? "" : "s"}.`
-        );
+        toastSuccess(ids.length === 1 ? "Synced." : `Synced ${result.synced} account${result.synced === 1 ? "" : "s"}.`);
       }
       if (failedNames.length > 0) {
-        setSyncError(`Sync failed for ${failedNames.join(", ")}.`);
+        toastError(`Sync failed for ${failedNames.join(", ")}.`);
       } else if (result.failed.length > 0) {
-        setSyncError("Sync failed for one or more accounts.");
+        toastError("Sync failed for one or more accounts.");
       }
     } catch (err: any) {
-      setSyncError(err?.response?.data?.detail ?? "Sync failed.");
+      toastError(err?.response?.data?.detail ?? "Sync failed.");
     }
   }
 
@@ -324,13 +330,6 @@ export default function OverviewPage() {
           )}
         </div>
       </div>
-
-      {syncMessage && <Banner tone="success">{syncMessage}</Banner>}
-      {syncError && <Banner tone="error">{syncError}</Banner>}
-      {(accountsError || modelsError || groupsError) && (
-        <Banner tone="error">Could not load accounts, models, or groups. Try refreshing the page.</Banner>
-      )}
-      {dashboardError && <Banner tone="error">Could not load dashboard data. Try refreshing the page.</Banner>}
 
       <Card>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">

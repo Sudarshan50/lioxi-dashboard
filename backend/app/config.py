@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     kimi_azure_cache_ttl_seconds: int = 900
     submit_session_ttl_seconds: int = 1800
+    join_password: str = ""
 
     google_sheets_spreadsheet_id: str = ""
     google_sheets_tab: str = "Sheet1"

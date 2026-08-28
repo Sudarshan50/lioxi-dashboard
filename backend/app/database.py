@@ -5,7 +5,13 @@ from sqlalchemy.orm import DeclarativeBase
 from app.config import get_settings
 
 settings = get_settings()
-engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+engine = create_async_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    pool_size=10,
+    max_overflow=20,
+    pool_recycle=1800,
+)
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False)
 
 
@@ -70,8 +76,8 @@ async def _ensure_submit_indexes(conn) -> None:
             """
             DELETE FROM sp_submit_requests AS extra
             USING sp_submit_requests AS kept
-            WHERE extra.status IN ('pending_approval', 'creating_sp')
-              AND kept.status IN ('pending_approval', 'creating_sp')
+            WHERE extra.status IN ('pending_approval', 'creating_sp', 'approving')
+              AND kept.status IN ('pending_approval', 'creating_sp', 'approving')
               AND extra.subscription_id IS NOT NULL
               AND btrim(extra.subscription_id) <> ''
               AND lower(extra.subscription_id) = lower(kept.subscription_id)
@@ -79,12 +85,13 @@ async def _ensure_submit_indexes(conn) -> None:
             """
         )
     )
+    await conn.execute(text("DROP INDEX IF EXISTS uq_sp_submit_live_subscription"))
     await conn.execute(
         text(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uq_sp_submit_live_subscription
             ON sp_submit_requests (lower(subscription_id))
-            WHERE status IN ('pending_approval', 'creating_sp')
+            WHERE status IN ('pending_approval', 'creating_sp', 'approving')
               AND subscription_id IS NOT NULL
               AND btrim(subscription_id) <> ''
             """

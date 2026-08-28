@@ -1,7 +1,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/lib/apiClient";
-import { KimiDeleteResponse, KimiDeployProgressEvent, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
+import { KimiContentFilterResponse, KimiDeleteResponse, KimiDeployProgressEvent, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
 
 const DEPLOY_TIMEOUT_MS = 45 * 60 * 1000;
 const KEYS_TIMEOUT_MS = 15 * 60 * 1000;
@@ -208,6 +208,17 @@ export function useKimiUndeploy() {
       void queryClient.invalidateQueries({ queryKey: ["kimi-stored-accounts"] });
       void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
     },
+  });
+}
+
+export function useKimiContentFilter() {
+  return useMutation({
+    mutationFn: async (payload: { accounts: Record<string, string>[]; jobs?: number }) =>
+      (
+        await apiClient.post<KimiContentFilterResponse>("/api/kimi-deploy/content-filter", payload, {
+          timeout: KEYS_TIMEOUT_MS,
+        })
+      ).data,
   });
 }
 

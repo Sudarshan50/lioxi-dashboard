@@ -14,6 +14,7 @@ from app.services.submit_service import (
     approve_request,
     list_pending,
     pending_public,
+    register_approve_task,
     reject_request,
 )
 
@@ -80,6 +81,7 @@ async def pending_approve(
 
     async def events():
         task = asyncio.create_task(run())
+        register_approve_task(request_id, task)
         try:
             while True:
                 try:

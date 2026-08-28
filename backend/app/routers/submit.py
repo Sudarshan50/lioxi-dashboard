@@ -1,26 +1,49 @@
 import asyncio
 import contextlib
+import hmac
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.database import get_db
-from app.schemas.submit import SubmitCommitRequest, SubmitNamesResponse, SubmitSessionCreated, SubmitSessionSnapshot
+from app.schemas.submit import (
+    JoinUnlockRequest,
+    SubmitCommitRequest,
+    SubmitNamesResponse,
+    SubmitSessionCreated,
+    SubmitSessionSnapshot,
+)
 from app.services.submit_service import (
     SubmitError,
+    cancel_session,
     commit_session,
     create_session,
     expire_stale,
     get_request,
     list_owner_names,
     public_snapshot,
+    register_commit_task,
     subscribe,
     unsubscribe,
 )
 
 router = APIRouter(prefix="/api/submit", tags=["submit"])
+
+
+def _join_password_ok(password: str | None) -> bool:
+    expected = (get_settings().join_password or "").encode()
+    got = (password or "").encode()
+    if not expected or len(got) != len(expected):
+        return False
+    return hmac.compare_digest(got, expected)
+
+
+async def require_join_password(x_join_password: str | None = Header(default=None)) -> None:
+    if not _join_password_ok(x_join_password):
+        raise HTTPException(status_code=401, detail="Join password required.")
 
 
 def _sse(events):
@@ -62,9 +85,17 @@ async def _event_stream(session_id: str, db: AsyncSession):
         await unsubscribe(session_id, queue)
 
 
+@router.post("/unlock")
+async def unlock(payload: JoinUnlockRequest) -> dict:
+    if not _join_password_ok(payload.password):
+        raise HTTPException(status_code=401, detail="Wrong password.")
+    return {"ok": True}
+
+
 @router.post("/sessions", response_model=SubmitSessionCreated)
 async def start_session(
     db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_join_password),
     tenant_id: str | None = Query(default=None, max_length=64),
 ) -> SubmitSessionCreated:
     try:
@@ -77,7 +108,11 @@ async def start_session(
 
 
 @router.get("/sessions/{session_id}", response_model=SubmitSessionSnapshot)
-async def session_status(session_id: str, db: AsyncSession = Depends(get_db)) -> SubmitSessionSnapshot:
+async def session_status(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_join_password),
+) -> SubmitSessionSnapshot:
     await expire_stale(db)
     row = await get_request(db, session_id)
     if row is None:
@@ -86,7 +121,11 @@ async def session_status(session_id: str, db: AsyncSession = Depends(get_db)) ->
 
 
 @router.get("/sessions/{session_id}/events")
-async def session_events(session_id: str, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+async def session_events(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_join_password),
+) -> StreamingResponse:
     row = await get_request(db, session_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown submit session.")
@@ -94,7 +133,12 @@ async def session_events(session_id: str, db: AsyncSession = Depends(get_db)) ->
 
 
 @router.post("/sessions/{session_id}/commit")
-async def commit(session_id: str, payload: SubmitCommitRequest, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
+async def commit(
+    session_id: str,
+    payload: SubmitCommitRequest,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_join_password),
+) -> StreamingResponse:
     queue: asyncio.Queue[dict | None] = asyncio.Queue()
 
     async def on_progress(event: dict) -> None:
@@ -118,6 +162,7 @@ async def commit(session_id: str, payload: SubmitCommitRequest, db: AsyncSession
 
     async def events():
         task = asyncio.create_task(run())
+        register_commit_task(session_id, task)
         try:
             while True:
                 try:
@@ -135,6 +180,22 @@ async def commit(session_id: str, payload: SubmitCommitRequest, db: AsyncSession
     return _sse(events())
 
 
+@router.post("/sessions/{session_id}/cancel")
+async def cancel(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_join_password),
+) -> dict:
+    try:
+        await cancel_session(db, session_id)
+    except SubmitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True}
+
+
 @router.get("/names", response_model=SubmitNamesResponse)
-async def names(db: AsyncSession = Depends(get_db)) -> SubmitNamesResponse:
+async def names(
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(require_join_password),
+) -> SubmitNamesResponse:
     return SubmitNamesResponse(names=await list_owner_names(db))

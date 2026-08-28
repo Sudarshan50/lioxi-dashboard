@@ -3,7 +3,6 @@ import { AlertTriangle, Inbox } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
-import Banner from "@/components/ui/Banner";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import EmptyState from "@/components/ui/EmptyState";
@@ -11,6 +10,7 @@ import Spinner from "@/components/ui/Spinner";
 import { invalidateAfterDeploy } from "@/hooks/useKimiDeploy";
 import apiClient from "@/lib/apiClient";
 import { streamPendingApprove } from "@/lib/submitApi";
+import { toastError, toastSuccess } from "@/lib/toast";
 import { KimiDeployProgressEvent, KimiDeployResult, PendingListResponse, PendingSubmitRequest } from "@/types";
 
 type RunProgress = { total: number; done: number; phase: string; message: string; startedAt: number };
@@ -19,7 +19,7 @@ function statusTone(status: string): "info" | "success" | "error" | "warning" | 
   if (status === "pending_approval") return "info";
   if (status === "approved") return "success";
   if (status === "failed" || status === "rejected") return "error";
-  if (status === "creating_sp") return "warning";
+  if (status === "creating_sp" || status === "approving") return "warning";
   return "neutral";
 }
 
@@ -95,6 +95,12 @@ function SubmitCard({
   onApprove?: () => void;
 }) {
   const failed = row.status === "failed";
+  const rolesFailed = failed && row.error_kind === "roles";
+  const deployFailed = failed && row.error_kind === "deploy";
+  const inFlight = row.status === "creating_sp" || row.status === "approving";
+  const canDecline =
+    row.status === "pending_approval" || row.status === "failed" || row.status === "creating_sp";
+  const canApprove = !inFlight && !rolesFailed && Boolean(row.can_retry_deploy && onApprove);
   return (
     <Card className={`flex flex-col gap-4 ${live ? "!border-accent/40 shadow-glow" : failed ? "!border-red-500/25" : ""}`}>
       <div className="flex items-start justify-between gap-3">
@@ -119,8 +125,25 @@ function SubmitCard({
           {row.subscription_name || row.subscription_id || "—"}
         </div>
         {row.subscription_id && <div className="truncate font-mono text-[11px] text-gray-500">{row.subscription_id}</div>}
+        {row.tenant_id && (
+          <div className="truncate">
+            <span className="text-gray-500">Tenant · </span>
+            <span className="font-mono text-[11px] text-gray-500">{row.tenant_id}</span>
+          </div>
+        )}
         {row.billing_error && <div className="text-amber-400">Billing note: {row.billing_error}</div>}
-        {(failed || (row.error_message && row.status !== "pending_approval")) && row.error_message && (
+        {rolesFailed && (
+          <div className="text-amber-300">
+            Azure role assignment failed. Ask them to join again — Retry deploy will not fix missing roles.
+          </div>
+        )}
+        {deployFailed && (
+          <div className="text-amber-300">
+            K3 deploy failed. Retry deploy if Azure grants Kimi access. Clear leftover removes the empty Azure stack
+            and this card.
+          </div>
+        )}
+        {row.error_message && (
           <div className="whitespace-pre-wrap break-words rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-red-300">
             {row.error_message}
           </div>
@@ -133,12 +156,33 @@ function SubmitCard({
         )}
         {deploy && !deploy.ok && deploy.error && <div className="text-red-400">{deploy.error}</div>}
       </dl>
-      {(row.status === "pending_approval" || row.status === "failed") && (
+      {(canDecline || canApprove) && (
         <div className="flex flex-wrap justify-end gap-2">
-          <Button variant="danger" className="px-3 py-1.5 text-xs" disabled={busy} isLoading={declining} onClick={onDecline}>
-            Decline
-          </Button>
-          {row.can_retry_deploy && onApprove && (
+          {canDecline && (
+            <Button
+              variant="danger"
+              className="px-3 py-1.5 text-xs"
+              disabled={busy}
+              isLoading={declining}
+              onClick={() => {
+                if (deployFailed) {
+                  if (
+                    !window.confirm(
+                      "Clear leftover Azure Kimi resources and delete the stored identity? They can join again after this."
+                    )
+                  ) {
+                    return;
+                  }
+                } else if (!window.confirm("Decline this submission and delete the stored identity?")) {
+                  return;
+                }
+                onDecline();
+              }}
+            >
+              {deployFailed ? "Clear leftover" : "Decline"}
+            </Button>
+          )}
+          {canApprove && (
             <Button className="px-3 py-1.5 text-xs" disabled={busy} isLoading={live} onClick={onApprove}>
               {row.status === "failed" ? "Retry deploy" : "Approve"}
             </Button>
@@ -160,7 +204,10 @@ export default function PendingPage() {
   const [progress, setProgress] = useState<RunProgress | null>(null);
   const [now, setNow] = useState(() => Date.now());
   const [results, setResults] = useState<Record<number, KimiDeployResult>>({});
-  const [banner, setBanner] = useState<{ tone: "success" | "error"; text: string } | null>(null);
+
+  useEffect(() => {
+    if (list.isError) toastError("Could not load pending submissions.", { toastId: "pending-load" });
+  }, [list.isError]);
 
   useEffect(() => {
     if (approvingId == null) return;
@@ -170,17 +217,26 @@ export default function PendingPage() {
 
   const reject = useMutation({
     mutationFn: async (id: number) =>
-      (await apiClient.post<{ ok: boolean; deleted_id: number; subscription_id?: string | null }>(`/api/pending/${id}/decline`))
-        .data,
+      (
+        await apiClient.post<{ ok: boolean; deleted_id: number; subscription_id?: string | null }>(
+          `/api/pending/${id}/decline`,
+          undefined,
+          { timeout: 15 * 60 * 1000 }
+        )
+      ).data,
     onMutate: async (id) => {
       await queryClient.cancelQueries({ queryKey: ["pending-submits"] });
       const previous = queryClient.getQueryData<PendingListResponse>(["pending-submits"]);
+      const row = previous?.requests.find((item) => item.id === id);
+      if (row?.error_kind === "deploy") {
+        return { previous };
+      }
       if (previous) {
-        const requests = previous.requests.filter((row) => row.id !== id);
+        const requests = previous.requests.filter((item) => item.id !== id);
         queryClient.setQueryData<PendingListResponse>(["pending-submits"], {
           requests,
-          pending_count: requests.filter((row) => row.status === "pending_approval").length,
-          failed_count: requests.filter((row) => row.status === "failed").length,
+          pending_count: requests.filter((item) => item.status === "pending_approval").length,
+          failed_count: requests.filter((item) => item.status === "failed").length,
         });
       }
       return { previous };
@@ -188,10 +244,15 @@ export default function PendingPage() {
     onError: (exc: unknown, _id, context) => {
       if (context?.previous) queryClient.setQueryData(["pending-submits"], context.previous);
       const detail = (exc as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-      setBanner({ tone: "error", text: typeof detail === "string" ? detail : "Could not decline this request." });
+      toastError(typeof detail === "string" ? detail : "Could not decline this request.");
     },
-    onSuccess: () => {
-      setBanner({ tone: "success", text: "Declined. That Azure subscription can register again at /join." });
+    onSuccess: (_data, id, context) => {
+      const row = context?.previous?.requests.find((item) => item.id === id);
+      toastSuccess(
+        row?.error_kind === "deploy"
+          ? "Leftover Azure Kimi stack cleared. They can join again."
+          : "Declined. They can register again."
+      );
     },
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: ["pending-submits"] });
@@ -200,7 +261,6 @@ export default function PendingPage() {
 
   async function approve(row: PendingSubmitRequest) {
     if (approvingId != null) return;
-    setBanner(null);
     setApprovingId(row.id);
     setProgress({ total: 1, done: 0, phase: "azure", message: "Starting Kimi K3 deploy…", startedAt: Date.now() });
     let failed = false;
@@ -236,14 +296,14 @@ export default function PendingPage() {
         }
         if (event.type === "error") {
           failed = true;
-          setBanner({ tone: "error", text: event.detail || "Approve failed." });
+          toastError(event.detail || "Approve failed.");
         }
       });
       invalidateAfterDeploy(queryClient);
       void queryClient.invalidateQueries({ queryKey: ["pending-submits"] });
-      if (!failed) setBanner({ tone: "success", text: "Deploy finished." });
+      if (!failed) toastSuccess("Deploy finished.");
     } catch (exc) {
-      setBanner({ tone: "error", text: exc instanceof Error ? exc.message : "Approve failed." });
+      toastError(exc instanceof Error ? exc.message : "Approve failed.");
     } finally {
       setApprovingId(null);
     }
@@ -251,21 +311,24 @@ export default function PendingPage() {
 
   const rows = list.data?.requests ?? [];
   const waiting = useMemo(() => rows.filter((row) => row.status === "pending_approval"), [rows]);
+  const inflight = useMemo(
+    () => rows.filter((row) => row.status === "creating_sp" || row.status === "approving"),
+    [rows]
+  );
   const failedRows = useMemo(() => rows.filter((row) => row.status === "failed"), [rows]);
   const approvedRows = useMemo(() => rows.filter((row) => row.status === "approved"), [rows]);
   const busy = approvingId != null || reject.isPending;
-  const empty = !list.isLoading && waiting.length === 0 && failedRows.length === 0 && approvedRows.length === 0;
+  const empty = !list.isLoading && waiting.length === 0 && inflight.length === 0 && failedRows.length === 0 && approvedRows.length === 0;
 
   return (
     <div className="flex flex-col gap-5">
       <div>
         <h1 className="gradient-title text-2xl font-semibold tracking-tight">Pending</h1>
         <p className="mt-1 text-sm text-gray-500">
-          Approve runs Kimi K3. If /join fails, they can Try again without waiting for Decline. Decline only dismisses the error
-          card. Network blips are not stored.
+          Approve runs Kimi K3. If deploy fails (quota / model access), Retry deploy reuses the stored identity. Clear leftover
+          deletes the empty Azure stack and this card so they can /join again.
         </p>
       </div>
-      {banner && <Banner tone={banner.tone}>{banner.text}</Banner>}
       {progress && approvingId != null && (
         <ProgressBar
           progress={progress}
@@ -289,12 +352,12 @@ export default function PendingPage() {
             <section className="flex flex-col gap-3">
               <div className="flex items-center gap-2">
                 <AlertTriangle size={16} className="text-red-400" />
-                <h2 className="text-sm font-semibold text-gray-100">Join / account errors</h2>
+                <h2 className="text-sm font-semibold text-gray-100">Join / deploy errors</h2>
                 <Badge tone="error">{failedRows.length}</Badge>
               </div>
               <p className="text-xs text-gray-500">
-                Azure or identity failures from /join or Approve. Retry deploy if the monitor identity is still stored.
-                Otherwise the user can reapply at /join. Decline removes this card.
+                Retry deploy if K3 failed after the identity was stored (quota/model access). Clear leftover deletes the
+                empty Azure stack and this card. Role failures need /join again.
               </p>
               <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                 {failedRows.map((row) => (
@@ -317,10 +380,21 @@ export default function PendingPage() {
               <h2 className="text-sm font-semibold text-gray-100">Ready to approve</h2>
               <Badge tone="info">{waiting.length}</Badge>
             </div>
-            {waiting.length === 0 ? (
+            {waiting.length === 0 && inflight.length === 0 ? (
               <p className="text-xs text-gray-500">No submissions waiting for K3 deploy.</p>
             ) : (
               <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
+                {inflight.map((row) => (
+                  <SubmitCard
+                    key={row.id}
+                    row={row}
+                    deploy={results[row.id]}
+                    live={approvingId === row.id}
+                    busy={busy}
+                    declining={reject.isPending && reject.variables === row.id}
+                    onDecline={() => reject.mutate(row.id)}
+                  />
+                ))}
                 {waiting.map((row) => (
                   <SubmitCard
                     key={row.id}

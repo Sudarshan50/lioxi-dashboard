@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+import httpx
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,22 +43,42 @@ STATUS_LOGIN_STARTED = "login_started"
 STATUS_LOGGED_IN = "logged_in"
 STATUS_CREATING_SP = "creating_sp"
 STATUS_PENDING = "pending_approval"
+STATUS_APPROVING = "approving"
 STATUS_APPROVED = "approved"
 STATUS_REJECTED = "rejected"
 STATUS_FAILED = "failed"
 STATUS_EXPIRED = "expired"
 
-OPEN_LOGIN = {STATUS_LOGIN_STARTED, STATUS_LOGGED_IN, STATUS_CREATING_SP}
+OPEN_LOGIN = {STATUS_LOGIN_STARTED, STATUS_LOGGED_IN}
 TERMINAL = {STATUS_APPROVED, STATUS_REJECTED, STATUS_FAILED, STATUS_EXPIRED}
-LIVE_SUB_STATUSES = (STATUS_PENDING, STATUS_CREATING_SP)
+LIVE_SUB_STATUSES = (STATUS_PENDING, STATUS_CREATING_SP, STATUS_APPROVING)
 DUPLICATE_SUB_MESSAGE = (
     "This Azure subscription is already submitted. An admin must decline it before you can register again."
 )
+ALREADY_ONBOARDED_MESSAGE = "This Azure subscription is already in the portal."
 
 SP_NAME = "usage-and-credits-monitor"
-PENDING_KEEP_DAYS = 7
+CREATING_SP_MAX_AGE = timedelta(minutes=25)
+APPROVING_MAX_AGE = timedelta(minutes=45)
+_DEFAULT_ADMIN_ROLES = [
+    "Contributor",
+    "Cognitive Services Contributor",
+    "Foundry Owner",
+    "Foundry User",
+    "Azure AI Developer",
+]
+_TOKEN_SCOPE = "https://management.azure.com/.default"
 ERROR_KIND_ACCOUNT = "account"
 ERROR_KIND_NETWORK = "network"
+ERROR_KIND_ROLES = "roles"
+ERROR_KIND_DEPLOY = "deploy"
+_INVALID_SECRET_MARKERS = (
+    "aadsts7000215",
+    "aadsts7000222",
+    "aadsts7000218",
+    "invalid_client",
+    "invalid client secret",
+)
 
 _NETWORK_MARKERS = (
     "etimedout",
@@ -88,11 +109,16 @@ _SKIP_MARKERS = (
     "finish azure sign-in",
     "enter a name",
     "name tag must be",
+    "cancelled",
 )
 
 _buses: dict[str, list[asyncio.Queue[dict | None]]] = {}
 _bus_guard = asyncio.Lock()
 _login_tasks: dict[str, asyncio.Task] = {}
+_commit_tasks: dict[str, asyncio.Task] = {}
+_approve_tasks: dict[int, asyncio.Task] = {}
+_aborted_sessions: set[str] = set()
+_aborted_approvals: set[int] = set()
 
 
 class SubmitError(RuntimeError):
@@ -167,7 +193,10 @@ def pending_public(row: SpSubmitRequest) -> PendingRequestPublic:
             and row.client_id
             and row.tenant_id
             and row.subscription_id
-            and row.status in {STATUS_PENDING, STATUS_FAILED}
+            and (
+                row.status == STATUS_PENDING
+                or (row.status == STATUS_FAILED and row.error_kind == ERROR_KIND_DEPLOY)
+            )
         ),
     )
 
@@ -220,6 +249,63 @@ async def unsubscribe(session_id: str, queue: asyncio.Queue[dict | None]) -> Non
             _buses.pop(sid, None)
 
 
+def _sid(session_id: str | None) -> str:
+    return (session_id or "").strip().lower()
+
+
+def register_commit_task(session_id: str, task: asyncio.Task) -> None:
+    sid = _sid(session_id)
+    _aborted_sessions.discard(sid)
+    _commit_tasks[sid] = task
+    task.add_done_callback(lambda _t, key=sid: _commit_tasks.pop(key, None))
+
+
+def register_approve_task(request_id: int, task: asyncio.Task) -> None:
+    _aborted_approvals.discard(request_id)
+    _approve_tasks[request_id] = task
+    task.add_done_callback(lambda _t, key=request_id: _approve_tasks.pop(key, None))
+
+
+def _session_has_work(session_id: str | None) -> bool:
+    sid = _sid(session_id)
+    login = _login_tasks.get(sid)
+    commit = _commit_tasks.get(sid)
+    return (login is not None and not login.done()) or (commit is not None and not commit.done())
+
+
+def _approve_has_work(request_id: int) -> bool:
+    task = _approve_tasks.get(request_id)
+    return task is not None and not task.done()
+
+
+def session_aborted(session_id: str | None) -> bool:
+    return _sid(session_id) in _aborted_sessions
+
+
+def approve_aborted(request_id: int) -> bool:
+    return request_id in _aborted_approvals
+
+
+def _cancel_task(task: asyncio.Task | None) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+
+
+async def abort_session_work(session_id: str | None) -> None:
+    sid = _sid(session_id)
+    if not sid:
+        return
+    _aborted_sessions.add(sid)
+    _cancel_task(_login_tasks.pop(sid, None))
+    _cancel_task(_commit_tasks.pop(sid, None))
+    await drop_az_session(sid)
+
+
+async def abort_approve_work(request_id: int) -> None:
+    _aborted_approvals.add(request_id)
+    _cancel_task(_approve_tasks.pop(request_id, None))
+
+
 async def get_request(db: AsyncSession, session_id: str) -> SpSubmitRequest | None:
     result = await db.execute(select(SpSubmitRequest).where(SpSubmitRequest.session_id == session_id))
     return result.scalar_one_or_none()
@@ -251,8 +337,8 @@ async def _discard_failed_for_subscription(
     db: AsyncSession,
     subscription_id: str,
     exclude_id: int | None = None,
+    inherit_into: SpSubmitRequest | None = None,
 ) -> None:
-    """Failed attempts must not block a new join. Drop them so the user can reapply."""
     wanted = subscription_id.strip().lower()
     if not wanted:
         return
@@ -263,7 +349,14 @@ async def _discard_failed_for_subscription(
     if exclude_id is not None:
         stmt = stmt.where(SpSubmitRequest.id != exclude_id)
     for old in (await db.execute(stmt)).scalars():
-        _wipe_secret(old)
+        if (
+            inherit_into is not None
+            and old.client_secret_encrypted
+            and not inherit_into.client_secret_encrypted
+        ):
+            inherit_into.client_id = old.client_id
+            inherit_into.client_secret_encrypted = old.client_secret_encrypted
+            inherit_into.sp_display_name = old.sp_display_name or inherit_into.sp_display_name
         await drop_az_session(old.session_id)
         await db.delete(old)
 
@@ -281,24 +374,6 @@ async def list_owner_names(db: AsyncSession) -> list[str]:
             if value:
                 names.add(value)
     return sorted(names, key=lambda item: item.lower())
-
-
-async def _owned_app_ids(db: AsyncSession) -> set[str]:
-    ids: set[str] = set()
-    for (cid,) in (await db.execute(select(AzureServicePrincipal.client_id))).all():
-        if cid:
-            ids.add(cid.strip().lower())
-    for (cid,) in (
-        await db.execute(
-            select(SpSubmitRequest.client_id).where(
-                SpSubmitRequest.client_id.isnot(None),
-                SpSubmitRequest.status.notin_([STATUS_REJECTED, STATUS_EXPIRED]),
-            )
-        )
-    ).all():
-        if cid:
-            ids.add(str(cid).strip().lower())
-    return ids
 
 
 def _wipe_secret(row: SpSubmitRequest) -> None:
@@ -325,13 +400,14 @@ async def apply_submit_failure(
     message: str,
     *,
     keep_network: bool = False,
+    error_kind: str | None = None,
 ) -> str | None:
-    """Persist account errors; delete in-flight rows for network/user-abort unless keep_network."""
-    kind = classify_submit_error(message)
+    kind = error_kind or classify_submit_error(message)
     detail = scrub_az_text(message)[:800]
     session_id = row.session_id
-    if kind != ERROR_KIND_ACCOUNT and not keep_network:
-        _wipe_secret(row)
+    has_identity = bool(row.client_secret_encrypted)
+    keep_kinds = {ERROR_KIND_ACCOUNT, ERROR_KIND_ROLES, ERROR_KIND_DEPLOY}
+    if kind not in keep_kinds and not keep_network and not has_identity:
         await drop_az_session(session_id)
         await db.delete(row)
         await db.commit()
@@ -339,7 +415,8 @@ async def apply_submit_failure(
     row.status = STATUS_FAILED
     row.error_kind = kind or ERROR_KIND_ACCOUNT
     row.error_message = detail or "Submission failed."
-    _wipe_secret(row)
+    if not has_identity:
+        _wipe_secret(row)
     row.az_config_dir = None
     await db.commit()
     await drop_az_session(session_id)
@@ -349,7 +426,6 @@ async def apply_submit_failure(
 async def expire_stale(db: AsyncSession) -> int:
     now = _utcnow()
     login_cutoff = now - timedelta(seconds=_ttl_seconds())
-    pending_cutoff = now - timedelta(days=PENDING_KEEP_DAYS)
     rows = (
         await db.execute(
             select(SpSubmitRequest).where(
@@ -358,23 +434,50 @@ async def expire_stale(db: AsyncSession) -> int:
                         SpSubmitRequest.status.in_(tuple(OPEN_LOGIN)),
                         SpSubmitRequest.updated_at < login_cutoff,
                     ),
-                    and_(
-                        SpSubmitRequest.status == STATUS_PENDING,
-                        SpSubmitRequest.updated_at < pending_cutoff,
-                    ),
+                    SpSubmitRequest.status.in_((STATUS_CREATING_SP, STATUS_APPROVING)),
                 )
             )
         )
     ).scalars()
     count = 0
     for row in rows:
+        if row.status == STATUS_CREATING_SP:
+            if _session_has_work(row.session_id):
+                continue
+            age = (now - (row.updated_at or now)) if row.updated_at else CREATING_SP_MAX_AGE
+            if age < CREATING_SP_MAX_AGE:
+                continue
+            await abort_session_work(row.session_id)
+            await apply_submit_failure(
+                db,
+                row,
+                "Interrupted. The server restarted or identity setup timed out. Sign in again at /join.",
+                keep_network=True,
+                error_kind=ERROR_KIND_ROLES,
+            )
+            await _publish(row.session_id, {"type": "error", "detail": row.error_message or "Interrupted."})
+            count += 1
+            continue
+        if row.status == STATUS_APPROVING:
+            if _approve_has_work(row.id):
+                continue
+            age = (now - (row.updated_at or now)) if row.updated_at else APPROVING_MAX_AGE
+            if age < APPROVING_MAX_AGE:
+                continue
+            await abort_approve_work(row.id)
+            await apply_submit_failure(
+                db,
+                row,
+                "Interrupted. The server restarted or deploy timed out. Use Retry deploy.",
+                keep_network=True,
+                error_kind=ERROR_KIND_DEPLOY,
+            )
+            count += 1
+            continue
         _wipe_secret(row)
         row.status = STATUS_EXPIRED
         row.error_message = row.error_message or "Session expired."
-        task = _login_tasks.pop((row.session_id or "").lower(), None)
-        if task is not None and not task.done():
-            task.cancel()
-        await drop_az_session(row.session_id)
+        await abort_session_work(row.session_id)
         row.az_config_dir = None
         count += 1
         await _publish(row.session_id, {"type": "error", "detail": "Session expired. Start again."})
@@ -426,8 +529,12 @@ async def _run_login(session_id: str, tenant_id: str | None = None) -> None:
                 row = await get_request(db, session_id)
                 if row is None:
                     return
-                row.device_user_code = str(event.get("user_code") or "")[:32] or None
-                row.device_verification_uri = str(event.get("verification_uri") or "")[:256] or None
+                code = str(event.get("user_code") or "").strip()[:32]
+                uri = str(event.get("verification_uri") or "").strip()[:256]
+                if code:
+                    row.device_user_code = code
+                if uri:
+                    row.device_verification_uri = uri
                 await db.commit()
         await _publish(session_id, event)
 
@@ -529,10 +636,19 @@ async def commit_session(
     if match is None:
         raise SubmitError("That subscription is not on this Azure login.")
 
+    wanted_sub = match.subscription_id.strip().lower()
+    existing_account = (
+        await db.execute(
+            select(ProviderAccount.id).where(func.lower(ProviderAccount.subscription_id) == wanted_sub).limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing_account is not None:
+        raise SubmitError(ALREADY_ONBOARDED_MESSAGE)
+
     existing_pending = await live_request_for_subscription(db, match.subscription_id, exclude_id=row.id)
     if existing_pending is not None:
         raise SubmitError(DUPLICATE_SUB_MESSAGE)
-    await _discard_failed_for_subscription(db, match.subscription_id, exclude_id=row.id)
+    await _discard_failed_for_subscription(db, match.subscription_id, exclude_id=row.id, inherit_into=row)
 
     mod = load_deploy_module()
     slug = mod.slugify(person)
@@ -572,8 +688,18 @@ async def commit_session(
     await emit({"type": "phase", "phase": "sp", "message": "Creating monitor identity…"})
     try:
         await _provision_sp(db, row, slug, emit)
+    except asyncio.CancelledError:
+        try:
+            await db.refresh(row)
+            if row.status == STATUS_CREATING_SP:
+                await apply_submit_failure(db, row, "Cancelled.", keep_network=True)
+                await emit({"type": "error", "detail": "Cancelled."})
+        except Exception:
+            logger.debug("submit cancel already applied session=%s", session_id, exc_info=True)
+        raise
     except (AzCliError, SubmitError) as exc:
-        await apply_submit_failure(db, row, str(exc), keep_network=True)
+        kind = ERROR_KIND_ROLES if "required admin roles" in str(exc).lower() else None
+        await apply_submit_failure(db, row, str(exc), keep_network=True, error_kind=kind)
         await emit({"type": "error", "detail": str(exc)})
         raise SubmitError(str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
@@ -582,6 +708,9 @@ async def commit_session(
         await emit({"type": "error", "detail": detail})
         raise SubmitError(detail) from exc
 
+    await db.refresh(row)
+    if row.status != STATUS_PENDING:
+        return row
     await emit(
         {
             "type": "done",
@@ -590,6 +719,42 @@ async def commit_session(
         }
     )
     return row
+
+
+async def _verify_sp_secret(tenant_id: str, client_id: str, secret: str) -> str:
+    tid = (tenant_id or "").strip()
+    cid = (client_id or "").strip()
+    pwd = (secret or "").strip()
+    if not tid or not cid or not pwd:
+        return "invalid"
+    url = f"https://login.microsoftonline.com/{tid}/oauth2/v2.0/token"
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                url,
+                data={
+                    "client_id": cid,
+                    "client_secret": pwd,
+                    "grant_type": "client_credentials",
+                    "scope": _TOKEN_SCOPE,
+                },
+            )
+    except httpx.HTTPError:
+        return "unknown"
+    if response.status_code == 200:
+        return "ok"
+    body = (response.text or "").lower()
+    if response.status_code in {400, 401} and any(marker in body for marker in _INVALID_SECRET_MARKERS):
+        return "invalid"
+    return "unknown"
+
+
+async def _ensure_still_creating(db: AsyncSession, row: SpSubmitRequest) -> None:
+    if session_aborted(row.session_id):
+        raise asyncio.CancelledError
+    await db.refresh(row)
+    if row.status != STATUS_CREATING_SP:
+        raise asyncio.CancelledError
 
 
 async def _provision_sp(
@@ -604,21 +769,50 @@ async def _provision_sp(
     await az.set_subscription(sub)
 
     stored = (
-        await db.execute(select(AzureServicePrincipal).where(AzureServicePrincipal.subscription_id == sub))
+        await db.execute(
+            select(AzureServicePrincipal).where(func.lower(AzureServicePrincipal.subscription_id) == sub.strip().lower())
+        )
     ).scalar_one_or_none()
-    owned = await _owned_app_ids(db)
     box = get_secret_box()
     secret: str | None = None
     app_id: str | None = None
     sp_name = SP_NAME
+    reused = False
 
-    if stored is not None:
+    if row.client_id and row.client_secret_encrypted:
+        app_id = row.client_id
+        secret = box.decrypt(row.client_secret_encrypted)
+        sp_name = row.sp_display_name or SP_NAME
+        reused = True
+        await emit({"type": "phase", "phase": "sp", "message": "Reusing this subscription’s monitor identity…"})
+    elif stored is not None:
         app_id = stored.client_id
         secret = box.decrypt(stored.client_secret_encrypted)
         sp_name = stored.name or SP_NAME
+        reused = True
         await emit({"type": "phase", "phase": "sp", "message": "Reusing this subscription’s monitor identity…"})
     else:
-        app_id, secret, sp_name = await _create_or_name_sp(az, slug, owned, emit)
+        app_id, secret, sp_name, reused = await _create_or_name_sp(az, db, sub, slug, emit)
+
+    if reused:
+        verdict = await _verify_sp_secret(str(row.tenant_id or ""), str(app_id or ""), str(secret or ""))
+        if verdict == "invalid":
+            await emit({"type": "phase", "phase": "sp", "message": "Stored secret was rejected by Microsoft. Rotating this app only…"})
+            secret = await az.reset_sp_password(app_id)
+        elif verdict == "unknown":
+            await emit(
+                {
+                    "type": "phase",
+                    "phase": "sp",
+                    "message": "Could not verify the stored secret (network). Reusing it without rotating.",
+                }
+            )
+
+    await _ensure_still_creating(db, row)
+    row.client_id = app_id
+    row.client_secret_encrypted = box.encrypt(secret)
+    row.sp_display_name = sp_name
+    await db.commit()
 
     oid = await az.sp_object_id(app_id)
     if stored is None and oid:
@@ -626,20 +820,23 @@ async def _provision_sp(
     await emit({"type": "phase", "phase": "roles", "message": "Assigning Azure roles…"})
     mod = load_deploy_module()
     roles: list[str] = list(getattr(mod, "ALL_ROLES", []))
+    admin_roles = set(getattr(mod, "ADMIN_ROLES", _DEFAULT_ADMIN_ROLES))
     if "Contributor" in roles:
         roles = ["Contributor"] + [item for item in roles if item != "Contributor"]
-    assigned: list[str] = []
-    failed: list[str] = []
+    failed_by_role: dict[str, str] = {}
     for role in roles:
+        if session_aborted(row.session_id):
+            raise asyncio.CancelledError
         await emit({"type": "phase", "phase": "roles", "message": f"Assigning {role}…"})
         ok, err = await az.assign_role(app_id, role, sub, object_id=oid, timeout=90 if role == "Contributor" else 45)
-        if ok:
-            assigned.append(role)
-        else:
-            failed.append(f"{role}: {err}")
+        if not ok:
+            failed_by_role[role] = err or "assignment failed"
 
-    if "Contributor" not in assigned:
-        raise SubmitError("Could not assign Contributor on this subscription. " + "; ".join(failed)[:800])
+    admin_failed = [f"{role}: {err}" for role, err in failed_by_role.items() if role in admin_roles]
+    if admin_failed:
+        raise SubmitError(
+            "Could not assign required admin roles on this subscription. " + "; ".join(admin_failed)[:800]
+        )
 
     billing_err = None
     tenant = str(row.tenant_id or "")
@@ -649,14 +846,12 @@ async def _provision_sp(
         if not ok:
             billing_err = err
 
-    row.client_id = app_id
-    row.client_secret_encrypted = box.encrypt(secret)
-    row.sp_display_name = sp_name
+    await _ensure_still_creating(db, row)
     row.billing_error = billing_err
     row.status = STATUS_PENDING
-    if failed:
-        note = "Some roles could not be assigned: " + "; ".join(failed)[:800]
-        row.error_message = note
+    viewer_failed = [f"{role}: {err}" for role, err in failed_by_role.items() if role not in admin_roles]
+    if viewer_failed:
+        row.error_message = "Some roles could not be assigned: " + "; ".join(viewer_failed)[:800]
     await db.commit()
     await drop_az_session(row.session_id)
     row.az_config_dir = None
@@ -665,22 +860,51 @@ async def _provision_sp(
 
 async def _create_or_name_sp(
     az,
+    db: AsyncSession,
+    subscription_id: str,
     slug: str,
-    owned: set[str],
     emit: ProgressFn,
-) -> tuple[str, str, str]:
-    async def take(name: str) -> tuple[str, str, str] | None:
+) -> tuple[str, str, str, bool]:
+    wanted_sub = (subscription_id or "").strip().lower()
+    box = get_secret_box()
+
+    async def take(name: str) -> tuple[str, str, str, bool] | None:
         existing = await az.list_sps_by_name(name)
         if not existing:
             await emit({"type": "phase", "phase": "sp", "message": f"Creating {name}…"})
             app_id, secret = await az.create_sp(name)
-            return app_id, secret, name
+            return app_id, secret, name, False
         app_id = str(existing[0].get("appId") or "").strip()
-        if app_id.lower() in owned:
-            await emit({"type": "phase", "phase": "sp", "message": "Rotating a monitor identity this portal already owns…"})
-            secret = await az.reset_sp_password(app_id)
-            return app_id, secret, name
-        return None
+        if not app_id:
+            return None
+        sp_row = (
+            await db.execute(
+                select(AzureServicePrincipal).where(func.lower(AzureServicePrincipal.client_id) == app_id.lower())
+            )
+        ).scalars().first()
+        if sp_row is not None:
+            sp_sub = (sp_row.subscription_id or "").strip().lower()
+            if sp_sub != wanted_sub:
+                return None
+            secret = box.decrypt(sp_row.client_secret_encrypted)
+            await emit({"type": "phase", "phase": "sp", "message": "Reusing this subscription’s monitor identity…"})
+            return app_id, secret, sp_row.name or name, True
+        pending_row = (
+            await db.execute(
+                select(SpSubmitRequest).where(
+                    func.lower(SpSubmitRequest.client_id) == app_id.lower(),
+                    SpSubmitRequest.client_secret_encrypted.is_not(None),
+                )
+            )
+        ).scalars().first()
+        if pending_row is None:
+            return None
+        pending_sub = (pending_row.subscription_id or "").strip().lower()
+        if pending_sub != wanted_sub:
+            return None
+        secret = box.decrypt(pending_row.client_secret_encrypted)
+        await emit({"type": "phase", "phase": "sp", "message": "Reusing this subscription’s monitor identity…"})
+        return app_id, secret, pending_row.sp_display_name or name, True
 
     taken = await take(SP_NAME)
     if taken:
@@ -693,7 +917,7 @@ async def _create_or_name_sp(
     fallback = f"{SP_NAME}-{slug}-{suffix}"[:120]
     await emit({"type": "phase", "phase": "sp", "message": f"Creating {fallback}…"})
     app_id, secret = await az.create_sp(fallback)
-    return app_id, secret, fallback
+    return app_id, secret, fallback, False
 
 
 def deploy_payload_from_row(row: SpSubmitRequest, secret: str) -> dict[str, str]:
@@ -717,12 +941,16 @@ async def list_pending(db: AsyncSession) -> list[SpSubmitRequest]:
             select(SpSubmitRequest)
             .where(
                     or_(
-                        SpSubmitRequest.status == STATUS_PENDING,
+                        SpSubmitRequest.status.in_(
+                            (STATUS_PENDING, STATUS_CREATING_SP, STATUS_APPROVING)
+                        ),
                         and_(
                             SpSubmitRequest.status == STATUS_FAILED,
                             or_(
                                 SpSubmitRequest.error_kind.is_(None),
-                                SpSubmitRequest.error_kind == ERROR_KIND_ACCOUNT,
+                                SpSubmitRequest.error_kind.in_(
+                                    (ERROR_KIND_ACCOUNT, ERROR_KIND_ROLES, ERROR_KIND_DEPLOY)
+                                ),
                             ),
                         ),
                         and_(
@@ -753,6 +981,27 @@ async def reject_request(db: AsyncSession, request_id: int) -> tuple[int, str | 
     deleted_id = row.id
     subscription_id = row.subscription_id
     session_id = row.session_id
+    await abort_session_work(session_id)
+    leftover_error: str | None = None
+    if row.client_secret_encrypted and row.client_id and row.tenant_id and row.subscription_id:
+        try:
+            from app.services.kimi_deploy_service import delete_accounts
+
+            secret = get_secret_box().decrypt(row.client_secret_encrypted)
+            results = await delete_accounts([deploy_payload_from_row(row, secret)], jobs=1)
+            if results and not results[0].ok:
+                leftover_error = results[0].error or "Azure leftover delete did not complete."
+        except Exception as exc:
+            leftover_error = str(exc)[:400]
+            logger.exception("Could not remove leftover Kimi stack for submit %s", deleted_id)
+        if leftover_error and (row.error_kind == ERROR_KIND_DEPLOY or row.status == STATUS_FAILED):
+            raise SubmitError(
+                "Could not remove leftover Azure Kimi resources. The card is still here — try Clear leftover again. "
+                + leftover_error
+            )
+    from app.services.service_principal_store import drop_orphan_service_principal
+
+    await drop_orphan_service_principal(db, subscription_id)
     _wipe_secret(row)
     await drop_az_session(session_id)
     await db.delete(row)
@@ -771,17 +1020,25 @@ async def approve_request(
 ) -> list[Any]:
     from app.services.kimi_deploy_service import KimiDeployError, deploy_accounts
 
-    row = await get_request_by_id(db, request_id)
+    row = (
+        await db.execute(select(SpSubmitRequest).where(SpSubmitRequest.id == request_id).with_for_update())
+    ).scalar_one_or_none()
     if row is None:
         raise SubmitError("Unknown pending request.")
+    if row.status == STATUS_APPROVING:
+        raise SubmitError("This submission is already being approved.")
     if row.status not in {STATUS_PENDING, STATUS_FAILED}:
         raise SubmitError("Only pending submissions can be approved.")
+    if row.status == STATUS_FAILED and row.error_kind != ERROR_KIND_DEPLOY:
+        raise SubmitError("This failure cannot be retried with Retry deploy. Ask them to join again.")
     if not row.client_secret_encrypted or not row.client_id or not row.subscription_id or not row.tenant_id:
         raise SubmitError("This request is missing a stored identity. Ask the user to submit again.")
 
     secret = get_secret_box().decrypt(row.client_secret_encrypted)
     payload = deploy_payload_from_row(row, secret)
-    await persist_service_principals(db, [payload])
+    row.status = STATUS_APPROVING
+    await db.commit()
+
     try:
         results = await deploy_accounts(
             [payload],
@@ -790,23 +1047,66 @@ async def approve_request(
             new_api_priority=new_api_priority,
             new_api_weight=new_api_weight,
             on_progress=on_progress,
+            persist_principals=False,
         )
+    except asyncio.CancelledError:
+        current = await get_request_by_id(db, request_id)
+        if current is not None and current.status == STATUS_APPROVING:
+            await apply_submit_failure(
+                db,
+                current,
+                "Deploy was cancelled.",
+                keep_network=True,
+                error_kind=ERROR_KIND_DEPLOY,
+            )
+        raise
     except KimiDeployError as exc:
+        await db.refresh(row)
+        if approve_aborted(request_id) or row.status != STATUS_APPROVING:
+            raise SubmitError("This submission is no longer being approved.") from exc
         row.status = STATUS_FAILED
-        row.error_kind = classify_submit_error(str(exc)) or ERROR_KIND_ACCOUNT
+        row.error_kind = ERROR_KIND_DEPLOY
         row.error_message = scrub_az_text(str(exc))[:800]
         await db.commit()
         raise SubmitError(str(exc)) from exc
 
+    await db.refresh(row)
+    if approve_aborted(request_id) or row.status != STATUS_APPROVING:
+        return results
     ok = bool(results and results[0].ok)
-    row.status = STATUS_APPROVED if ok else STATUS_FAILED
-    row.approved_at = _utcnow() if ok else None
-    if not ok:
-        detail = (results[0].error if results else None) or "Deploy failed."
-        row.error_kind = classify_submit_error(detail) or ERROR_KIND_ACCOUNT
-        row.error_message = scrub_az_text(detail)[:800]
-    else:
+    if ok:
+        await persist_service_principals(db, [payload])
+        await db.refresh(row)
+        if approve_aborted(request_id) or row.status != STATUS_APPROVING:
+            return results
+        row.status = STATUS_APPROVED
+        row.approved_at = _utcnow()
         row.error_message = None
         row.error_kind = None
+        _wipe_secret(row)
+    else:
+        row.status = STATUS_FAILED
+        row.approved_at = None
+        detail = (results[0].error if results else None) or "Deploy failed."
+        row.error_kind = ERROR_KIND_DEPLOY
+        mod = load_deploy_module()
+        humanize = getattr(mod, "humanize_kimi_deploy_error", None)
+        if callable(humanize):
+            detail = humanize(detail)
+        row.error_message = scrub_az_text(detail)[:800]
     await db.commit()
     return results
+
+
+async def cancel_session(db: AsyncSession, session_id: str) -> None:
+    row = await get_request(db, session_id)
+    if row is None:
+        raise SubmitError("Unknown submit session.")
+    if row.status not in {STATUS_LOGIN_STARTED, STATUS_LOGGED_IN, STATUS_CREATING_SP}:
+        raise SubmitError("This session cannot be cancelled.")
+    sid = row.session_id
+    await abort_session_work(sid)
+    await db.refresh(row)
+    if row.status in {STATUS_LOGIN_STARTED, STATUS_LOGGED_IN, STATUS_CREATING_SP}:
+        await apply_submit_failure(db, row, "Cancelled.")
+    await _publish(sid, {"type": "error", "detail": "Cancelled."})

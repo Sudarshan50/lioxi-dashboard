@@ -52,7 +52,23 @@ DEPLOYMENT_NAME = "FW-Kimi-K3"
 API_VERSION = "2023-05-01"
 DEPLOY_API_VERSION = "2024-10-01"
 FIREWORKS_FEATURE = "Fireworks.EnableDeploy"
-DEFAULT_FIREWORKS_CAP = 500
+RAI_POLICY_NAME = "LioxiCustom"
+RAI_POLICY_API = "2024-10-01"
+RAI_CONTENT_FILTERS = [
+    {"name": "Violence", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Prompt", "action": "NONE"},
+    {"name": "Hate", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Prompt", "action": "NONE"},
+    {"name": "Sexual", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Prompt", "action": "NONE"},
+    {"name": "Selfharm", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Prompt", "action": "NONE"},
+    {"name": "Jailbreak", "blocking": False, "enabled": False, "source": "Prompt", "action": "NONE"},
+    {"name": "Indirect Attack", "blocking": False, "enabled": False, "source": "Prompt", "action": "NONE"},
+    {"name": "Indirect Attack Spotlighting", "blocking": False, "enabled": False, "source": "Prompt", "action": "NONE"},
+    {"name": "Violence", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Completion", "action": "NONE"},
+    {"name": "Hate", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Completion", "action": "NONE"},
+    {"name": "Sexual", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Completion", "action": "NONE"},
+    {"name": "Selfharm", "blocking": True, "enabled": True, "severityThreshold": "High", "source": "Completion", "action": "NONE"},
+    {"name": "Protected Material Text", "blocking": False, "enabled": False, "source": "Completion", "action": "NONE"},
+    {"name": "Protected Material Code", "blocking": False, "enabled": False, "source": "Completion", "action": "NONE"},
+]
 
 VIEWER_ROLES = [
     "Reader",
@@ -309,6 +325,11 @@ def arm_json(
         return 0, str(exc)
 
 
+def _role_already_assigned(err: str) -> bool:
+    text = (err or "").lower()
+    return "already exists" in text or "roleassignmentexists" in text
+
+
 def assign_role_arm(
     env: dict[str, str] | None,
     object_id: str,
@@ -402,10 +423,29 @@ def retry(fn, attempts: int = 8, delay: float = 8.0, desc: str = "operation"):
                     "timeout",
                 )
             )
-            if not retryable or i == attempts - 1:
+            if model_unavailable(msg) or not retryable or i == attempts - 1:
                 raise
             time.sleep(delay * (1.2 ** i))
-    raise last  # pragma: no cover
+    raise last  # type: ignore[misc]
+
+
+def model_unavailable(err: str) -> bool:
+    text = (err or "").lower()
+    return (
+        "specialfeatureorquotaidrequired" in text
+        or "does not have access to this model" in text
+        or "fireworks datazonestandard quota is 0" in text
+    )
+
+
+def humanize_kimi_deploy_error(err: str) -> str:
+    if model_unavailable(err):
+        return (
+            "This Azure subscription cannot deploy FW-Kimi-K3. Microsoft has not enabled "
+            "Fireworks Kimi on it. Retry deploy after they grant access, or Clear leftover "
+            "to delete the empty Azure stack and this card."
+        )
+    return (err or "")[-800:]
 
 
 # ---------------------------------------------------------------------------
@@ -734,7 +774,7 @@ def bootstrap(name: str, email: str, out_path: Path) -> dict[str, Any]:
             )
         if ok:
             assigned.append(role)
-        elif "already exists" in err.lower() or "exist" in err.lower():
+        elif _role_already_assigned(err):
             assigned.append(role)
         else:
             failed.append(f"{role}: {err}")
@@ -805,7 +845,7 @@ def fireworks_quota(env: dict[str, str], location: str) -> tuple[int, int]:
             current = int(float(u.get("currentValue") or 0))
             limit = int(float(u.get("limit") or 0))
             return current, limit
-    return 0, DEFAULT_FIREWORKS_CAP
+    return 0, 0
 
 
 def account_ready(env: dict[str, str], name: str, rg: str) -> tuple[bool, str]:
@@ -919,7 +959,8 @@ def put_kimi_deployment(env: dict[str, str], sub: str, rg: str, acct: str, capac
                     "format": MODEL_FORMAT,
                     "name": MODEL_NAME,
                     "version": MODEL_VERSION,
-                }
+                },
+                "raiPolicyName": RAI_POLICY_NAME,
             },
         }
     )
@@ -930,10 +971,89 @@ def put_kimi_deployment(env: dict[str, str], sub: str, rg: str, acct: str, capac
     )
 
 
+def rai_policy_body() -> dict[str, Any]:
+    return {
+        "properties": {
+            "basePolicyName": "Microsoft.DefaultV2",
+            "mode": "Default",
+            "contentFilters": RAI_CONTENT_FILTERS,
+        }
+    }
+
+
+def ensure_kimi_content_filter(env: dict[str, str], sub: str, rg: str, acct: str) -> str:
+    """Create/update the Lioxi custom RAI policy copied from Lioxi-Gaurav2."""
+    url = (
+        f"https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}"
+        f"/providers/Microsoft.CognitiveServices/accounts/{acct}/raiPolicies/{RAI_POLICY_NAME}"
+        f"?api-version={RAI_POLICY_API}"
+    )
+    body = json.dumps(rai_policy_body())
+    try:
+        az_json(
+            ["az", "rest", "--method", "put", "--url", url, "--body", body, "-o", "json"],
+            env=env,
+            timeout=120,
+        )
+    except AzError as exc:
+        stripped = []
+        for item in RAI_CONTENT_FILTERS:
+            row = {k: v for k, v in item.items() if k != "action"}
+            stripped.append(row)
+        retry_body = json.dumps({"properties": {"basePolicyName": "Microsoft.DefaultV2", "mode": "Default", "contentFilters": stripped}})
+        try:
+            az_json(
+                ["az", "rest", "--method", "put", "--url", url, "--body", retry_body, "-o", "json"],
+                env=env,
+                timeout=120,
+            )
+        except AzError:
+            raise AzError(f"Could not create content filter {RAI_POLICY_NAME}: {exc}") from exc
+    return RAI_POLICY_NAME
+
+
+def attach_kimi_content_filter(env: dict[str, str], sub: str, rg: str, acct: str) -> dict[str, Any]:
+    """PUT the custom RAI policy and point FW-Kimi-K3 at it without changing capacity."""
+    policy = ensure_kimi_content_filter(env, sub, rg, acct)
+    shown = az_json(
+        [
+            "az",
+            "cognitiveservices",
+            "account",
+            "deployment",
+            "show",
+            "-n",
+            acct,
+            "-g",
+            rg,
+            "--deployment-name",
+            DEPLOYMENT_NAME,
+            "-o",
+            "json",
+        ],
+        env=env,
+        timeout=90,
+    )
+    props = shown.get("properties") or {}
+    previous = props.get("raiPolicyName")
+    cap = int(((shown.get("sku") or {}).get("capacity")) or 1)
+    if previous != policy:
+        shown = put_kimi_deployment(env, sub, rg, acct, cap)
+    attached = ((shown.get("properties") or {}).get("raiPolicyName")) or policy
+    return {
+        "rai_policy_name": attached,
+        "previous_rai_policy_name": previous,
+        "capacity": cap,
+        "deployment_name": shown.get("name") or DEPLOYMENT_NAME,
+    }
+
+
 def ensure_kimi_deployment(env: dict[str, str], sub: str, acct: str, rg: str, location: str) -> dict[str, Any]:
     current, limit = fireworks_quota(env, location)
     if limit <= 0:
         raise AzError(f"Fireworks DataZoneStandard quota is 0 in {location}")
+
+    ensure_kimi_content_filter(env, sub, rg, acct)
 
     deployments = (
         az_json(
@@ -959,7 +1079,8 @@ def ensure_kimi_deployment(env: dict[str, str], sub: str, acct: str, rg: str, lo
         target = limit
 
     current_cap = int(((existing.get("sku") or {}).get("capacity")) or 0) if existing else 0
-    if existing is None or current_cap != target:
+    current_rai = ((existing.get("properties") or {}).get("raiPolicyName") if existing else None)
+    if existing is None or current_cap != target or current_rai != RAI_POLICY_NAME:
         shown = retry(
             lambda: put_kimi_deployment(env, sub, rg, acct, target),
             attempts=8,
@@ -1048,6 +1169,19 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
             env=env,
         )
 
+        current_q, limit_q = fireworks_quota(env, LOCATION)
+        if limit_q <= 0:
+            leftover = list_kimi_stacks(env)
+            for leftover_name, leftover_rg in leftover:
+                if looks_like_kimi_stack(leftover_name, leftover_rg):
+                    purge_kimi_stack(env, leftover_name, leftover_rg)
+            raise AzError(
+                humanize_kimi_deploy_error(
+                    "SpecialFeatureOrQuotaIdRequired: this subscription does not have access to "
+                    f"{QUOTA_NAME} in {LOCATION}"
+                )
+            )
+
         def _create():
             return pick_or_create_account(env, slug, sub)
 
@@ -1058,12 +1192,17 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
         )
         loc = (shown.get("location") or LOCATION).replace(" ", "").lower()
 
-        dep = retry(
-            lambda: ensure_kimi_deployment(env, sub, acct_name, rg, loc),
-            attempts=6,
-            delay=12,
-            desc="deploy K3",
-        )
+        try:
+            dep = retry(
+                lambda: ensure_kimi_deployment(env, sub, acct_name, rg, loc),
+                attempts=6,
+                delay=12,
+                desc="deploy K3",
+            )
+        except AzError as exc:
+            if model_unavailable(str(exc)) and looks_like_kimi_stack(acct_name, rg):
+                delete_dedicated_kimi_stack(env, acct_name, rg)
+            raise AzError(humanize_kimi_deploy_error(str(exc))) from exc
         keys = az_json(
             ["az", "cognitiveservices", "account", "keys", "list", "-n", acct_name, "-g", rg, "-o", "json"],
             env=env,
@@ -1101,6 +1240,52 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
             "subscription_name": current.get("name"),
             "quota_limit": dep["quota_limit"],
             "payg": payg,
+            "rai_policy_name": RAI_POLICY_NAME,
+        }
+
+
+def apply_content_filter_one(acct: dict[str, Any]) -> dict[str, Any]:
+    """Create the Lioxi custom content filter and attach it to FW-Kimi-K3."""
+    tenant = acct["AZURE_TENANT_ID"]
+    client = acct["AZURE_CLIENT_ID"]
+    secret = acct["AZURE_CLIENT_SECRET"]
+    sub = acct["AZURE_SUBSCRIPTION_ID"]
+    name = acct.get("name") or slugify(acct.get("account_holder") or client)
+    preferred_name = acct.get("account_name") or ""
+    preferred_rg = acct.get("resource_group") or ""
+
+    with tempfile.TemporaryDirectory(prefix=f"az-rai-{slugify(name)}-") as tmp:
+        env = isolated_env(Path(tmp))
+        current = sp_login(env, tenant, client, secret, sub)
+        target = find_kimi_target(env, preferred_name, preferred_rg)
+        if target is None:
+            return {
+                "ok": True,
+                "name": name,
+                "subscription_id": sub,
+                "subscription_name": current.get("name"),
+                "rai_policy_name": None,
+                "message": "No FW-Kimi-K3 deployment or kimi account found.",
+            }
+        acct_name, rg = target
+        attached = attach_kimi_content_filter(env, sub, rg, acct_name)
+        previous = attached.get("previous_rai_policy_name")
+        policy = attached.get("rai_policy_name")
+        if previous == policy:
+            message = f"Content filter {policy} already on FW-Kimi-K3."
+        else:
+            message = f"Attached content filter {policy}" + (f" (was {previous})" if previous else "") + "."
+        return {
+            "ok": True,
+            "name": name,
+            "account_name": acct_name,
+            "resource_group": rg,
+            "subscription_id": sub,
+            "subscription_name": current.get("name"),
+            "deployment_name": attached.get("deployment_name"),
+            "rai_policy_name": policy,
+            "previous_rai_policy_name": previous,
+            "message": message,
         }
 
 
@@ -1110,9 +1295,129 @@ def looks_like_kimi_stack(acct_name: str, rg: str) -> bool:
     return "-kimi-" in name and group.startswith("rg-") and group.endswith("-kimi")
 
 
-def find_kimi_target(
+def purge_kimi_stack(env: dict[str, str], acct_name: str, rg: str) -> list[str]:
+    """Delete K3 deployment, Foundry projects, account, then RG. Raises on hard failures."""
+    deleted: list[str] = []
+    ok, err = az_ok(
+        [
+            "az",
+            "cognitiveservices",
+            "account",
+            "deployment",
+            "delete",
+            "-n",
+            acct_name,
+            "-g",
+            rg,
+            "--deployment-name",
+            DEPLOYMENT_NAME,
+            "-o",
+            "none",
+        ],
+        env=env,
+        timeout=180,
+    )
+    if ok:
+        deleted.append(f"deployment {DEPLOYMENT_NAME}")
+    elif "not found" not in err.lower() and "does not exist" not in err.lower():
+        raise AzError(f"Could not delete deployment {DEPLOYMENT_NAME}: {err}")
+
+    if not looks_like_kimi_stack(acct_name, rg):
+        return deleted
+
+    projects = []
+    try:
+        projects = (
+            az_json(
+                [
+                    "az",
+                    "cognitiveservices",
+                    "account",
+                    "project",
+                    "list",
+                    "-n",
+                    acct_name,
+                    "-g",
+                    rg,
+                    "-o",
+                    "json",
+                ],
+                env=env,
+            )
+            or []
+        )
+    except AzError:
+        projects = []
+    for proj in projects:
+        pname = (proj or {}).get("name") if isinstance(proj, dict) else None
+        if not pname:
+            continue
+        ok, err = az_ok(
+            [
+                "az",
+                "cognitiveservices",
+                "account",
+                "project",
+                "delete",
+                "-n",
+                acct_name,
+                "-g",
+                rg,
+                "--project-name",
+                pname,
+                "-o",
+                "none",
+            ],
+            env=env,
+            timeout=180,
+        )
+        if ok:
+            deleted.append(f"project {pname}")
+        elif "not found" not in err.lower() and "does not exist" not in err.lower():
+            raise AzError(f"Could not delete project {pname}: {err}")
+    ok, err = az_ok(
+        [
+            "az",
+            "cognitiveservices",
+            "account",
+            "delete",
+            "-n",
+            acct_name,
+            "-g",
+            rg,
+            "-o",
+            "none",
+        ],
+        env=env,
+        timeout=300,
+    )
+    if ok:
+        deleted.append(f"account {acct_name}")
+    elif "not found" not in err.lower() and "does not exist" not in err.lower():
+        raise AzError(f"Could not delete account {acct_name}: {err}")
+    ok, err = az_ok(
+        ["az", "group", "delete", "-n", rg, "--yes", "--no-wait", "-o", "none"],
+        env=env,
+        timeout=120,
+    )
+    if ok:
+        deleted.append(f"resource group {rg} (delete started)")
+    elif "not found" not in err.lower() and "does not exist" not in err.lower():
+        deleted.append(f"resource group {rg} left in place: {err[-200:]}")
+    return deleted
+
+
+def delete_dedicated_kimi_stack(env: dict[str, str], acct_name: str, rg: str) -> None:
+    if not looks_like_kimi_stack(acct_name, rg):
+        return
+    purge_kimi_stack(env, acct_name, rg)
+
+
+def list_kimi_stacks(
     env: dict[str, str], preferred_name: str = "", preferred_rg: str = ""
-) -> tuple[str, str] | None:
+) -> list[tuple[str, str]]:
+    ranked: list[tuple[int, str, str]] = []
+    seen: set[tuple[str, str]] = set()
     if preferred_name and preferred_rg:
         ok, _ = az_ok(
             [
@@ -1130,10 +1435,10 @@ def find_kimi_target(
             env=env,
         )
         if ok:
-            return preferred_name, preferred_rg
+            ranked.append((3, preferred_name, preferred_rg))
+            seen.add((preferred_name.lower(), preferred_rg.lower()))
 
     accounts = az_json(["az", "cognitiveservices", "account", "list", "-o", "json"], env=env) or []
-    ranked: list[tuple[int, str, str]] = []
     for item in accounts:
         if item.get("kind") != KIND:
             continue
@@ -1141,6 +1446,9 @@ def find_kimi_target(
         parts = rid.split("/")
         rg = parts[parts.index("resourceGroups") + 1] if "resourceGroups" in parts else ""
         name = item.get("name") or ""
+        key = (name.lower(), rg.lower())
+        if key in seen:
+            continue
         deps = (
             az_json(
                 [
@@ -1170,10 +1478,16 @@ def find_kimi_target(
             continue
         score = (2 if has_kimi else 0) + (1 if stack else 0)
         ranked.append((score, name, rg))
-    if not ranked:
-        return None
+        seen.add(key)
     ranked.sort(reverse=True)
-    return ranked[0][1], ranked[0][2]
+    return [(name, rg) for _, name, rg in ranked]
+
+
+def find_kimi_target(
+    env: dict[str, str], preferred_name: str = "", preferred_rg: str = ""
+) -> tuple[str, str] | None:
+    stacks = list_kimi_stacks(env, preferred_name, preferred_rg)
+    return stacks[0] if stacks else None
 
 
 def delete_one(acct: dict[str, Any]) -> dict[str, Any]:
@@ -1190,8 +1504,8 @@ def delete_one(acct: dict[str, Any]) -> dict[str, Any]:
         env = isolated_env(Path(tmp))
         current = sp_login(env, tenant, client, secret, sub)
 
-        target = find_kimi_target(env, preferred_name, preferred_rg)
-        if target is None:
+        stacks = list_kimi_stacks(env, preferred_name, preferred_rg)
+        if not stacks:
             return {
                 "ok": True,
                 "name": name,
@@ -1201,121 +1515,17 @@ def delete_one(acct: dict[str, Any]) -> dict[str, Any]:
                 "message": "No FW-Kimi-K3 deployment or kimi account found.",
             }
 
-        acct_name, rg = target
         deleted: list[str] = []
-
-        ok, err = az_ok(
-            [
-                "az",
-                "cognitiveservices",
-                "account",
-                "deployment",
-                "delete",
-                "-n",
-                acct_name,
-                "-g",
-                rg,
-                "--deployment-name",
-                DEPLOYMENT_NAME,
-                "-o",
-                "none",
-            ],
-            env=env,
-            timeout=180,
-        )
-        if ok or "not found" in err.lower() or "does not exist" in err.lower():
-            if ok:
-                deleted.append(f"deployment {DEPLOYMENT_NAME}")
-        else:
-            raise AzError(f"Could not delete deployment {DEPLOYMENT_NAME}: {err}")
-
-        if looks_like_kimi_stack(acct_name, rg):
-            projects = []
-            try:
-                projects = (
-                    az_json(
-                        [
-                            "az",
-                            "cognitiveservices",
-                            "account",
-                            "project",
-                            "list",
-                            "-n",
-                            acct_name,
-                            "-g",
-                            rg,
-                            "-o",
-                            "json",
-                        ],
-                        env=env,
-                    )
-                    or []
-                )
-            except AzError:
-                projects = []
-            for proj in projects:
-                pname = (proj or {}).get("name") if isinstance(proj, dict) else None
-                if not pname:
-                    continue
-                ok, err = az_ok(
-                    [
-                        "az",
-                        "cognitiveservices",
-                        "account",
-                        "project",
-                        "delete",
-                        "-n",
-                        acct_name,
-                        "-g",
-                        rg,
-                        "--project-name",
-                        pname,
-                        "-o",
-                        "none",
-                    ],
-                    env=env,
-                    timeout=180,
-                )
-                if ok:
-                    deleted.append(f"project {pname}")
-                elif "not found" not in err.lower() and "does not exist" not in err.lower():
-                    raise AzError(f"Could not delete project {pname}: {err}")
-            ok, err = az_ok(
-                [
-                    "az",
-                    "cognitiveservices",
-                    "account",
-                    "delete",
-                    "-n",
-                    acct_name,
-                    "-g",
-                    rg,
-                    "-o",
-                    "none",
-                ],
-                env=env,
-                timeout=300,
-            )
-            if ok or "not found" in err.lower() or "does not exist" in err.lower():
-                if ok:
-                    deleted.append(f"account {acct_name}")
-            else:
-                raise AzError(f"Could not delete account {acct_name}: {err}")
-            ok, err = az_ok(
-                ["az", "group", "delete", "-n", rg, "--yes", "--no-wait", "-o", "none"],
-                env=env,
-                timeout=120,
-            )
-            if ok:
-                deleted.append(f"resource group {rg} (delete started)")
-            elif "not found" not in err.lower() and "does not exist" not in err.lower():
-                deleted.append(f"resource group {rg} left in place: {err[-200:]}")
+        last_name, last_rg = stacks[0]
+        for acct_name, rg in stacks:
+            last_name, last_rg = acct_name, rg
+            deleted.extend(purge_kimi_stack(env, acct_name, rg))
 
         return {
             "ok": True,
             "name": name,
-            "account_name": acct_name,
-            "resource_group": rg,
+            "account_name": last_name,
+            "resource_group": last_rg,
             "subscription_id": sub,
             "subscription_name": current.get("name"),
             "deleted": deleted,
@@ -1613,6 +1823,31 @@ def cmd_undeploy(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
+def cmd_content_filter(args: argparse.Namespace) -> int:
+    accounts = load_accounts(Path(args.input))
+    workers = min(args.jobs, max(1, len(accounts)))
+    results: list[dict[str, Any]] = [None] * len(accounts)  # type: ignore
+    errors = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(apply_content_filter_one, acct): i for i, acct in enumerate(accounts)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            name = accounts[i].get("name") or accounts[i].get("account_holder") or str(i)
+            try:
+                results[i] = fut.result()
+                print(f"OK {name} {results[i].get('message')}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                results[i] = {"ok": False, "name": name, "error": str(exc)[-1500:]}
+                print(f"FAIL {name}: {exc}", file=sys.stderr)
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"results": results}, indent=2) + "\n")
+    print(json.dumps({"ok_count": len(accounts) - errors, "fail_count": errors, "wrote": str(out)}))
+    return 1 if errors else 0
+
+
 def cmd_deploy(args: argparse.Namespace) -> int:
     accounts = load_accounts(Path(args.input))
     workers = min(args.jobs, max(1, len(accounts)))
@@ -1719,20 +1954,26 @@ def build_parser() -> argparse.ArgumentParser:
     d = sub.add_parser("deploy", help="Deploy FW-Kimi-K3 from a JSON array of SP secrets")
     d.add_argument("--input", required=True)
     d.add_argument("--out", required=True)
-    d.add_argument("--jobs", type=int, default=6)
+    d.add_argument("--jobs", type=int, default=12)
     d.set_defaults(func=cmd_deploy)
 
     rg = sub.add_parser("regenerate", help="Reset client secrets for a JSON array of existing SPs")
     rg.add_argument("--input", required=True)
     rg.add_argument("--out", required=True)
-    rg.add_argument("--jobs", type=int, default=4)
+    rg.add_argument("--jobs", type=int, default=8)
     rg.set_defaults(func=cmd_regenerate)
 
     u = sub.add_parser("undeploy", help="Delete FW-Kimi-K3 (and dedicated kimi account/RG if we created it)")
     u.add_argument("--input", required=True)
     u.add_argument("--out", required=True)
-    u.add_argument("--jobs", type=int, default=4)
+    u.add_argument("--jobs", type=int, default=8)
     u.set_defaults(func=cmd_undeploy)
+
+    cf = sub.add_parser("content-filter", help="Create/attach the Lioxi custom content filter to FW-Kimi-K3")
+    cf.add_argument("--input", required=True)
+    cf.add_argument("--out", required=True)
+    cf.add_argument("--jobs", type=int, default=12)
+    cf.set_defaults(func=cmd_content_filter)
 
     ep = sub.add_parser("ensure-payg", help="Check current Owner login and upgrade/create PAYG if blocked")
     ep.set_defaults(func=cmd_ensure_payg)

@@ -323,6 +323,7 @@ export interface KimiDeployResult {
   new_api_priority?: number | null;
   new_api_weight?: number | null;
   new_api_error?: string | null;
+  rai_policy_name?: string | null;
   removed?: boolean;
   deleted_resources?: string[];
   deleted_message?: string | null;
@@ -345,6 +346,26 @@ export interface KimiDeleteResponse {
   ok_count: number;
   fail_count: number;
   results: KimiDeleteResult[];
+}
+
+export interface KimiContentFilterResult {
+  ok: boolean;
+  name?: string | null;
+  account_name?: string | null;
+  resource_group?: string | null;
+  subscription_id?: string | null;
+  subscription_name?: string | null;
+  deployment_name?: string | null;
+  rai_policy_name?: string | null;
+  previous_rai_policy_name?: string | null;
+  message?: string | null;
+  error?: string | null;
+}
+
+export interface KimiContentFilterResponse {
+  ok_count: number;
+  fail_count: number;
+  results: KimiContentFilterResult[];
 }
 
 export interface KimiTestResult {

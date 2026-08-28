@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from app.core.crypto import SecretBox
 from app.database import SessionLocal
+from app.runtime import AZURE_SYNC_CONCURRENCY
 from app.repositories.account_repository import AccountRepository
 from app.repositories.model_repository import ModelRepository
 from app.repositories.usage_repository import UsageRepository
@@ -41,7 +42,7 @@ class SyncOrchestrator:
         async with self._azure_lock:
             async with SessionLocal() as session:
                 accounts = await AccountRepository(session).list_all()
-            limit = asyncio.Semaphore(3)
+            limit = asyncio.Semaphore(max(1, AZURE_SYNC_CONCURRENCY))
 
             async def _bounded(account_id: int) -> dict:
                 async with limit:

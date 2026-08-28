@@ -10,6 +10,7 @@ from app.database import get_db
 from app.dependencies import get_current_admin
 from app.schemas.kimi_deploy import (
     KimiBootstrapRequest,
+    KimiContentFilterResponse,
     KimiCreditsRequest,
     KimiCreditsResponse,
     KimiDeleteResponse,
@@ -34,6 +35,7 @@ from app.schemas.kimi_deploy import (
 from app.services.kimi_deploy_service import (
     KimiDeployError,
     add_kimi_newapi_channels,
+    apply_content_filters,
     bootstrap_account,
     delete_accounts,
     deploy_accounts,
@@ -196,6 +198,16 @@ async def undeploy(payload: KimiRegenerateRequest, db: AsyncSession = Depends(ge
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ok_count = sum(1 for item in results if item.ok)
     return KimiDeleteResponse(ok_count=ok_count, fail_count=len(results) - ok_count, results=results)
+
+
+@router.post("/content-filter", response_model=KimiContentFilterResponse)
+async def content_filter(payload: KimiRegenerateRequest, db: AsyncSession = Depends(get_db)) -> KimiContentFilterResponse:
+    try:
+        results = await apply_content_filters(payload.accounts, payload.jobs, session=db)
+    except KimiDeployError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ok_count = sum(1 for item in results if item.ok)
+    return KimiContentFilterResponse(ok_count=ok_count, fail_count=len(results) - ok_count, results=results)
 
 
 @router.post("/stream")
