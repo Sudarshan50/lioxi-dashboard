@@ -150,7 +150,7 @@ Tracked files are templates and code only. This repo must never contain live cre
 
 Azure client secrets, Foundry keys, and NewAPI tokens are encrypted in Postgres with `ENCRYPTION_KEY`. They are not written back to the git tree.
 
-`scripts/sync_prod_db.sh` reads `PROD_SSH_*` from `.env`. It has no baked-in host, user, or password.
+`scripts/sync_prod_db.sh` reads `PROD_SSH_*` from `.env`. The password is never stored in git. Host / user / path fall back to the existing operator defaults if those env vars are empty, so a pull or push keeps working the same as before.
 
 If a secret ever lands in a commit, rotate it and remove it from history. Do not rely on a later delete.
 
