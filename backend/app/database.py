@@ -67,6 +67,9 @@ async def _ensure_azure_openai_key_columns(conn) -> None:
 
 async def _ensure_submit_columns(conn) -> None:
     await conn.execute(text("ALTER TABLE sp_submit_requests ADD COLUMN IF NOT EXISTS error_kind VARCHAR(16)"))
+    await conn.execute(
+        text("ALTER TABLE sp_submit_requests ADD COLUMN IF NOT EXISTS auto_retry_count INTEGER NOT NULL DEFAULT 0")
+    )
 
 
 async def _ensure_submit_indexes(conn) -> None:
@@ -99,6 +102,37 @@ async def _ensure_submit_indexes(conn) -> None:
     )
 
 
+async def _ensure_sp_elevated_access(conn) -> None:
+    await conn.execute(
+        text(
+            "ALTER TABLE azure_service_principals ADD COLUMN IF NOT EXISTS elevated_access BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE azure_service_principals AS sp
+            SET elevated_access = TRUE
+            WHERE EXISTS (
+                    SELECT 1 FROM sp_submit_requests AS req
+                    WHERE req.status = 'approved'
+                      AND req.subscription_id IS NOT NULL
+                      AND btrim(req.subscription_id) <> ''
+                      AND lower(req.subscription_id) = lower(sp.subscription_id)
+               )
+               OR EXISTS (
+                    SELECT 1 FROM provider_accounts AS acct
+                    WHERE lower(acct.subscription_id) = lower(sp.subscription_id)
+                      AND (
+                        (lower(acct.resource_group) LIKE 'rg-%' AND lower(acct.resource_group) LIKE '%-kimi')
+                        OR lower(acct.resource_name) LIKE '%-kimi-%'
+                      )
+               )
+            """
+        )
+    )
+
+
 async def init_models() -> None:
     import app.models  # noqa: F401 - registers ORM models on Base.metadata before create_all
 
@@ -108,3 +142,4 @@ async def init_models() -> None:
         await _ensure_azure_openai_key_columns(conn)
         await _ensure_submit_columns(conn)
         await _ensure_submit_indexes(conn)
+        await _ensure_sp_elevated_access(conn)

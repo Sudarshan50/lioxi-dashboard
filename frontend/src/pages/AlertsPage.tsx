@@ -1,6 +1,6 @@
 import clsx from "clsx";
-import { BellRing, FileDown, Play, Plus, Scissors, Search, Send, Users, X } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { BellRing, Eraser, FileDown, Play, Plus, Scissors, Search, Send, Users, X } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
@@ -14,13 +14,17 @@ import {
   useAlertConfig,
   useAlertState,
   useAlertStatus,
+  useCancelClearGroupChat,
+  useClearGroupChatStatus,
   useRunAlertCheck,
   useSaveAlertConfig,
+  useSendGroupMessage,
   useSendTestAlert,
   useSetAtCapManual,
   useSetPayableSettled,
+  useStartClearGroupChat,
 } from "@/hooks/useAlerts";
-import { formatCurrency } from "@/lib/format";
+import { formatCurrency, formatRelative } from "@/lib/format";
 import { amountPayableUsd, brokerageUsd, downloadPayableCsv, payablePercentLabel } from "@/lib/payable";
 import { matchesOwner, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
 import { toastDismiss, toastError, toastSuccess } from "@/lib/toast";
@@ -55,12 +59,32 @@ function sortAlertState(items: AlertStateItem[], sort: AlertSort): AlertStateIte
     if (sort === "headroom-desc") return compareNullable(left.headroom_usd, right.headroom_usd, "desc");
     const active = Number(right.gateway_enabled) - Number(left.gateway_enabled);
     if (active !== 0) return active;
-    return compareNullable(left.percent, right.percent, "desc");
+    return compareNullable(left.percent, right.percent, left.gateway_enabled ? "desc" : "asc");
   });
 }
 
 function isDisabledAtCap(item: AlertStateItem): boolean {
   return !item.gateway_enabled && item.exhausted;
+}
+
+function spendSplitLabel(item: AlertStateItem): string | null {
+  const o1 = item.spend_o1_usd;
+  const o2 = item.spend_o2_usd;
+  const parts: string[] = [];
+  if (o1 != null) parts.push(`O1 ${formatCurrency(o1, "USD")}`);
+  if (o2 != null) parts.push(`O2 ${formatCurrency(o2, "USD")}`);
+  if (parts.length < 2) return null;
+  return parts.join(" + ");
+}
+
+function grantPercentLabel(percent: number): string {
+  return percent >= 100 ? `${percent.toFixed(1)}%` : `${percent.toFixed(0)}%`;
+}
+
+function atCapTitle(item: AlertStateItem): string {
+  if (item.exhausted_reason === "manual") return "Manually tagged at cap";
+  if ((item.overspend_buffer_usd || 0) > 0) return "Spend reached grant + buffer";
+  return "NewAPI spend reached the credit grant";
 }
 
 function StatusPill({
@@ -106,7 +130,18 @@ function matchesAlertSearch(item: AlertStateItem, rawQuery: string): boolean {
   const needle = normalizeSearchText(rawQuery);
   if (!needle) return true;
   const haystack = normalizeSearchText(
-    [item.name, item.new_api_name, item.owner_tag, item.endpoint, item.gateway, item.exhausted ? "at cap" : "", item.alert_level >= 100 ? "auto-disabled" : ""].filter(Boolean).join(" ")
+    [
+      item.name,
+      item.deployed_at ? formatRelative(item.deployed_at) : "",
+      item.new_api_name,
+      item.owner_tag,
+      item.endpoint,
+      item.gateway,
+      item.exhausted ? "at cap" : "",
+      item.alert_level >= 100 && item.exhausted && item.exhausted_reason === "overspent" ? "auto-disabled" : "",
+    ]
+      .filter(Boolean)
+      .join(" ")
   );
   if (haystack.includes(needle)) return true;
   return needle.split(/\s+/).filter(Boolean).every((token) => haystack.includes(token));
@@ -118,6 +153,10 @@ export default function AlertsPage() {
   const state = useAlertState();
   const saveConfig = useSaveAlertConfig();
   const sendTest = useSendTestAlert();
+  const sendGroup = useSendGroupMessage();
+  const clearChats = useStartClearGroupChat();
+  const cancelClear = useCancelClearGroupChat();
+  const clearStatus = useClearGroupChatStatus();
   const runCheck = useRunAlertCheck();
   const setPayableSettled = useSetPayableSettled();
   const setAtCapManual = useSetAtCapManual();
@@ -134,11 +173,16 @@ export default function AlertsPage() {
   const [newThreshold, setNewThreshold] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [groupNote, setGroupNote] = useState("");
   const [tagPayableOpen, setTagPayableOpen] = useState(false);
+  const [clearChatsOpen, setClearChatsOpen] = useState(false);
   const [brokerageClicks, setBrokerageClicks] = useState(0);
   const [brokerageLeaving, setBrokerageLeaving] = useState(false);
   const showBrokerage = brokerageClicks >= 3 || brokerageLeaving;
   const payablePct = payablePercentLabel();
+  const clearJob = clearStatus.data;
+  const clearingGroup = Boolean(clearJob?.running || clearChats.isPending);
+  const sawClearRunning = useRef(false);
 
   useEffect(() => {
     if (message) toastSuccess(message, "alerts-ok");
@@ -232,6 +276,53 @@ export default function AlertsPage() {
     }
   }
 
+  useEffect(() => {
+    if (clearJob?.running) {
+      sawClearRunning.current = true;
+      return;
+    }
+    if (!sawClearRunning.current || !clearJob) return;
+    sawClearRunning.current = false;
+    if (clearJob.ok === true) {
+      setMessage(
+        `Group chat cleared — ${clearJob.attempted.toLocaleString()} message id${clearJob.attempted === 1 ? "" : "s"} swept.`
+      );
+    } else if (clearJob.ok === false) {
+      setError(
+        clearJob.error ||
+          `Group clear finished with ${clearJob.failed_batches} failed batch${clearJob.failed_batches === 1 ? "" : "es"}.`
+      );
+    }
+  }, [clearJob]);
+
+  async function handleClearChats() {
+    setMessage(null);
+    setError(null);
+    try {
+      await clearChats.mutateAsync();
+      setClearChatsOpen(false);
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Could not start the group chat clear.");
+    }
+  }
+
+  async function handleSendGroup() {
+    const text = groupNote.trim();
+    setMessage(null);
+    setError(null);
+    if (!text) {
+      setError("Write a message to send to the group.");
+      return;
+    }
+    try {
+      await sendGroup.mutateAsync(text);
+      setGroupNote("");
+      setMessage("Message sent to the Telegram group.");
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Could not send the message.");
+    }
+  }
+
   const owner = ownerFilter === "all" ? null : ownerFilter;
   const ownerOptions = useMemo(() => uniqueOwners(state.data ?? []), [state.data]);
   const visibleAlertState = useMemo(
@@ -256,10 +347,7 @@ export default function AlertsPage() {
       .reduce((sum, item) => sum + amountPayableUsd(item.spend_usd), 0);
     const active = visibleAlertState.filter((item) => item.gateway_enabled).length;
     const forecast = visibleAlertState.reduce((sum, item) => sum + amountPayableUsd(item.credits_limit), 0);
-    const brokerage = visibleAlertState.reduce(
-      (sum, item) => sum + brokerageUsd(item.credits_limit, amountPayableUsd(item.spend_usd)),
-      0
-    );
+    const brokerage = visibleAlertState.reduce((sum, item) => sum + brokerageUsd(item.credits_limit), 0);
     return { spend, payable, unsettled, settled, active, inactive: visibleAlertState.length - active, forecast, brokerage };
   }, [visibleAlertState]);
   const payableByTag = useMemo(() => {
@@ -281,7 +369,7 @@ export default function AlertsPage() {
       current.spend += item.spend_usd || 0;
       current.payable += amountPayableUsd(item.spend_usd);
       current.forecast += amountPayableUsd(item.credits_limit);
-      current.brokerage += brokerageUsd(item.credits_limit, amountPayableUsd(item.spend_usd));
+      current.brokerage += brokerageUsd(item.credits_limit);
       current.count += 1;
       if (item.gateway_enabled) current.active += 1;
       else current.inactive += 1;
@@ -470,7 +558,8 @@ export default function AlertsPage() {
           <div>
             <h2 className="text-sm font-semibold text-gray-200">Bot actions</h2>
             <p className="mt-0.5 text-xs text-gray-500">
-              The bot also answers /usage, /enable and /disable in the group for whitelisted admins.
+              The bot answers /live for everyone in the group. /people, /usage, /alerts, /test, /enable and /disable stay admin-only.
+              Clear group chat silently deletes the full group history for every member. It does not post an alert.
             </p>
           </div>
           <div className="flex flex-col gap-2 text-xs text-gray-400">
@@ -491,6 +580,33 @@ export default function AlertsPage() {
               <span className="text-gray-200">{status.data?.admin_count ?? "—"}</span>
             </div>
           </div>
+          <div className="flex flex-col gap-1.5">
+            <label htmlFor="group-note" className="text-xs font-medium text-gray-400">
+              Message to group
+            </label>
+            <textarea
+              id="group-note"
+              value={groupNote}
+              onChange={(e) => setGroupNote(e.target.value)}
+              rows={4}
+              maxLength={3900}
+              placeholder="Write a note for the Telegram group…"
+              className="w-full min-w-0 resize-y rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm leading-relaxed text-gray-100 outline-none transition-colors placeholder:text-gray-600 focus:border-accent"
+            />
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs text-gray-500">Sent as plain text to the linked group.</p>
+              <span className="shrink-0 text-xs tabular-nums text-gray-600">
+                {groupNote.trim().length}/3900
+              </span>
+            </div>
+            <Button
+              onClick={handleSendGroup}
+              isLoading={sendGroup.isPending}
+              disabled={!groupNote.trim() || sendGroup.isPending}
+            >
+              <Send size={15} /> Send to group
+            </Button>
+          </div>
           <div className="mt-auto flex flex-wrap gap-2">
             <Button variant="secondary" onClick={handleTest} isLoading={sendTest.isPending}>
               <Send size={15} /> Send test message
@@ -498,6 +614,36 @@ export default function AlertsPage() {
             <Button variant="secondary" onClick={handleRunCheck} isLoading={runCheck.isPending}>
               <Play size={15} /> Run check now
             </Button>
+            <Button
+              variant="danger"
+              onClick={() => setClearChatsOpen(true)}
+              disabled={!status.data?.telegram_configured || !status.data?.chat_id_set || clearingGroup}
+              isLoading={clearingGroup}
+            >
+              <Eraser size={15} />
+              {clearingGroup
+                ? clearJob?.phase === "finding" || !clearJob?.total
+                  ? "Finding messages…"
+                  : `Clearing ${clearJob.attempted.toLocaleString()}/${clearJob.total.toLocaleString()}`
+                : "Clear group chat"}
+            </Button>
+            {clearingGroup && (
+              <Button
+                variant="secondary"
+                onClick={async () => {
+                  setError(null);
+                  try {
+                    await cancelClear.mutateAsync();
+                    setMessage("Group clear cancelled.");
+                  } catch (err: any) {
+                    setError(err?.response?.data?.detail ?? "Could not cancel the group clear.");
+                  }
+                }}
+                isLoading={cancelClear.isPending}
+              >
+                Stop
+              </Button>
+            )}
           </div>
         </Card>
       </div>
@@ -516,8 +662,8 @@ export default function AlertsPage() {
                 )}
               </div>
               <p className="mt-1 max-w-2xl text-xs leading-relaxed text-gray-500">
-                Payable is NewAPI spend × {payablePct}. Unsettled is disabled accounts at cap (auto or tagged) that are not yet
-                marked paid.
+                Spend is NewAPI lifetime, O1 + O2, each channel counted once. Payable is that total × {payablePct}. Unsettled is
+                disabled accounts at cap (auto or tagged) that are not yet marked paid.
               </p>
             </div>
             <div className="flex w-full min-w-0 flex-col gap-2 sm:flex-row sm:items-end lg:w-auto">
@@ -566,7 +712,7 @@ export default function AlertsPage() {
                   value={alertSort}
                   onChange={(e) => setAlertSort(e.target.value as AlertSort)}
                 >
-                  <option value="percent">Of grant % (high)</option>
+                  <option value="percent">Of grant % (enabled high, disabled low)</option>
                   <option value="spend-desc">NewAPI spend (high)</option>
                   <option value="spend-asc">NewAPI spend (low)</option>
                   <option value="payable-desc">Payable (high)</option>
@@ -684,6 +830,7 @@ export default function AlertsPage() {
               <tbody>
                 {sortedAlertState.map((item) => {
                   const channelLine = [item.new_api_name, item.gateway].filter(Boolean).join(" · ");
+                  const spendSplit = spendSplitLabel(item);
                   const pendingCap = setAtCapManual.isPending && setAtCapManual.variables?.id === item.id;
                   const pendingPaid = setPayableSettled.isPending && setPayableSettled.variables?.id === item.id;
                   return (
@@ -692,23 +839,21 @@ export default function AlertsPage() {
                         <div className="min-w-[16rem] max-w-[22rem]">
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="font-medium text-gray-100">{item.name}</span>
+                            {item.deployed_at && (
+                              <span className="shrink-0 text-[11px] tabular-nums text-gray-500">
+                                {formatRelative(item.deployed_at)}
+                              </span>
+                            )}
                             {item.owner_tag && <StatusPill tone="violet">{item.owner_tag}</StatusPill>}
                             {item.gateway && !item.gateway_enabled && <StatusPill tone="amber">disabled</StatusPill>}
                             {!item.gateway && <StatusPill tone="amber" title="No NewAPI channel matched">no NewAPI</StatusPill>}
-                            {item.alert_level >= 100 && (
-                              <StatusPill tone="red" title="Gateway auto-stopped when NewAPI spend reached grant + buffer">
+                            {item.alert_level >= 100 && item.exhausted && item.exhausted_reason === "overspent" && (
+                              <StatusPill tone="red" title={atCapTitle(item)}>
                                 auto-disabled
                               </StatusPill>
                             )}
                             {item.exhausted && (
-                              <StatusPill
-                                tone="red"
-                                title={
-                                  item.exhausted_reason === "manual"
-                                    ? "Manually tagged at cap"
-                                    : "Spend reached grant + buffer"
-                                }
-                              >
+                              <StatusPill tone="red" title={atCapTitle(item)}>
                                 at cap
                               </StatusPill>
                             )}
@@ -718,7 +863,8 @@ export default function AlertsPage() {
                         </div>
                       </td>
                       <td className="py-3 pr-3 text-right tabular-nums text-violet-300">
-                        {formatCurrency(item.spend_usd, "USD")}
+                        <div>{formatCurrency(item.spend_usd, "USD")}</div>
+                        {spendSplit && <p className="mt-0.5 text-[11px] font-normal text-gray-500">{spendSplit}</p>}
                       </td>
                       <td className="py-3 pr-3 text-right tabular-nums text-amber-200">
                         {formatCurrency(amountPayableUsd(item.spend_usd), "USD")}
@@ -751,7 +897,7 @@ export default function AlertsPage() {
                                 style={{ width: `${Math.min(item.percent, 100)}%` }}
                               />
                             </div>
-                            <span className="w-10 text-right tabular-nums text-gray-400">{item.percent.toFixed(0)}%</span>
+                            <span className="w-12 text-right tabular-nums text-gray-400">{grantPercentLabel(item.percent)}</span>
                           </div>
                         )}
                       </td>
@@ -823,6 +969,25 @@ export default function AlertsPage() {
           )}
         </div>
       </Card>
+
+      <Modal title="Clear group chat" isOpen={clearChatsOpen} onClose={() => !clearingGroup && setClearChatsOpen(false)}>
+        <p className="text-sm leading-relaxed text-gray-300">
+          Deletes the entire linked Telegram group history for every member — from the first message through the latest.
+          Nothing is posted to the group, including alerts, until the clear finishes. Telegram has no undo.
+        </p>
+        <p className="mt-2 text-xs text-gray-500">
+          The bot must be a group admin with delete-messages rights. Older posts are deleted one by one if Telegram
+          rejects a batch. A clear already in progress cannot be started again.
+        </p>
+        <div className="mt-5 flex flex-wrap justify-end gap-2">
+          <Button variant="secondary" onClick={() => setClearChatsOpen(false)} disabled={clearingGroup}>
+            Cancel
+          </Button>
+          <Button variant="danger" onClick={handleClearChats} isLoading={clearingGroup} disabled={clearingGroup}>
+            <Eraser size={15} /> Clear full group
+          </Button>
+        </div>
+      </Modal>
 
       <Modal
         title={

@@ -43,6 +43,18 @@ export function formatDateTime(value: string): string {
   });
 }
 
+export function formatDeployedAt(value: string): string {
+  const when = new Date(value);
+  if (Number.isNaN(when.getTime())) return "—";
+  return when.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export function formatRelative(value: string | null): string {
   if (!value) return "never";
   const minutes = Math.round((Date.now() - new Date(value).getTime()) / 60000);

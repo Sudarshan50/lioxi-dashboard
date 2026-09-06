@@ -63,6 +63,14 @@ def parse_owner_tag(value: str | None) -> str | None:
     return owner
 
 
+def join_picker_name(value: str | None) -> str | None:
+    try:
+        owner = parse_owner_tag(value)
+    except ValueError:
+        return None
+    return owner
+
+
 def _payload_person_text(value: object) -> str | None:
     if isinstance(value, str):
         return value

@@ -1,7 +1,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/lib/apiClient";
-import { KimiContentFilterResponse, KimiDeleteResponse, KimiDeployProgressEvent, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
+import { KimiContentFilterResponse, KimiDeleteResponse, KimiDeployDefaults, KimiDeployJob, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiDropStoredResponse, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
 
 const DEPLOY_TIMEOUT_MS = 45 * 60 * 1000;
 const KEYS_TIMEOUT_MS = 15 * 60 * 1000;
@@ -15,6 +15,24 @@ export function useKimiStoredAccounts() {
   return useQuery({
     queryKey: ["kimi-stored-accounts"],
     queryFn: async () => (await apiClient.get<KimiStoredResponse>("/api/kimi-deploy/stored")).data,
+  });
+}
+
+export function useKimiDeployDefaults() {
+  return useQuery({
+    queryKey: ["kimi-deploy-defaults"],
+    queryFn: async () => (await apiClient.get<KimiDeployDefaults>("/api/kimi-deploy/defaults")).data,
+  });
+}
+
+export function useSaveKimiDeployDefaults() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (defaults: KimiDeployDefaults) =>
+      (await apiClient.put<KimiDeployDefaults>("/api/kimi-deploy/defaults", defaults)).data,
+    onSuccess: (data) => {
+      queryClient.setQueryData(["kimi-deploy-defaults"], data);
+    },
   });
 }
 
@@ -37,78 +55,22 @@ export function invalidateAfterDeploy(queryClient: ReturnType<typeof useQueryCli
   void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
 }
 
-export function useKimiDeploy() {
-  const queryClient = useQueryClient();
-  return useMutation({
-    mutationFn: async (payload: {
-      accounts: Record<string, string>[];
-      jobs: number;
-      new_api_priority: number;
-      new_api_weight: number;
-    }) => (await apiClient.post<KimiDeployResponse>("/api/kimi-deploy", payload, { timeout: DEPLOY_TIMEOUT_MS })).data,
-    onSuccess: () => invalidateAfterDeploy(queryClient),
+export function useKimiDeployJob() {
+  return useQuery({
+    queryKey: ["kimi-deploy-job"],
+    queryFn: async () => (await apiClient.get<KimiDeployJob>("/api/kimi-deploy/job")).data,
+    refetchInterval: (query) => (query.state.data?.running ? 3000 : 12_000),
+    refetchOnWindowFocus: true,
   });
 }
 
-export async function streamKimiDeploy(
-  payload: {
-    accounts: Record<string, string>[];
-    jobs: number;
-    new_api_priority: number;
-    new_api_weight: number;
-  },
-  onEvent: (event: KimiDeployProgressEvent) => void
-) {
-  const base = String(apiClient.defaults.baseURL || "").replace(/\/$/, "");
-  const token = localStorage.getItem("access_token");
-  const response = await fetch(`${base}/api/kimi-deploy/stream`, {
-    method: "POST",
-    cache: "no-store",
-    headers: {
-      "Content-Type": "application/json",
-      Accept: "text/event-stream",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(payload),
-  });
-  if (response.status === 401) {
-    localStorage.removeItem("access_token");
-    window.location.href = "/login";
-    throw new Error("Your session expired. Sign in again.");
-  }
-  if (!response.ok || !response.body) {
-    let detail = `Deploy failed (${response.status}).`;
-    try {
-      const body = await response.json();
-      if (typeof body?.detail === "string" && body.detail.trim()) detail = body.detail;
-    } catch {
-      /* ignore */
-    }
-    throw new Error(detail);
-  }
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let sawDone = false;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n\n");
-    buffer = chunks.pop() ?? "";
-    for (const chunk of chunks) {
-      const line = chunk.split("\n").find((part) => part.startsWith("data: "));
-      if (!line) continue;
-      try {
-        const event = JSON.parse(line.slice(6)) as KimiDeployProgressEvent;
-        onEvent(event);
-        if (event.type === "done" || event.type === "error") sawDone = true;
-      } catch {
-        /* ignore a truncated or keep-alive frame */
-      }
-    }
-  }
-  if (!sawDone) throw new Error("Deploy stream ended before results arrived.");
+export async function startKimiDeployJob(payload: {
+  accounts: Record<string, string>[];
+  jobs: number;
+  new_api_priority: number;
+  new_api_weight: number;
+}) {
+  return (await apiClient.post<KimiDeployJob>("/api/kimi-deploy/job", payload)).data;
 }
 
 export function useO1NewApiAuth() {
@@ -194,6 +156,18 @@ export function useKimiRegenerateKeys() {
   });
 }
 
+export function useKimiDropStored() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { subscription_ids: string[] }) =>
+      (await apiClient.post<KimiDropStoredResponse>("/api/kimi-deploy/stored/drop", payload)).data,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["kimi-stored-accounts"] });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
+    },
+  });
+}
+
 export function useKimiUndeploy() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -219,6 +193,22 @@ export function useKimiContentFilter() {
           timeout: KEYS_TIMEOUT_MS,
         })
       ).data,
+  });
+}
+
+export function useKimiScaleQuota() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (payload: { accounts: Record<string, string>[]; jobs?: number }) =>
+      (
+        await apiClient.post<KimiDeployResponse>("/api/kimi-deploy/scale-quota", payload, {
+          timeout: KEYS_TIMEOUT_MS,
+        })
+      ).data,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
+    },
   });
 }
 

@@ -77,5 +77,29 @@ class PendingDeclineResponse(BaseModel):
 
 class PendingApproveRequest(BaseModel):
     jobs: int = Field(default=1, ge=1, le=64)
-    new_api_priority: int = Field(default=13, ge=0, le=10000)
-    new_api_weight: int = Field(default=1, ge=1, le=10000)
+    new_api_priority: int | None = Field(default=None, ge=0, le=10000)
+    new_api_weight: int | None = Field(default=None, ge=1, le=10000)
+
+
+class PendingApproveAccepted(BaseModel):
+    ok: bool = True
+    request_id: int
+    status: str
+
+
+class PendingBatchApproveRequest(BaseModel):
+    ids: list[int] | None = None
+    retry: bool = False
+    new_api_priority: int | None = Field(default=None, ge=0, le=10000)
+    new_api_weight: int | None = Field(default=None, ge=1, le=10000)
+
+
+class PendingBatchSkipped(BaseModel):
+    id: int
+    error: str
+
+
+class PendingBatchApproveResponse(BaseModel):
+    ok: bool = True
+    started: list[int] = Field(default_factory=list)
+    skipped: list[PendingBatchSkipped] = Field(default_factory=list)

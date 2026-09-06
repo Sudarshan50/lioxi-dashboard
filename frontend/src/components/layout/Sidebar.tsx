@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, X } from "lucide-react";
+import { BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, ShieldBan, X } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
@@ -7,11 +7,14 @@ import { useAuth } from "@/context/AuthContext";
 import apiClient from "@/lib/apiClient";
 import { PendingListResponse } from "@/types";
 
+import SystemStatsPanel from "./SystemStatsPanel";
+
 const navItems = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
   { to: "/accounts", label: "Accounts", icon: Cloud },
   { to: "/deploy", label: "Deploy K3", icon: Rocket },
   { to: "/pending", label: "Pending", icon: Inbox },
+  { to: "/ban", label: "Ban", icon: ShieldBan },
   { to: "/models", label: "Models", icon: Cpu },
   { to: "/alerts", label: "Alerts", icon: BellRing },
 ];
@@ -94,6 +97,7 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
             </NavLink>
           ))}
         </nav>
+        <SystemStatsPanel />
         <button
           onClick={logout}
           className="flex items-center gap-3 rounded-xl px-3 py-2 text-sm font-medium text-gray-400 transition-colors hover:bg-white/[0.04] hover:text-gray-100"

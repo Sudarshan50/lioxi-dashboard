@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { Rocket, Upload } from "lucide-react";
-import { ChangeEvent, DragEvent, useEffect, useMemo, useState } from "react";
+import { Rocket, Search, Trash2, Upload } from "lucide-react";
+import { ChangeEvent, DragEvent, useEffect, useMemo, useRef, useState } from "react";
 
 import DeployedKimiCard from "@/components/deploy/DeployedKimiCard";
 import Button from "@/components/ui/Button";
@@ -8,10 +8,14 @@ import Card from "@/components/ui/Card";
 import Spinner from "@/components/ui/Spinner";
 import {
   invalidateAfterDeploy,
-  streamKimiDeploy,
+  startKimiDeployJob,
   useKimiAddNewApi,
   useKimiContentFilter,
+  useKimiDeployDefaults,
+  useKimiDeployJob,
   useKimiDeployStatus,
+  useSaveKimiDeployDefaults,
+  useKimiDropStored,
   useKimiInventory,
   useKimiNewApiPool,
   useKimiRenameNewApi,
@@ -19,25 +23,23 @@ import {
   useKimiRefreshInventory,
   useKimiSheetStatus,
   useKimiSheetSync,
+  useKimiScaleQuota,
   useKimiStoredAccounts,
   useKimiTestModel,
   useKimiUndeploy,
 } from "@/hooks/useKimiDeploy";
 import { canonicalOwner } from "@/lib/ownerTag";
+import { hasQuotaUpdate, nextQuotaTierLabel, quotaTierLabel, quotaTierNumber } from "@/lib/tpmTier";
 import { toastDismiss, toastError, toastSuccess } from "@/lib/toast";
 import { AzureDeploySecret, parseAzureDeploySecretsArray, toKimiDeployPayload } from "@/lib/parseAzureCredentials";
-import { KimiDeployProgressEvent, KimiDeployResult, KimiNewApiPool, KimiStoredAccount, KimiTestResult } from "@/types";
+import { KimiDeployResult, KimiNewApiPool, KimiStoredAccount, KimiTestResult } from "@/types";
 
 const PARALLEL_JOBS = 12;
+const PAGE_SIZE = 10;
 const LEFTOVER_SECRETS_KEY = "kimi-deploy-secrets";
 
-type DeployRunProgress = {
-  total: number;
-  done: number;
-  phase: string;
-  message: string;
-  startedAt: number;
-};
+type DeploySort = "name" | "name-desc" | "newest" | "oldest" | "tpm-desc" | "tpm-asc" | "tier-desc" | "tier-asc" | "email";
+type DateFilter = "all" | "today" | "7d" | "30d" | "unknown";
 
 function parallelJobs(count: number) {
   return Math.max(1, Math.min(PARALLEL_JOBS, count));
@@ -55,12 +57,14 @@ export default function DeployK3Page() {
   const stored = useKimiStoredAccounts();
   const regenerate = useKimiRegenerateKeys();
   const undeploy = useKimiUndeploy();
+  const dropStored = useKimiDropStored();
   const testModel = useKimiTestModel();
   const addNewApi = useKimiAddNewApi();
   const applyContentFilter = useKimiContentFilter();
   const renameNewApi = useKimiRenameNewApi();
   const sheetStatus = useKimiSheetStatus();
   const sheetSync = useKimiSheetSync();
+  const scaleQuota = useKimiScaleQuota();
   const refreshInventory = useKimiRefreshInventory();
   const [jsonText, setJsonText] = useState("");
   const [jsonLocked, setJsonLocked] = useState(false);
@@ -69,25 +73,57 @@ export default function DeployK3Page() {
   const [notice, setNotice] = useState<string | null>(null);
   const [results, setResults] = useState<KimiDeployResult[] | null>(null);
   const [deletingIndex, setDeletingIndex] = useState<number | "all" | null>(null);
+  const [droppingIndex, setDroppingIndex] = useState<number | "all" | null>(null);
+  const [hiddenLeftovers, setHiddenLeftovers] = useState<string[]>([]);
   const [rotatingIndex, setRotatingIndex] = useState<number | "all" | null>(null);
   const [testingIndex, setTestingIndex] = useState<number | "all" | null>(null);
   const [addingNewApiIndex, setAddingNewApiIndex] = useState<number | "all" | null>(null);
   const [renamingNewApiIndex, setRenamingNewApiIndex] = useState<number | null>(null);
   const [syncingSheetIndex, setSyncingSheetIndex] = useState<number | "all" | null>(null);
   const [refreshingIndex, setRefreshingIndex] = useState<number | null>(null);
+  const [upgradingTpmIndex, setUpgradingTpmIndex] = useState<number | "all" | null>(null);
+  const [deployQuery, setDeployQuery] = useState("");
+  const [deploySort, setDeploySort] = useState<DeploySort>("newest");
+  const [tierFilter, setTierFilter] = useState<"all" | number>("all");
+  const [dateFilter, setDateFilter] = useState<DateFilter>("all");
+  const [page, setPage] = useState(0);
+  const [showAll, setShowAll] = useState(false);
   const [testByIndex, setTestByIndex] = useState<Record<number, KimiTestResult>>({});
   const [dragging, setDragging] = useState(false);
-  const [newApiPriority, setNewApiPriority] = useState(13);
+  const [newApiPriority, setNewApiPriority] = useState(10);
   const [newApiWeight, setNewApiWeight] = useState(1);
   const [deploying, setDeploying] = useState(false);
-  const [deployProgress, setDeployProgress] = useState<DeployRunProgress | null>(null);
-  const [now, setNow] = useState(() => Date.now());
+  const deployDefaults = useKimiDeployDefaults();
+  const saveDeployDefaults = useSaveKimiDeployDefaults();
+  const serverJob = useKimiDeployJob();
+  const watchedJobId = useRef<string | null>(null);
+  const seededDefaults = useRef(false);
 
   useEffect(() => {
-    if (!deploying) return;
-    const id = window.setInterval(() => setNow(Date.now()), 400);
-    return () => window.clearInterval(id);
-  }, [deploying]);
+    if (!deployDefaults.data || seededDefaults.current) return;
+    seededDefaults.current = true;
+    setNewApiPriority(deployDefaults.data.priority);
+    setNewApiWeight(deployDefaults.data.weight);
+  }, [deployDefaults.data]);
+
+  useEffect(() => {
+    const job = serverJob.data;
+    if (job?.running && job.job_id) {
+      setDeploying(true);
+      watchedJobId.current = job.job_id;
+    }
+  }, [serverJob.data]);
+
+  useEffect(() => {
+    const job = serverJob.data;
+    if (!job || job.running || !deploying) return;
+    if (!watchedJobId.current || job.job_id !== watchedJobId.current) return;
+    if (job.error) setError(job.error);
+    if (job.results?.length) applyJobResults(job.results, loadedAccounts);
+    setDeploying(false);
+    invalidateAfterDeploy(queryClient);
+    void stored.refetch();
+  }, [deploying, loadedAccounts, queryClient, serverJob.data, stored]);
 
   useEffect(() => {
     if (error) toastError(error, { toastId: "deploy-err", persist: true });
@@ -115,61 +151,145 @@ export default function DeployK3Page() {
   );
   const sessionActive = jsonLocked && loadedAccounts.length > 0;
   const workingAccounts = sessionActive ? loadedAccounts : storedSecrets;
-  const deployPayload = useMemo(
+  const listedAccounts = useMemo(
     () =>
-      toKimiDeployPayload(workingAccounts).map((row) => {
+      workingAccounts
+        .map((account, index) => ({ account, index }))
+        .filter(({ account }) => matchesAccountSearch(account, deployQuery))
+        .filter(({ account }) => matchesAccountDateFilter(account, dateFilter))
+        .sort((left, right) => compareAccounts(left.account, right.account, deploySort)),
+    [dateFilter, deployQuery, deploySort, workingAccounts]
+  );
+  const showDeployed = workingAccounts.length > 0 || Boolean(results);
+  const newApiPool = useKimiNewApiPool(showDeployed);
+  const resultCards = useMemo(() => {
+    if (!results) return null;
+    return results
+      .map((item, index) => ({ item: mergeNewApi(item, newApiPool.data), index }))
+      .filter(({ item }) => !item.removed)
+      .filter(({ item }) => matchesDeploySearch(item, deployQuery, holderFromPaste(item)))
+      .filter(({ item }) => matchesTierFilter(item, tierFilter))
+      .filter(({ item }) => matchesDateFilter(item, dateFilter))
+      .sort((left, right) => compareDeployCards(left.item, right.item, deploySort));
+  }, [dateFilter, deployQuery, deploySort, newApiPool.data, results, tierFilter, workingAccounts]);
+  const listTotal = resultCards?.length ?? listedAccounts.length;
+  const pageCount = Math.max(1, Math.ceil(listTotal / PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pageStart = safePage * PAGE_SIZE;
+  const pageEntries = useMemo(
+    () => (showAll ? listedAccounts : listedAccounts.slice(pageStart, pageStart + PAGE_SIZE)),
+    [listedAccounts, pageStart, showAll]
+  );
+  const pageAccounts = pageEntries.map((entry) => entry.account);
+  const pagePayload = useMemo(
+    () =>
+      toKimiDeployPayload(pageAccounts).map((row) => {
         if (!row.AZURE_CLIENT_SECRET) return row;
         const { AZURE_CLIENT_SECRET: _secret, ...rest } = row;
         return rest;
       }),
-    [workingAccounts]
+    [pageAccounts]
   );
-  const showDeployed = workingAccounts.length > 0 || Boolean(results);
-  const inventory = useKimiInventory(deployPayload, showDeployed && !deploying);
-  const newApiPool = useKimiNewApiPool(showDeployed);
+  const inventory = useKimiInventory(pagePayload, showDeployed && !deploying && !results);
   const inventoryRows = useMemo(
     () =>
-      deployPayload.map((account, index) => {
+      pagePayload.map((account, index) => {
         const query = inventory.queries[index];
         const row = query?.data?.results[0];
-        const pasted = workingAccounts[index];
+        const pasted = pageAccounts[index];
+        const sourceIndex = pageEntries[index]?.index ?? index;
         if (row) {
           return {
-            ...row,
-            subscription_name:
-              row.subscription_name || pasted?.subscriptionName || account.subscription_name || null,
-            owner_tag: row.owner_tag || pasted?.personAssociated || null,
+            item: {
+              ...row,
+              subscription_name:
+                row.subscription_name || pasted?.subscriptionName || account.subscription_name || null,
+              owner_tag: row.owner_tag || pasted?.personAssociated || null,
+            },
+            index: sourceIndex,
           };
         }
         return {
-          ok: false,
-          name: pasted?.name || account.name,
-          email: pasted?.accountHolder || null,
-          subscription_id: pasted?.subscriptionId || account.AZURE_SUBSCRIPTION_ID,
-          subscription_name: pasted?.subscriptionName || null,
-          owner_tag: pasted?.personAssociated || null,
-          pending: Boolean(query?.isFetching || query?.isPending),
-          error: query?.isError ? "Could not list deployed resources for this account." : null,
-        } satisfies KimiDeployResult;
+          item: {
+            ok: false,
+            name: pasted?.name || account.name,
+            email: looksLikeEmail(pasted?.accountHolder) ? pasted?.accountHolder : null,
+            subscription_id: pasted?.subscriptionId || account.AZURE_SUBSCRIPTION_ID,
+            subscription_name: pasted?.subscriptionName || null,
+            owner_tag: pasted?.personAssociated || null,
+            pending: Boolean(query?.isFetching || query?.isPending),
+            error: query?.isError ? "Could not list deployed resources for this account." : null,
+          } satisfies KimiDeployResult,
+          index: sourceIndex,
+        };
       }),
-    [deployPayload, inventory.queries, workingAccounts]
+    [inventory.queries, pageAccounts, pageEntries, pagePayload]
   );
-  const displayed = useMemo(
-    () => (results ?? inventoryRows).map((item) => mergeNewApi(item, newApiPool.data)),
-    [inventoryRows, newApiPool.data, results]
-  );
+  const displayedCards = useMemo(() => {
+    if (resultCards) {
+      return showAll ? resultCards : resultCards.slice(safePage * PAGE_SIZE, safePage * PAGE_SIZE + PAGE_SIZE);
+    }
+    return inventoryRows
+      .map(({ item, index }) => ({
+        item: mergeNewApi(item, newApiPool.data),
+        index,
+      }))
+      .sort((left, right) => compareDeployCards(left.item, right.item, deploySort));
+  }, [deploySort, inventoryRows, newApiPool.data, resultCards, safePage, showAll]);
+  const displayed = useMemo(() => displayedCards.map((row) => row.item), [displayedCards]);
   const busy =
     deploying ||
     regenerate.isPending ||
     undeploy.isPending ||
+    dropStored.isPending ||
     testModel.isPending ||
     addNewApi.isPending ||
     applyContentFilter.isPending ||
     renameNewApi.isPending ||
-    sheetSync.isPending;
+    sheetSync.isPending ||
+    scaleQuota.isPending;
   const liveResults = displayed.filter((item) => item.ok && !item.removed);
-  const testableResults = displayed.filter((item) => !item.removed && !item.error && !item.pending);
-  const pendingCount = displayed.filter((item) => item.pending).length;
+  const upgradableResults = displayedCards.filter(({ item }) => item.ok && !item.removed && hasQuotaUpdate(item));
+  const leftoverResults = results
+    ? []
+    : displayedCards.filter(
+        ({ item }) =>
+          !item.pending && !item.removed && !item.ok && !hiddenLeftovers.includes(leftoverKey(item))
+      );
+  const listedTiers = useMemo(() => {
+    const nums = new Set<number>();
+    for (const item of displayed) {
+      if (!item.ok || item.removed) continue;
+      const n = quotaTierNumber(item.account_tier);
+      if (n != null) nums.add(n);
+    }
+    return [...nums].sort((a, b) => a - b);
+  }, [displayed]);
+  const visibleCards = useMemo(
+    () =>
+      displayedCards.filter(({ item }) => {
+        if (item.removed) return false;
+        if (results) return true;
+        if (!item.ok) return false;
+        return (
+          matchesTierFilter(item, tierFilter) &&
+          matchesDeploySearch(item, deployQuery, holderFromPaste(item))
+        );
+      }),
+    [deployQuery, displayedCards, results, tierFilter, workingAccounts]
+  );
+  const progressItems = resultCards ?? displayedCards;
+  const pendingCount = progressItems.filter(({ item }) => item.pending).length;
+  const testableResults = displayed.filter((item) => item.ok && !item.removed && !item.pending);
+  const pageFrom = listTotal === 0 ? 0 : safePage * PAGE_SIZE + 1;
+  const pageTo = Math.min(listTotal, (safePage + 1) * PAGE_SIZE);
+
+  useEffect(() => {
+    setPage(0);
+  }, [dateFilter, deployQuery, deploySort, tierFilter]);
+  useEffect(() => {
+    if (page !== safePage) setPage(safePage);
+  }, [page, safePage]);
   const pendingParse = Boolean(jsonText.trim() && !parseError && parsed.accounts.length > 0);
   const canDeploy = Boolean(status.data?.ready && (sessionActive || pendingParse));
 
@@ -192,7 +312,6 @@ export default function DeployK3Page() {
     setJsonLocked(true);
     setResults(null);
     setTestByIndex({});
-    setDeployProgress(null);
     setError(null);
     setNotice(null);
     return accounts;
@@ -221,77 +340,17 @@ export default function DeployK3Page() {
     setNotice(null);
   }
 
-  function applyDeployEvent(event: KimiDeployProgressEvent, accounts: AzureDeploySecret[]) {
-    if (event.type === "start") {
-      setDeployProgress((prev) => ({
-        total: event.total ?? accounts.length,
-        done: 0,
-        phase: event.phase || "azure",
-        message: event.message || `Deploying ${accounts.length} Azure stacks in parallel`,
-        startedAt: prev?.startedAt ?? Date.now(),
-      }));
-      return;
-    }
-    if (event.type === "account" && event.result && event.index != null) {
-      const pasted = accounts[event.index];
-      const result = event.result;
-      const index = event.index;
-      setResults((prev) => {
-        const next = [...(prev ?? [])];
-        while (next.length <= index) next.push({ ok: false, pending: true });
-        next[index] = {
-          ...result,
-          ok: Boolean(result.ok),
-          pending: false,
-          email: result.email || pasted?.accountHolder || result.email,
-          name: result.name || pasted?.name || result.name,
-          owner_tag: result.owner_tag || pasted?.personAssociated || result.owner_tag,
-        };
-        return next;
-      });
-      setDeployProgress((prev) => ({
-        total: event.total ?? prev?.total ?? accounts.length,
-        done: event.done ?? prev?.done ?? 0,
-        phase: event.phase || prev?.phase || "azure",
-        message: `${event.done ?? 0} of ${event.total ?? accounts.length} Azure stacks finished`,
-        startedAt: prev?.startedAt ?? Date.now(),
-      }));
-      return;
-    }
-    if (event.type === "phase") {
-      setDeployProgress((prev) => ({
-        total: event.total ?? prev?.total ?? accounts.length,
-        done: prev?.done ?? 0,
-        phase: event.phase || prev?.phase || "portal",
-        message: event.message || "Working…",
-        startedAt: prev?.startedAt ?? Date.now(),
-      }));
-      return;
-    }
-    if (event.type === "done" && event.results) {
-      const mapped = event.results.map((item, index) => ({
-        ...item,
-        ok: Boolean(item.ok),
-        pending: false,
-        email: item.email || accounts[index]?.accountHolder || item.email,
-        name: item.name || accounts[index]?.name || item.name,
-        owner_tag: item.owner_tag || accounts[index]?.personAssociated || item.owner_tag,
-      }));
-      setResults(mapped);
-      const parts = deploySummary(mapped);
-      setNotice(parts.join(" "));
-      setDeployProgress((prev) => ({
-        total: mapped.length,
-        done: mapped.length,
-        phase: "done",
-        message: parts.join(" "),
-        startedAt: prev?.startedAt ?? Date.now(),
-      }));
-      return;
-    }
-    if (event.type === "error") {
-      setError(event.detail || "Deploy failed.");
-    }
+  function applyJobResults(jobResults: KimiDeployResult[], accounts: AzureDeploySecret[]) {
+    const mapped = jobResults.map((item, index) => ({
+      ...item,
+      ok: Boolean(item.ok),
+      pending: false,
+      email: item.email || accounts[index]?.accountHolder || item.email,
+      name: item.name || accounts[index]?.name || item.name,
+      owner_tag: item.owner_tag || accounts[index]?.personAssociated || item.owner_tag,
+    }));
+    setResults(mapped);
+    setNotice(deploySummary(mapped).join(" "));
   }
 
   async function handleDeploy() {
@@ -299,16 +358,7 @@ export default function DeployK3Page() {
     setNotice(null);
     const accounts = commitSecrets();
     if (!accounts) return;
-    const startedAt = Date.now();
-    setNow(startedAt);
     setDeploying(true);
-    setDeployProgress({
-      total: accounts.length,
-      done: 0,
-      phase: "azure",
-      message: `Starting ${accounts.length} parallel Azure deploy${accounts.length === 1 ? "" : "s"}…`,
-      startedAt,
-    });
     setResults(
       accounts.map((account) => ({
         ok: false,
@@ -321,25 +371,22 @@ export default function DeployK3Page() {
       }))
     );
     try {
-      await streamKimiDeploy(
-        {
-          accounts: toKimiDeployPayload(accounts),
-          jobs: parallelJobs(accounts.length),
-          new_api_priority: newApiPriority,
-          new_api_weight: newApiWeight,
-        },
-        (event) => applyDeployEvent(event, accounts)
-      );
-      invalidateAfterDeploy(queryClient);
-      await stored.refetch();
-      await inventory.refetch();
+      watchedJobId.current = null;
+      const job = await startKimiDeployJob({
+        accounts: toKimiDeployPayload(accounts),
+        jobs: parallelJobs(accounts.length),
+        new_api_priority: newApiPriority,
+        new_api_weight: newApiWeight,
+      });
+      watchedJobId.current = job.job_id ?? null;
+      await queryClient.invalidateQueries({ queryKey: ["kimi-deploy-job"] });
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : "Deploy failed.";
+      const message = err instanceof Error ? err.message : "Could not queue deploy.";
       setError(message);
       setResults((prev) =>
-        prev?.map((item) => (item.pending ? { ...item, pending: false, error: item.error || "Deploy stopped." } : item)) ?? null
+        prev?.map((item) => (item.pending ? { ...item, pending: false, error: item.error || "Deploy was not queued." } : item)) ??
+          null
       );
-    } finally {
       setDeploying(false);
     }
   }
@@ -395,13 +442,15 @@ export default function DeployK3Page() {
         priority: newApiPriority,
         weight: newApiWeight,
       });
-      setResults(
-        displayed.map((item, index) => {
-          const payloadIndex = payloads.findIndex((row) => row.index === index);
-          if (payloadIndex < 0) return item;
-          const row = response.results[payloadIndex];
-          return row ? { ...item, ...newApiFields(row) } : item;
-        })
+      setResults((prev) =>
+        prev
+          ? prev.map((item, index) => {
+              const payloadIndex = payloads.findIndex((row) => row.index === index);
+              if (payloadIndex < 0) return item;
+              const row = response.results[payloadIndex];
+              return row ? { ...item, ...newApiFields(row) } : item;
+            })
+          : prev
       );
       const added = response.results.filter((row) => row.new_api_created).length;
       const already = response.results.filter((row) => row.new_api_present && !row.new_api_created).length;
@@ -448,10 +497,8 @@ export default function DeployK3Page() {
         account_name: item.account_name || "",
         azure_openai_endpoint: item.azure_openai_endpoint || "",
       });
-      setResults(
-        displayed.map((current, currentIndex) =>
-          currentIndex === index ? { ...current, ...newApiFields(row) } : current
-        )
+      setResults((prev) =>
+        prev ? prev.map((current, currentIndex) => (currentIndex === index ? { ...current, ...newApiFields(row) } : current)) : prev
       );
       setNotice(
         `Updated NewAPI channel ${row.new_api_name || trimmed} (p${row.new_api_priority ?? patch.priority} · w${row.new_api_weight ?? patch.weight}).`
@@ -494,7 +541,7 @@ export default function DeployK3Page() {
     setNotice(null);
     const accounts = secretsForActions();
     if (!accounts) return;
-    const payload = payloadForResult(item, accounts) || deployPayload[index];
+    const payload = payloadForResult(item, accounts);
     if (!payload) {
       setError(`Need the matching account to refresh ${displayName(item)}.`);
       return;
@@ -518,6 +565,65 @@ export default function DeployK3Page() {
       setError(apiErrorMessage(err, "Could not refresh this account."));
     } finally {
       setRefreshingIndex(null);
+    }
+  }
+
+  async function handleUpgradeTpm(items: { item: KimiDeployResult; index: number }[], bulk: boolean) {
+    setError(null);
+    setNotice(null);
+    const accounts = secretsForActions();
+    if (!accounts) return;
+    const payloads: { index: number; name: string; payload: Record<string, string> }[] = [];
+    const missing: string[] = [];
+    for (const { item, index } of items) {
+      const payload = payloadForResult(item, accounts);
+      if (!payload) missing.push(displayName(item));
+      else payloads.push({ index, name: displayName(item), payload });
+    }
+    if (missing.length > 0) {
+      setError(`Need the matching account to upgrade TPM/RPM for: ${missing.join(", ")}.`);
+      return;
+    }
+    const preview = items[0]?.item;
+    const confirmed = window.confirm(
+      bulk
+        ? `Upgrade TPM/RPM to Azure quota on ${payloads.length} stack${payloads.length === 1 ? "" : "s"}? Sheet TPM will update after a successful scale.`
+        : `Upgrade TPM/RPM for ${payloads[0]?.name} from ${formatQuotaPair(preview?.tpm, preview?.rpm)} to ${formatQuotaPair(preview?.tpm_available, preview?.rpm_available)}?`
+    );
+    if (!confirmed) return;
+    setUpgradingTpmIndex(bulk ? "all" : payloads[0].index);
+    try {
+      const response = await scaleQuota.mutateAsync({
+        accounts: payloads.map((row) => row.payload),
+        jobs: parallelJobs(payloads.length),
+      });
+      setResults((prev) =>
+        prev
+          ? prev.map((item, index) => {
+              const payloadIndex = payloads.findIndex((row) => row.index === index);
+              if (payloadIndex < 0) return item;
+              const row = response.results[payloadIndex];
+              if (!row?.ok) return item;
+              return { ...item, ...quotaFields(row), pending: false, error: null };
+            })
+          : prev
+      );
+      const failed = response.results.filter((row) => !row.ok);
+      setNotice(
+        failed.length > 0
+          ? `Upgraded TPM/RPM on ${response.ok_count}, failed ${response.fail_count}. Sheet rows updated for the successes.`
+          : response.ok_count === 1
+            ? "Upgraded TPM/RPM and synced the new values to the sheet."
+            : `Upgraded TPM/RPM on ${response.ok_count} stacks and synced the new values to the sheet.`
+      );
+      if (failed.length > 0) {
+        setError(failed.map((row) => `${row.name ?? "account"}: ${row.error}`).join("; "));
+      }
+      await inventory.refetch();
+    } catch (err: any) {
+      setError(apiErrorMessage(err, "Could not upgrade TPM/RPM."));
+    } finally {
+      setUpgradingTpmIndex(null);
     }
   }
 
@@ -587,7 +693,7 @@ export default function DeployK3Page() {
     setNotice(null);
     const accounts = secretsForActions();
     if (!accounts) return;
-    const items = displayed.map((item, index) => ({ item, index })).filter(({ item }) => item.ok && !item.removed);
+    const items = displayedCards.filter(({ item }) => item.ok && !item.removed);
     const payloads: Record<string, string>[] = [];
     const missing: string[] = [];
     for (const { item } of items) {
@@ -614,22 +720,25 @@ export default function DeployK3Page() {
       if (failed.length > 0) {
         setError(failed.map((row) => `${row.name ?? "account"}: ${row.error}`).join("; "));
       }
-      setResults(
-        displayed.map((item) => {
-          const row = response.results.find(
-            (entry) =>
-              (entry.subscription_id && entry.subscription_id === item.subscription_id) || entry.name === item.name
-          );
-          if (!row?.ok) return item;
-          return {
-            ...item,
-            removed: true,
-            deleted_resources: row.deleted ?? [],
-            deleted_message: row.message,
-            azure_openai_endpoint: null,
-          };
-        })
+      setResults((prev) =>
+        prev
+          ? prev.map((item) => {
+              const row = response.results.find(
+                (entry) =>
+                  (entry.subscription_id && entry.subscription_id === item.subscription_id) || entry.name === item.name
+              );
+              if (!row?.ok) return item;
+              return {
+                ...item,
+                removed: true,
+                deleted_resources: row.deleted ?? [],
+                deleted_message: row.message,
+                azure_openai_endpoint: null,
+              };
+            })
+          : prev
       );
+      await stored.refetch();
       await inventory.refetch();
     } catch (err: any) {
       setError(apiErrorMessage(err, "Could not delete deployed resources."));
@@ -658,24 +767,64 @@ export default function DeployK3Page() {
         return;
       }
       setNotice(row.message || `Deleted ${resourceLabel(item)}.`);
-      setResults(
-        displayed.map((entry, entryIndex) =>
-          entryIndex === index
-            ? {
-                ...entry,
-                removed: true,
-                deleted_resources: row.deleted ?? [],
-                deleted_message: row.message,
-                azure_openai_endpoint: null,
-              }
-            : entry
-        )
+      setResults((prev) =>
+        prev
+          ? prev.map((entry, entryIndex) =>
+              entryIndex === index
+                ? {
+                    ...entry,
+                    removed: true,
+                    deleted_resources: row.deleted ?? [],
+                    deleted_message: row.message,
+                    azure_openai_endpoint: null,
+                  }
+                : entry
+            )
+          : prev
       );
+      await stored.refetch();
       await inventory.refetch();
     } catch (err: any) {
       setError(apiErrorMessage(err, "Could not delete this resource."));
     } finally {
       setDeletingIndex(null);
+    }
+  }
+
+  async function handleDropLeftover(items: { item: KimiDeployResult; index: number }[], bulk: boolean) {
+    setError(null);
+    setNotice(null);
+    const ids = [
+      ...new Set(
+        items
+          .map(({ item }) => (item.subscription_id || "").trim())
+          .filter(Boolean)
+      ),
+    ];
+    if (ids.length === 0) {
+      setError("Those leftover identities have no subscription id to remove.");
+      return;
+    }
+    const confirmed = window.confirm(
+      bulk
+        ? `Remove ${ids.length} leftover identit${ids.length === 1 ? "y" : "ies"} with no live FW-Kimi-K3?`
+        : `Remove ${displayName(items[0].item)} from Deploy K3? There is no live FW-Kimi-K3 on this subscription.`
+    );
+    if (!confirmed) return;
+    setDroppingIndex(bulk ? "all" : items[0].index);
+    try {
+      const response = await dropStored.mutateAsync({ subscription_ids: ids });
+      setHiddenLeftovers((prev) => [...new Set([...prev, ...ids.map((id) => id.toLowerCase()), ...items.map(({ item }) => leftoverKey(item))])]);
+      setNotice(
+        response.dropped === 1
+          ? "Removed 1 leftover identity from Deploy K3."
+          : `Removed ${response.dropped} leftover identities from Deploy K3.`
+      );
+      await stored.refetch();
+    } catch (err: any) {
+      setError(apiErrorMessage(err, "Could not remove leftover identities."));
+    } finally {
+      setDroppingIndex(null);
     }
   }
 
@@ -725,21 +874,27 @@ export default function DeployK3Page() {
   }
 
   async function handleApplyContentFilter() {
-    const accounts = (stored.data?.accounts ?? []).map((row) => ({
-      name: row.name || "",
-      account_holder: row.account_holder || "",
-      AZURE_TENANT_ID: row.AZURE_TENANT_ID || "",
-      AZURE_CLIENT_ID: row.AZURE_CLIENT_ID || "",
-      AZURE_SUBSCRIPTION_ID: row.AZURE_SUBSCRIPTION_ID,
-      person_associated: row.owner_tag || "",
-    }));
-    if (accounts.length === 0) {
-      setError("No stored identities. Nothing to attach the content filter to.");
+    const targets = displayedCards.filter(({ item }) => item.ok && !item.removed);
+    const accounts = secretsForActions();
+    if (!accounts) return;
+    const payloads: Record<string, string>[] = [];
+    const missing: string[] = [];
+    for (const { item } of targets) {
+      const payload = payloadForResult(item, accounts);
+      if (!payload) missing.push(displayName(item));
+      else payloads.push(payload);
+    }
+    if (missing.length > 0) {
+      setError(`Need the matching elevated identity for: ${missing.join(", ")}.`);
+      return;
+    }
+    if (payloads.length === 0) {
+      setError("No elevated Deploy K3 stacks listed. Nothing to attach the content filter to.");
       return;
     }
     if (
       !window.confirm(
-        `Apply the Lioxi custom content filter to ${accounts.length} K3 stack${accounts.length === 1 ? "" : "s"}? This matches Lioxi-Gaurav2: High on hate/sexual/violence/self-harm; jailbreak and protected material off.`
+        `Apply the Lioxi custom content filter to ${payloads.length} elevated K3 stack${payloads.length === 1 ? "" : "s"} listed here? High on hate/sexual/violence/self-harm; jailbreak and protected material off.`
       )
     ) {
       return;
@@ -748,8 +903,8 @@ export default function DeployK3Page() {
     setNotice(null);
     try {
       const response = await applyContentFilter.mutateAsync({
-        accounts,
-        jobs: parallelJobs(accounts.length),
+        accounts: payloads,
+        jobs: parallelJobs(payloads.length),
       });
       const failed = response.results.filter((row) => !row.ok);
       setNotice(
@@ -793,9 +948,7 @@ export default function DeployK3Page() {
           <Button onClick={() => void handleDeploy()} isLoading={deploying} disabled={busy || !canDeploy} className="sm:w-auto">
             {!deploying && <Rocket size={16} />}
             {deploying
-              ? deployProgress
-                ? `Deploying ${deployProgress.done}/${deployProgress.total}…`
-                : `Deploying ${loadedAccounts.length || parsed.accounts.length}…`
+              ? "Running on server…"
               : (jsonLocked ? loadedAccounts.length : parsed.accounts.length)
                 ? `Deploy ${jsonLocked ? loadedAccounts.length : parsed.accounts.length}`
                 : "Deploy"}
@@ -807,12 +960,12 @@ export default function DeployK3Page() {
       </div>
 
       {status.isLoading && <Spinner />}
-      {deployProgress && deploying && (
-        <DeployProgressBar
-          progress={deployProgress}
-          elapsedMs={Math.max(0, now - deployProgress.startedAt)}
-          failed={(results ?? []).filter((item) => !item.pending && !item.ok).length}
-        />
+      {deploying && (
+        <p className="rounded-xl border border-accent/25 bg-accent/[0.07] px-4 py-3 text-sm text-indigo-100">
+          Deploy is running on the server
+          {serverJob.data?.total ? ` (${serverJob.data.total} account${serverJob.data.total === 1 ? "" : "s"})` : ""}.
+          You can leave this page — it will keep going.
+        </p>
       )}
 
       <Card className="flex flex-col gap-3 !p-4 sm:!p-5">
@@ -834,7 +987,6 @@ export default function DeployK3Page() {
                   setLoadedAccounts([]);
                   setResults(null);
                   setTestByIndex({});
-                  setDeployProgress(null);
                   setNotice(null);
                   setError(null);
                 }}
@@ -887,9 +1039,9 @@ export default function DeployK3Page() {
         )}
         {deploying && (
           <p className="text-xs text-gray-500">
-            {loadedAccounts.length} Azure stack{loadedAccounts.length === 1 ? "" : "s"} running in parallel
-            {loadedAccounts.length > 1 ? ` (${parallelJobs(loadedAccounts.length)} workers)` : ""}. Keep this tab
-            open — cards flip from deploying to done as each tenant finishes.
+            Job submitted. The server is deploying
+            {serverJob.data?.total ? ` ${serverJob.data.total} stack${serverJob.data.total === 1 ? "" : "s"}` : ""}.
+            Closing this tab does not stop it.
           </p>
         )}
       </Card>
@@ -898,27 +1050,27 @@ export default function DeployK3Page() {
         <section className="flex flex-col gap-3">
           <div className="flex flex-col gap-3">
             <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-              <div className="min-w-0">
+              <div className="min-w-0 sm:max-w-md sm:flex-1">
                 <h2 className="text-sm font-semibold text-gray-200">Deployed</h2>
-                <p className="text-xs text-gray-500">
-                  {deploying && pendingCount > 0
-                    ? `Deploying ${pendingCount} of ${displayed.length} in parallel…`
-                    : pendingCount > 0
-                      ? `Looking up ${pendingCount} subscription${pendingCount === 1 ? "" : "s"} in parallel…`
-                      : `${liveResults.length} live${
-                          displayed.filter((item) => !item.ok && item.error).length
-                            ? ` · ${displayed.filter((item) => !item.ok && item.error).length} failed`
-                            : ""
-                        }${
-                          displayed.filter((item) => item.new_api_present).length
-                            ? ` · ${displayed.filter((item) => item.new_api_present).length} in NewAPI`
-                            : ""
-                        }${
-                          displayed.filter((item) => item.removed).length
-                            ? ` · ${displayed.filter((item) => item.removed).length} deleted`
-                            : ""
-                        }`}
-                </p>
+                {pendingCount > 0 ? (
+                  <LookupProgress done={progressItems.length - pendingCount} total={progressItems.length} />
+                ) : (
+                  <p className="text-xs text-gray-500">
+                    {`${liveResults.length} live${
+                      leftoverResults.length ? ` · ${leftoverResults.length} leftover` : ""
+                    }${
+                      displayed.filter((item) => item.new_api_present).length
+                        ? ` · ${displayed.filter((item) => item.new_api_present).length} in NewAPI`
+                        : ""
+                    }${
+                      listTotal > PAGE_SIZE
+                        ? showAll
+                          ? ` · all ${listTotal}`
+                          : ` · ${pageFrom}–${pageTo} of ${listTotal}`
+                        : ""
+                    }`}
+                  </p>
+                )}
               </div>
               <div className="flex flex-wrap items-end gap-2">
                 <label className="flex flex-col gap-1 text-[11px] text-gray-500">
@@ -945,6 +1097,27 @@ export default function DeployK3Page() {
                     className="w-16 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
                   />
                 </label>
+                <Button
+                  variant="secondary"
+                  className="px-3 py-1.5 text-xs"
+                  disabled={busy || saveDeployDefaults.isPending}
+                  isLoading={saveDeployDefaults.isPending}
+                  onClick={() => {
+                    saveDeployDefaults.mutate(
+                      { priority: newApiPriority, weight: newApiWeight },
+                      {
+                        onSuccess: () =>
+                          toastSuccess(`Saved default priority ${newApiPriority} · weight ${newApiWeight}.`),
+                        onError: (exc: unknown) => {
+                          const detail = (exc as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+                          toastError(typeof detail === "string" ? detail : "Could not save deploy defaults.");
+                        },
+                      }
+                    );
+                  }}
+                >
+                  Save defaults
+                </Button>
                 {newApiPool.data?.next_name && !newApiPool.data.auth_expired && (
                   <p className="pb-2 text-[11px] text-gray-500">
                     Next <span className="font-mono text-gray-400">{newApiPool.data.next_name}</span>
@@ -960,9 +1133,7 @@ export default function DeployK3Page() {
                     className="px-3 py-1.5 text-xs"
                     onClick={() =>
                       void handleSyncSheet(
-                        displayed
-                          .map((item, index) => ({ item, index }))
-                          .filter(({ item }) => item.ok && !item.removed),
+                        displayedCards.filter(({ item }) => item.ok && !item.removed),
                         true
                       )
                     }
@@ -977,13 +1148,24 @@ export default function DeployK3Page() {
                     Sync all to sheet
                   </Button>
                 )}
+                {upgradableResults.length > 0 && (
+                  <Button
+                    variant="secondary"
+                    className="px-3 py-1.5 text-xs"
+                    onClick={() => void handleUpgradeTpm(upgradableResults, true)}
+                    isLoading={scaleQuota.isPending && upgradingTpmIndex === "all"}
+                    disabled={busy}
+                    title="Scale FW-Kimi-K3 to the higher Azure TPM/RPM quota"
+                  >
+                    Upgrade TPM ({upgradableResults.length})
+                  </Button>
+                )}
                 <Button
                   variant="secondary"
                   className="px-3 py-1.5 text-xs"
-                  onClick={() => void handleTest(
-                      displayed
-                        .map((item, index) => ({ item, index }))
-                        .filter(({ item }) => !item.removed && !item.error && !item.pending),
+                  onClick={() =>
+                    void handleTest(
+                      displayedCards.filter(({ item }) => item.ok && !item.removed && !item.pending),
                       true
                     )
                   }
@@ -997,8 +1179,8 @@ export default function DeployK3Page() {
                   className="px-3 py-1.5 text-xs"
                   onClick={() => void handleApplyContentFilter()}
                   isLoading={applyContentFilter.isPending}
-                  disabled={busy || (stored.data?.accounts.length ?? 0) === 0}
-                  title="Attach the Lioxi-Gaurav2 custom content filter to every stored K3 stack"
+                  disabled={busy || liveResults.length === 0}
+                  title="Attach the Lioxi custom content filter to the elevated Deploy K3 stacks listed here"
                 >
                   Apply content filter
                 </Button>
@@ -1008,9 +1190,7 @@ export default function DeployK3Page() {
                     className="px-3 py-1.5 text-xs"
                     onClick={() =>
                       void handleAddNewApi(
-                        displayed
-                          .map((item, index) => ({ item, index }))
-                          .filter(({ item }) => item.ok && !item.removed && !item.new_api_present),
+                        displayedCards.filter(({ item }) => item.ok && !item.removed && !item.new_api_present),
                         true
                       )
                     }
@@ -1027,7 +1207,7 @@ export default function DeployK3Page() {
                       className="px-3 py-1.5 text-xs"
                       onClick={() =>
                         void rotateAccounts(
-                          displayed.map((item, index) => ({ item, index })).filter(({ item }) => item.ok && !item.removed),
+                          displayedCards.filter(({ item }) => item.ok && !item.removed),
                           true
                         )
                       }
@@ -1050,15 +1230,78 @@ export default function DeployK3Page() {
               </div>
             )}
           </div>
-          {displayed.length === 0 ? (
-            <p className="text-sm text-gray-500">No FW-Kimi-K3 found on these subscriptions yet.</p>
+          {(liveResults.length > 0 || visibleCards.length > 0 || deployQuery.trim() || tierFilter !== "all" || dateFilter !== "all") && (
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <label className="relative min-w-0 flex-1">
+                <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" />
+                <input
+                  value={deployQuery}
+                  onChange={(event) => setDeployQuery(event.target.value)}
+                  placeholder="Search name, email, endpoint, NewAPI, Tier 1…"
+                  className="w-full rounded-lg border border-white/[0.08] bg-surface py-2 pl-9 pr-3 text-sm text-gray-100 outline-none placeholder:text-gray-600 focus:border-accent"
+                />
+              </label>
+              <select
+                value={tierFilter === "all" ? "all" : String(tierFilter)}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setTierFilter(value === "all" ? "all" : Number(value));
+                }}
+                className="rounded-lg border border-white/[0.08] bg-surface px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent"
+                title="Filter by Azure quota tier"
+              >
+                <option value="all">All quota tiers</option>
+                {listedTiers.map((tier) => (
+                  <option key={tier} value={tier}>
+                    {tier === 0 ? "Free Tier" : `Tier ${tier}`}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={dateFilter}
+                onChange={(event) => setDateFilter(event.target.value as DateFilter)}
+                className="rounded-lg border border-white/[0.08] bg-surface px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent"
+                title="Filter by when the stack was deployed"
+              >
+                <option value="all">All deploy times</option>
+                <option value="today">Deployed today</option>
+                <option value="7d">Last 7 days</option>
+                <option value="30d">Last 30 days</option>
+                <option value="unknown">Unknown time</option>
+              </select>
+              <select
+                value={deploySort}
+                onChange={(event) => setDeploySort(event.target.value as DeploySort)}
+                className="rounded-lg border border-white/[0.08] bg-surface px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent"
+                title="Sort deployed cards. TPM/RPM upgrades stay on top."
+              >
+                <option value="name">Name A–Z</option>
+                <option value="name-desc">Name Z–A</option>
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="tier-asc">Quota tier low–high</option>
+                <option value="tier-desc">Quota tier high–low</option>
+                <option value="tpm-desc">TPM high–low</option>
+                <option value="tpm-asc">TPM low–high</option>
+                <option value="email">Email</option>
+              </select>
+            </div>
+          )}
+          {visibleCards.length === 0 ? (
+            <p className="text-sm text-gray-500">
+              {deployQuery.trim() || tierFilter !== "all" || dateFilter !== "all"
+                ? "No deployed stacks match this search."
+                : leftoverResults.length > 0
+                  ? "No live FW-Kimi-K3 on these subscriptions."
+                  : "No FW-Kimi-K3 found on these subscriptions yet."}
+            </p>
           ) : (
             <div className="grid grid-cols-1 gap-3">
-              {displayed.map((item, index) => (
+              {visibleCards.map(({ item, index }) => (
                 <DeployedKimiCard
                   key={`${item.subscription_id ?? item.name ?? "row"}-${index}`}
                   item={item}
-                  email={item.email || holderFromPaste(item)}
+                  email={cardEmail(item, holderFromPaste(item))}
                   busy={busy || refreshingIndex === index}
                   deploying={deploying && Boolean(item.pending)}
                   rotating={regenerate.isPending && rotatingIndex === index}
@@ -1068,6 +1311,7 @@ export default function DeployK3Page() {
                   renamingNewApi={renameNewApi.isPending && renamingNewApiIndex === index}
                   syncingSheet={sheetSync.isPending && (syncingSheetIndex === index || syncingSheetIndex === "all")}
                   refreshing={refreshingIndex === index}
+                  upgradingTpm={scaleQuota.isPending && (upgradingTpmIndex === index || upgradingTpmIndex === "all")}
                   nextNewApiName={newApiPool.data?.next_name}
                   defaultPriority={newApiPriority}
                   defaultWeight={newApiWeight}
@@ -1081,8 +1325,95 @@ export default function DeployK3Page() {
                   onSaveNewApi={(patch) => void handleSaveNewApi(item, index, patch)}
                   onSyncSheet={() => void handleSyncSheet([{ item, index }], false)}
                   onRefresh={() => void handleRefreshOne(item, index)}
+                  onUpgradeTpm={() => void handleUpgradeTpm([{ item, index }], false)}
                 />
               ))}
+            </div>
+          )}
+          {listTotal > PAGE_SIZE && (
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-xs text-gray-500">
+                {showAll ? `All ${listTotal}` : `${pageFrom}–${pageTo} of ${listTotal}`}
+              </p>
+              <div className="flex items-center gap-2">
+                {!showAll && (
+                  <>
+                    <Button
+                      variant="secondary"
+                      className="px-3 py-1.5 text-xs"
+                      disabled={safePage <= 0}
+                      onClick={() => setPage(safePage - 1)}
+                    >
+                      Prev
+                    </Button>
+                    <span className="tabular-nums text-xs text-gray-400">
+                      {safePage + 1} / {pageCount}
+                    </span>
+                    <Button
+                      variant="secondary"
+                      className="px-3 py-1.5 text-xs"
+                      disabled={safePage >= pageCount - 1}
+                      onClick={() => setPage(safePage + 1)}
+                    >
+                      Next
+                    </Button>
+                  </>
+                )}
+                <Button
+                  variant="secondary"
+                  className="px-3 py-1.5 text-xs"
+                  onClick={() => {
+                    setShowAll((current) => !current);
+                    setPage(0);
+                  }}
+                >
+                  {showAll ? "Show 10" : "Show all"}
+                </Button>
+              </div>
+            </div>
+          )}
+          {leftoverResults.length > 0 && (
+            <div className="rounded-2xl border border-white/[0.08] bg-surface/60 px-4 py-3">
+              <div className="mb-2 flex flex-wrap items-center gap-2">
+                <p className="text-sm font-medium text-gray-200">Leftover identities</p>
+                <p className="text-xs text-gray-500">No live FW-Kimi-K3. Remove them from Deploy K3.</p>
+                <Button
+                  variant="danger"
+                  className="ml-auto px-3 py-1.5 text-xs"
+                  onClick={() => void handleDropLeftover(leftoverResults, true)}
+                  isLoading={dropStored.isPending && droppingIndex === "all"}
+                  disabled={busy}
+                >
+                  Delete leftover
+                </Button>
+              </div>
+              <ul className="flex flex-col gap-2">
+                {leftoverResults.map(({ item, index }) => (
+                  <li
+                    key={`${item.subscription_id ?? item.name ?? "leftover"}-${index}`}
+                    className="flex flex-wrap items-center gap-2 rounded-xl border border-white/[0.06] bg-black/20 px-3 py-2"
+                  >
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-sm text-gray-100">{displayName(item)}</p>
+                      <p className="truncate font-mono text-[11px] text-gray-500">
+                        {cardEmail(item, holderFromPaste(item)) || "—"}
+                        {item.subscription_id ? ` · ${item.subscription_id}` : ""}
+                      </p>
+                    </div>
+                    <Button
+                      variant="danger"
+                      className="px-2.5 py-1 text-xs"
+                      onClick={() => void handleDropLeftover([{ item, index }], false)}
+                      isLoading={dropStored.isPending && droppingIndex === index}
+                      disabled={busy}
+                      title="Remove this stored identity from Deploy K3"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                      Delete
+                    </Button>
+                  </li>
+                ))}
+              </ul>
             </div>
           )}
         </section>
@@ -1107,72 +1438,6 @@ function deploySummary(mapped: KimiDeployResult[]) {
   if (already) parts.push(already === 1 ? "1 was already in NewAPI." : `${already} were already in NewAPI.`);
   if (newApiFailed) parts.push(newApiFailed === 1 ? "1 NewAPI add failed." : `${newApiFailed} NewAPI adds failed.`);
   return parts;
-}
-
-function formatElapsed(ms: number) {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  if (minutes === 0) return `${seconds}s`;
-  return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
-}
-
-function deployPercent(progress: DeployRunProgress) {
-  if (progress.phase === "done") return 100;
-  const azure = progress.total > 0 ? progress.done / progress.total : 0;
-  if (progress.phase === "azure") return Math.min(82, Math.max(3, Math.round(azure * 82)));
-  if (progress.phase === "portal") return 88;
-  if (progress.phase === "newapi") return 94;
-  return Math.min(99, Math.max(3, Math.round(azure * 100)));
-}
-
-function phaseCaption(phase: string) {
-  if (phase === "azure") return "Azure stacks";
-  if (phase === "portal") return "Portal accounts";
-  if (phase === "newapi") return "O1 NewAPI";
-  if (phase === "done") return "Done";
-  return phase;
-}
-
-function DeployProgressBar({
-  progress,
-  elapsedMs,
-  failed,
-}: {
-  progress: DeployRunProgress;
-  elapsedMs: number;
-  failed: number;
-}) {
-  const percent = deployPercent(progress);
-  const remaining = Math.max(0, progress.total - progress.done);
-  return (
-    <div className="overflow-hidden rounded-2xl border border-accent/25 bg-accent/[0.07] px-4 py-3 shadow-glow">
-      <div className="flex flex-wrap items-end justify-between gap-2">
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-gray-100">{progress.message}</p>
-          <p className="mt-0.5 text-xs text-gray-400">
-            {phaseCaption(progress.phase)}
-            {progress.phase === "azure"
-              ? ` · ${progress.done}/${progress.total} finished${remaining ? ` · ${remaining} still running` : ""}`
-              : ""}
-            {failed ? ` · ${failed} failed` : ""}
-          </p>
-        </div>
-        <div className="flex items-baseline gap-3 tabular-nums">
-          <span className="text-lg font-semibold text-gray-100">{percent}%</span>
-          <span className="text-xs text-gray-500">{formatElapsed(elapsedMs)}</span>
-        </div>
-      </div>
-      <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/[0.08]">
-        <div
-          className="relative h-full overflow-hidden rounded-full bg-accent-gradient transition-[width] duration-700 ease-out"
-          style={{ width: `${percent}%` }}
-        >
-          <span className="absolute inset-y-0 left-0 w-2/3 animate-bar-shimmer bg-gradient-to-r from-transparent via-white/35 to-transparent" />
-        </div>
-      </div>
-    </div>
-  );
 }
 
 const KIMI_500K_PROXY_RE = /^kimi-k3-500k-proxy-(\d+)$/i;
@@ -1222,22 +1487,227 @@ function newApiFields(row: KimiDeployResult): Partial<KimiDeployResult> {
   };
 }
 
+function quotaFields(row: KimiDeployResult): Partial<KimiDeployResult> {
+  return {
+    tpm: row.tpm,
+    rpm: row.rpm,
+    capacity: row.capacity,
+    quota_limit: row.quota_limit,
+    tpm_available: row.tpm_available,
+    rpm_available: row.rpm_available,
+    tpm_upgrade_available: row.tpm_upgrade_available,
+    quota_id: row.quota_id,
+    account_tier: row.account_tier,
+    account_tier_available: row.account_tier_available,
+    quota_tier_upgrade_available: row.quota_tier_upgrade_available,
+    sku: row.sku,
+    error: row.error,
+  };
+}
+
+function formatQuotaPair(tpm?: number | null, rpm?: number | null) {
+  const tokens =
+    tpm == null
+      ? "—"
+      : tpm >= 1_000_000
+        ? `${tpm / 1_000_000}M`
+        : tpm >= 1_000
+          ? `${tpm / 1_000}k`
+          : String(tpm);
+  return `${tokens} / ${rpm ?? "—"}`;
+}
+
 function resourceHost(value?: string | null) {
   if (!value) return "";
   const raw = value.replace(/^https?:\/\//i, "").split("/")[0];
   return raw.split(".")[0].toLowerCase();
 }
 
+function looksLikeEmail(value?: string | null) {
+  const text = (value || "").trim();
+  return text.includes("@") && !text.includes(" ");
+}
+
+function cardEmail(item: KimiDeployResult, fallback?: string | null): string {
+  if (looksLikeEmail(item.email)) return String(item.email).trim();
+  if (looksLikeEmail(fallback)) return String(fallback).trim();
+  return "";
+}
+
 function storedToSecret(row: KimiStoredAccount): AzureDeploySecret {
+  const email = looksLikeEmail(row.account_holder) ? String(row.account_holder).trim() : undefined;
   return {
-    name: row.name || row.account_holder || "account",
-    accountHolder: row.account_holder || undefined,
+    name: row.name || "account",
+    accountHolder: email,
     tenantId: row.AZURE_TENANT_ID || "",
     clientId: row.AZURE_CLIENT_ID || "",
     subscriptionId: row.AZURE_SUBSCRIPTION_ID,
     subscriptionName: row.subscription_name || undefined,
     personAssociated: row.owner_tag || undefined,
+    createdAt: row.created_at || undefined,
   };
+}
+
+function matchesAccountSearch(account: AzureDeploySecret, query: string) {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return true;
+  const hay = [
+    account.name,
+    account.accountHolder,
+    account.subscriptionName,
+    account.subscriptionId,
+    account.personAssociated,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return hay.includes(needle);
+}
+
+function accountTimeMs(account: AzureDeploySecret) {
+  if (!account.createdAt) return 0;
+  const ms = new Date(account.createdAt).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function matchesAccountDateFilter(account: AzureDeploySecret, filter: DateFilter) {
+  if (filter === "all") return true;
+  const ms = account.createdAt ? new Date(account.createdAt).getTime() : NaN;
+  if (!Number.isFinite(ms)) return filter === "unknown";
+  if (filter === "unknown") return false;
+  const now = new Date();
+  if (filter === "today") {
+    return ms >= new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  }
+  const days = filter === "7d" ? 7 : 30;
+  return ms >= now.getTime() - days * 86400000;
+}
+
+function compareAccounts(left: AzureDeploySecret, right: AzureDeploySecret, sort: DeploySort) {
+  const name = (value?: string | null) => (value || "").trim().toLowerCase();
+  switch (sort) {
+    case "name":
+      return name(left.name).localeCompare(name(right.name));
+    case "name-desc":
+      return name(right.name).localeCompare(name(left.name));
+    case "oldest":
+      return accountTimeMs(left) - accountTimeMs(right);
+    case "email":
+      return name(left.accountHolder).localeCompare(name(right.accountHolder));
+    default:
+      return accountTimeMs(right) - accountTimeMs(left);
+  }
+}
+
+function LookupProgress({ done, total }: { done: number; total: number }) {
+  const safeTotal = Math.max(total, 1);
+  const percent = Math.round((Math.max(0, done) / safeTotal) * 100);
+  return (
+    <div className="mt-2 flex items-center gap-3">
+      <div className="relative h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/[0.07]">
+        <div
+          className="absolute inset-y-0 left-0 rounded-full bg-accent-gradient shadow-glow-sm transition-[width] duration-500 ease-out"
+          style={{ width: `${percent}%` }}
+        />
+        <div className="pointer-events-none absolute inset-0 overflow-hidden">
+          <div className="h-full w-1/3 animate-bar-shimmer bg-gradient-to-r from-transparent via-white/30 to-transparent" />
+        </div>
+      </div>
+      <span className="shrink-0 tabular-nums text-[11px] text-gray-400">
+        {done}/{total}
+      </span>
+    </div>
+  );
+}
+
+function leftoverKey(item: KimiDeployResult) {
+  return (item.subscription_id || item.name || "").trim().toLowerCase();
+}
+
+function matchesDeploySearch(item: KimiDeployResult, query: string, extraEmail?: string | null) {
+  const needle = query.trim().toLowerCase().replace(/\s+/g, " ");
+  if (!needle) return true;
+  const compact = needle.replace(/\s+/g, "");
+  const tier = quotaTierLabel(item) || "";
+  const next = nextQuotaTierLabel(item) || "";
+  const hay = [
+    item.name,
+    item.account_name,
+    item.email,
+    extraEmail,
+    item.subscription_name,
+    item.subscription_id,
+    item.owner_tag,
+    item.new_api_name,
+    item.azure_openai_endpoint,
+    item.resource_group,
+    tier,
+    next,
+    tier.replace(/\s+/g, ""),
+    next.replace(/\s+/g, ""),
+    hasQuotaUpdate(item) ? "newupdate update" : "",
+    item.tpm != null ? String(item.tpm) : "",
+    item.tpm != null && item.tpm >= 1000 ? `${item.tpm / 1000}k` : "",
+    item.deployed_at || "",
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  return hay.includes(needle) || hay.replace(/\s+/g, "").includes(compact);
+}
+
+function matchesTierFilter(item: KimiDeployResult, filter: "all" | number) {
+  if (filter === "all") return true;
+  return quotaTierNumber(item.account_tier) === filter;
+}
+
+function deployTimeMs(item: KimiDeployResult): number | null {
+  if (!item.deployed_at) return null;
+  const ms = new Date(item.deployed_at).getTime();
+  return Number.isFinite(ms) ? ms : null;
+}
+
+function matchesDateFilter(item: KimiDeployResult, filter: DateFilter) {
+  if (filter === "all") return true;
+  const ms = deployTimeMs(item);
+  if (ms == null) return filter === "unknown";
+  if (filter === "unknown") return false;
+  const now = new Date();
+  if (filter === "today") {
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    return ms >= start;
+  }
+  const days = filter === "7d" ? 7 : 30;
+  return ms >= now.getTime() - days * 86400000;
+}
+
+function compareDeployCards(left: KimiDeployResult, right: KimiDeployResult, sort: DeploySort) {
+  const leftUp = hasQuotaUpdate(left) ? 1 : 0;
+  const rightUp = hasQuotaUpdate(right) ? 1 : 0;
+  if (leftUp !== rightUp) return rightUp - leftUp;
+  const name = (value?: string | null) => (value || "").trim().toLowerCase();
+  const leftTime = deployTimeMs(left) ?? 0;
+  const rightTime = deployTimeMs(right) ?? 0;
+  switch (sort) {
+    case "name-desc":
+      return name(right.name || right.account_name).localeCompare(name(left.name || left.account_name));
+    case "newest":
+      return rightTime - leftTime;
+    case "oldest":
+      return leftTime - rightTime;
+    case "email":
+      return name(left.email).localeCompare(name(right.email));
+    case "tpm-desc":
+      return (right.tpm || 0) - (left.tpm || 0);
+    case "tpm-asc":
+      return (left.tpm || 0) - (right.tpm || 0);
+    case "tier-desc":
+      return (quotaTierNumber(right.account_tier) ?? -1) - (quotaTierNumber(left.account_tier) ?? -1);
+    case "tier-asc":
+      return (quotaTierNumber(left.account_tier) ?? -1) - (quotaTierNumber(right.account_tier) ?? -1);
+    default:
+      return name(left.name || left.account_name).localeCompare(name(right.name || right.account_name));
+  }
 }
 
 function displayName(item: KimiDeployResult) {

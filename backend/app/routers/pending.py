@@ -1,20 +1,23 @@
-import asyncio
-import contextlib
-import json
-
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_admin
-from app.schemas.submit import PendingApproveRequest, PendingDeclineResponse, PendingListResponse, PendingRequestPublic
+from app.schemas.submit import (
+    PendingApproveAccepted,
+    PendingApproveRequest,
+    PendingBatchApproveRequest,
+    PendingBatchApproveResponse,
+    PendingBatchSkipped,
+    PendingDeclineResponse,
+    PendingListResponse,
+)
 from app.services.submit_service import (
     SubmitError,
-    approve_request,
+    enqueue_approve,
+    enqueue_approve_many,
     list_pending,
     pending_public,
-    register_approve_task,
     reject_request,
 )
 
@@ -42,66 +45,42 @@ async def pending_reject(request_id: int, db: AsyncSession = Depends(get_db)) ->
     return PendingDeclineResponse(ok=True, deleted_id=deleted_id, subscription_id=subscription_id)
 
 
-@router.post("/{request_id}/approve")
+@router.post("/approve-batch", response_model=PendingBatchApproveResponse)
+async def pending_approve_batch(
+    payload: PendingBatchApproveRequest,
+    db: AsyncSession = Depends(get_db),
+) -> PendingBatchApproveResponse:
+    try:
+        started, skipped = await enqueue_approve_many(
+            db,
+            payload.ids,
+            retry=payload.retry,
+            new_api_priority=payload.new_api_priority,
+            new_api_weight=payload.new_api_weight,
+        )
+    except SubmitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PendingBatchApproveResponse(
+        ok=True,
+        started=started,
+        skipped=[PendingBatchSkipped(id=item_id, error=error) for item_id, error in skipped],
+    )
+
+
+@router.post("/{request_id}/approve", response_model=PendingApproveAccepted)
 async def pending_approve(
     request_id: int,
     payload: PendingApproveRequest | None = None,
     db: AsyncSession = Depends(get_db),
-) -> StreamingResponse:
+) -> PendingApproveAccepted:
     body = payload or PendingApproveRequest()
-    queue: asyncio.Queue[dict | None] = asyncio.Queue()
-
-    async def on_progress(event: dict) -> None:
-        await queue.put(event)
-
-    async def run() -> None:
-        try:
-            results = await approve_request(
-                db,
-                request_id,
-                jobs=body.jobs,
-                new_api_priority=body.new_api_priority,
-                new_api_weight=body.new_api_weight,
-                on_progress=on_progress,
-            )
-            await queue.put(
-                {
-                    "type": "done",
-                    "total": len(results),
-                    "phase": "done",
-                    "results": [item.model_dump(mode="json") for item in results],
-                }
-            )
-        except SubmitError as exc:
-            await queue.put({"type": "error", "detail": str(exc)})
-        except Exception as exc:  # noqa: BLE001
-            await queue.put({"type": "error", "detail": str(exc)[:400]})
-        finally:
-            await queue.put(None)
-
-    async def events():
-        task = asyncio.create_task(run())
-        register_approve_task(request_id, task)
-        try:
-            while True:
-                try:
-                    item = await asyncio.wait_for(queue.get(), timeout=15)
-                except TimeoutError:
-                    yield ": ping\n\n"
-                    continue
-                if item is None:
-                    break
-                yield f"data: {json.dumps(item, default=str)}\n\n"
-        finally:
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    try:
+        row = await enqueue_approve(
+            db,
+            request_id,
+            new_api_priority=body.new_api_priority,
+            new_api_weight=body.new_api_weight,
+        )
+    except SubmitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PendingApproveAccepted(ok=True, request_id=row.id, status=row.status)

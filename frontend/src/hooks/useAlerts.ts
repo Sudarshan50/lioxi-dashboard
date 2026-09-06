@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/lib/apiClient";
-import { AlertConfig, AlertStateItem, AlertStatus } from "@/types";
+import { AlertConfig, AlertStateItem, AlertStatus, ClearGroupChatStatus } from "@/types";
 
 export function useAlertStatus() {
   return useQuery({
@@ -37,6 +37,43 @@ export function useAlertState() {
 export function useSendTestAlert() {
   return useMutation({
     mutationFn: async () => (await apiClient.post<{ status: string }>("/api/alerts/test")).data,
+  });
+}
+
+export function useSendGroupMessage() {
+  return useMutation({
+    mutationFn: async (text: string) =>
+      (await apiClient.post<{ status: string }>("/api/alerts/message", { text })).data,
+  });
+}
+
+export function useClearGroupChatStatus() {
+  return useQuery({
+    queryKey: ["alerts", "clear-chats"],
+    queryFn: async () => (await apiClient.get<ClearGroupChatStatus>("/api/alerts/clear-chats")).data,
+    refetchInterval: (query) => (query.state.data?.running ? 1000 : false),
+  });
+}
+
+export function useStartClearGroupChat() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => (await apiClient.post<ClearGroupChatStatus>("/api/alerts/clear-chats")).data,
+    onSuccess: (data) => {
+      queryClient.setQueryData(["alerts", "clear-chats"], data);
+      queryClient.invalidateQueries({ queryKey: ["alerts", "clear-chats"] });
+    },
+  });
+}
+
+export function useCancelClearGroupChat() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async () => (await apiClient.delete<ClearGroupChatStatus>("/api/alerts/clear-chats")).data,
+    onSuccess: (data) => {
+      queryClient.setQueryData(["alerts", "clear-chats"], data);
+      queryClient.invalidateQueries({ queryKey: ["alerts", "clear-chats"] });
+    },
   });
 }
 

@@ -5,7 +5,8 @@ import JoinTerminal, { JoinTermLine } from "@/components/join/JoinTerminal";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Input from "@/components/ui/Input";
-import { canonicalOwner } from "@/lib/ownerTag";
+import Spinner from "@/components/ui/Spinner";
+import { joinPickerName } from "@/lib/ownerTag";
 import { toastDismiss, toastError } from "@/lib/toast";
 import {
   JOIN_PASSWORD_KEY,
@@ -62,13 +63,17 @@ function subscriptionLabel(item: SubmitSubscription) {
   return `${item.name || "Subscription"} · ${subSlice} · tenant ${tenantSlice}`;
 }
 
+function isSubmitComplete(status: string | undefined) {
+  return status === "pending_approval" || status === "approved" || status === "approving";
+}
+
 async function pollCreatingSp(sessionId: string, stillThisSession: () => boolean) {
   while (stillThisSession()) {
     await new Promise((resolve) => window.setTimeout(resolve, 2000));
     if (!stillThisSession()) return null;
     const next = await fetchSubmitSnapshot(sessionId);
     if (!next) return { kind: "missing" as const };
-    if (next.status === "pending_approval" || next.status === "approved") return { kind: "done" as const, snap: next };
+    if (isSubmitComplete(next.status)) return { kind: "done" as const, snap: next };
     if (next.status === "failed" || next.status === "expired" || next.status === "rejected") {
       return { kind: "failed" as const, snap: next };
     }
@@ -125,6 +130,10 @@ export default function JoinPage() {
   const [subscriptionId, setSubscriptionId] = useState("");
   const [person, setPerson] = useState("");
   const [names, setNames] = useState<string[]>([]);
+  const [namesLoading, setNamesLoading] = useState(() => Boolean(sessionStorage.getItem(JOIN_PASSWORD_KEY)));
+  const [namesError, setNamesError] = useState<string | null>(null);
+  const [namesTick, setNamesTick] = useState(0);
+  const [doneMessage, setDoneMessage] = useState("Submitted. An admin will deploy Kimi K3.");
   const [phaseMessage, setPhaseMessage] = useState("Working…");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -143,17 +152,36 @@ export default function JoinPage() {
 
   useEffect(() => {
     if (!unlocked) return;
+    let cancelled = false;
+    setNamesLoading(true);
+    setNamesError(null);
     void fetchSubmitNames()
-      .then(setNames)
+      .then((rows) => {
+        if (cancelled) return;
+        setNames(rows.map((name) => joinPickerName(name)).filter((name): name is string => Boolean(name)));
+        setNamesError(null);
+      })
       .catch((exc) => {
-        if (exc instanceof Error && exc.message.includes("join password")) {
+        if (cancelled) return;
+        const message = exc instanceof Error ? exc.message : "Could not load names.";
+        if (message.includes("join password")) {
           setUnlocked(false);
           setStep("gate");
           return;
         }
-        setNames([]);
+        setNamesError(message);
+      })
+      .finally(() => {
+        if (!cancelled) setNamesLoading(false);
       });
-  }, [unlocked]);
+    return () => {
+      cancelled = true;
+    };
+  }, [unlocked, namesTick]);
+
+  useEffect(() => {
+    if (step === "name") setNamesTick((n) => n + 1);
+  }, [step]);
 
   useEffect(() => {
     if (!unlocked || !sessionId) return;
@@ -191,7 +219,11 @@ export default function JoinPage() {
               type: "done",
               session_id: sessionId,
               status: settled.snap.status,
-              message: settled.snap.message || "Submitted. An admin will deploy Kimi K3.",
+              message:
+                settled.snap.message ||
+                (settled.snap.status === "pending_approval"
+                  ? "Submitted. An admin will deploy Kimi K3."
+                  : "Submitted. Kimi K3 deploy is starting automatically."),
             });
             return;
           }
@@ -234,11 +266,18 @@ export default function JoinPage() {
     setSnapshot(current);
     if (current.subscriptions?.length) setSubscriptions(current.subscriptions);
     if (current.subscription_id) setSubscriptionId(current.subscription_id);
-    if (current.person_associated) setPerson(current.person_associated);
+    const savedName = joinPickerName(current.person_associated);
+    if (savedName) setPerson(savedName);
     if (current.error) setError(current.error);
     if (current.status === "logged_in") {
       pickSubscription(current.subscriptions ?? [], current.subscription_id);
-    } else if (current.status === "pending_approval" || current.status === "approved") {
+    } else if (isSubmitComplete(current.status)) {
+      setDoneMessage(
+        current.message ||
+          (current.status === "pending_approval"
+            ? "Submitted. An admin will deploy Kimi K3."
+            : "Submitted. Kimi K3 deploy is starting automatically.")
+      );
       setStep("done");
     } else if (current.status === "creating_sp") {
       setStep("working");
@@ -270,7 +309,16 @@ export default function JoinPage() {
     }
     if (kind === "device_code_wait") {
       const hint = String(event.message || "").trim();
-      setSigninHint(hint || null);
+      setSigninHint(hint || "Microsoft needs one more sign-in. Wait for a new code — do not reuse the previous one.");
+      setSnapshot((prev) => ({
+        ...(prev ?? { session_id: sid, status: "login_started" }),
+        session_id: sid || prev?.session_id || "",
+        status: "login_started",
+        device_user_code: "",
+        user_code: "",
+        device_verification_uri: "",
+        verification_uri: "",
+      }));
       return;
     }
     if (kind === "device_code") {
@@ -307,6 +355,12 @@ export default function JoinPage() {
       return;
     }
     if (kind === "done") {
+      setDoneMessage(
+        String(event.message || "").trim() ||
+          (event.status === "pending_approval"
+            ? "Submitted. An admin will deploy Kimi K3."
+            : "Submitted. Kimi K3 deploy is starting automatically.")
+      );
       clearJoinSession();
       setStep("done");
       return;
@@ -333,6 +387,8 @@ export default function JoinPage() {
     try {
       await unlockJoin(gatePassword.trim());
       setGatePassword("");
+      setNamesLoading(true);
+      setNamesError(null);
       setUnlocked(true);
       setStep("welcome");
     } catch (exc) {
@@ -361,9 +417,12 @@ export default function JoinPage() {
       setStep("signin");
       await streamSubmitEvents(created.session_id, applyEvent);
     } catch (exc) {
-      if (createdId) await cancelSubmitSession(createdId).catch(() => undefined);
-      if (createdId && sessionIdRef.current !== createdId) return;
       const message = exc instanceof Error ? exc.message : "Could not start Azure sign-in.";
+      // Let the server finish login. Cancelling here wiped the row and hid the real error.
+      if (createdId && !message.toLowerCase().includes("stream ended")) {
+        await cancelSubmitSession(createdId).catch(() => undefined);
+      }
+      if (createdId && sessionIdRef.current !== createdId) return;
       setError(message);
       if (message.includes("join password")) {
         setUnlocked(false);
@@ -404,15 +463,17 @@ export default function JoinPage() {
       return;
     }
     setError(null);
+    setNamesError(null);
+    if (names.length === 0) setNamesLoading(true);
     setStep("name");
   }
 
   async function handleCommit(event: FormEvent) {
     event.preventDefault();
     if (!sessionId) return;
-    const tag = canonicalOwner(person);
-    if (!tag) {
-      setError("Enter a name.");
+    const tag = joinPickerName(person);
+    if (!tag || !names.some((name) => name.toLowerCase() === tag.toLowerCase())) {
+      setError("Pick a name from the dropdown.");
       return;
     }
     if (!subscriptionId) {
@@ -427,12 +488,16 @@ export default function JoinPage() {
       await commitSubmitSession(sessionId, { subscription_id: subscriptionId, person_associated: tag }, applyEvent);
     } catch (exc) {
       const snap = await fetchSubmitSnapshot(sessionId).catch(() => null);
-      if (snap?.status === "pending_approval" || snap?.status === "approved") {
+      if (snap && isSubmitComplete(snap.status)) {
         applyEvent({
           type: "done",
           session_id: sessionId,
           status: snap.status,
-          message: "Submitted. An admin will deploy Kimi K3.",
+          message:
+            snap.message ||
+            (snap.status === "pending_approval"
+              ? "Submitted. An admin will deploy Kimi K3."
+              : "Submitted. Kimi K3 deploy is starting automatically."),
         });
         return;
       }
@@ -451,7 +516,11 @@ export default function JoinPage() {
             type: "done",
             session_id: sessionId,
             status: settled.snap.status,
-            message: settled.snap.message || "Submitted. An admin will deploy Kimi K3.",
+            message:
+              settled.snap.message ||
+              (settled.snap.status === "pending_approval"
+                ? "Submitted. An admin will deploy Kimi K3."
+                : "Submitted. Kimi K3 deploy is starting automatically."),
           });
           return;
         }
@@ -515,11 +584,16 @@ export default function JoinPage() {
         )}
         {step === "welcome" && (
           <div className="flex flex-col gap-4">
-            <p className="text-sm text-gray-400">
-              {error
-                ? "This attempt failed. Sign in again to reapply — you do not need an admin to decline first."
-                : "You will get a one-time Microsoft code. After you approve access, pick your subscription and name. You will never see a client secret."}
-            </p>
+            {error ? (
+              <p className="whitespace-pre-wrap rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                {error}
+              </p>
+            ) : (
+              <p className="text-sm text-gray-400">
+                You will get a one-time Microsoft code. After you approve access, pick your subscription and name. You
+                will never see a client secret.
+              </p>
+            )}
             <Button type="button" isLoading={busy} onClick={() => void startSignIn()} className="w-full">
               {error ? "Try again" : "Start Azure sign-in"}
             </Button>
@@ -540,8 +614,12 @@ export default function JoinPage() {
                   Open Microsoft device login
                 </a>
               </>
-            ) : null}
-            {signinHint && <p className="text-center text-xs text-gray-400">{signinHint}</p>}
+            ) : (
+              <p className="text-center text-xs text-gray-400">
+                {signinHint || "Waiting for a Microsoft device code…"}
+              </p>
+            )}
+            {code && signinHint && <p className="text-center text-xs text-gray-400">{signinHint}</p>}
             <JoinTerminal lines={termLines} waiting />
             <Button type="button" variant="secondary" onClick={() => void handleCancelSignIn()} className="w-full">
               Cancel
@@ -582,26 +660,58 @@ export default function JoinPage() {
                 Subscription <span className="text-gray-300">{subscriptionLabel(selected)}</span>
               </p>
             )}
-            <div>
-              <Input
-                id="join-name"
-                label="Your name"
-                list="join-name-options"
-                value={person}
-                onChange={(event) => setPerson(event.target.value)}
-                placeholder="e.g. Ritesh"
-                autoComplete="off"
-                maxLength={64}
-                required
-              />
-              <datalist id="join-name-options">
-                {names.map((name) => (
-                  <option key={name} value={name} />
-                ))}
-              </datalist>
-              <p className="mt-1 text-xs text-gray-500">Pick an existing name or type a new one. This tags the account.</p>
-            </div>
-            <Button type="submit" isLoading={busy} className="w-full">
+            <label className="flex min-w-0 w-full flex-col gap-1.5">
+              <span className="text-xs font-medium text-gray-400">Your name</span>
+              {namesLoading && names.length === 0 ? (
+                <div className="flex items-center gap-2 rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm text-gray-400">
+                  <Spinner className="h-4 w-4" />
+                  Loading names…
+                </div>
+              ) : names.length === 0 && namesError ? (
+                <div className="flex flex-col gap-2">
+                  <p className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+                    {namesError}
+                  </p>
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    onClick={() => {
+                      setNamesLoading(true);
+                      setNamesError(null);
+                      setNamesTick((n) => n + 1);
+                    }}
+                    className="w-full"
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : (
+                <select
+                  id="join-name"
+                  value={person}
+                  onChange={(event) => setPerson(event.target.value)}
+                  required
+                  disabled={names.length === 0}
+                  className="w-full rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent disabled:opacity-60"
+                >
+                  <option value="">{names.length ? "Select from the dropdown…" : "No names available"}</option>
+                  {names.map((name) => (
+                    <option key={name} value={name}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              )}
+              {names.length > 0 && (
+                <p className="text-xs text-gray-500">Use the dropdown. Custom names are not allowed.</p>
+              )}
+            </label>
+            <Button
+              type="submit"
+              isLoading={busy}
+              disabled={!person || names.length === 0 || namesLoading || Boolean(namesError)}
+              className="w-full"
+            >
               Submit for deploy
             </Button>
           </form>
@@ -620,7 +730,7 @@ export default function JoinPage() {
             <div className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-400">
               <Check size={22} />
             </div>
-            <p className="text-sm font-medium text-gray-100">Submitted. An admin will deploy Kimi K3.</p>
+            <p className="text-sm font-medium text-gray-100">{doneMessage}</p>
             <p className="text-xs text-gray-500">You can close this page. No secrets were shown.</p>
             <Button
               type="button"

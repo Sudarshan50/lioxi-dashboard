@@ -1,6 +1,10 @@
 export const UNTAGGED_OWNER = "__none__";
 export const UNTAGGED_LABEL = "Untagged";
 
+export function joinPickerName(value: string | null | undefined): string | null {
+  return canonicalOwner(value ?? "") || null;
+}
+
 export function canonicalOwner(name: string) {
   // Split on whitespace; tokens with - or ' stay as typed, else First-upper + rest-lower.
   return name

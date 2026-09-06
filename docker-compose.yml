@@ -83,6 +83,10 @@ services:
       - backend
     ports:
       - "3000:80"
+      - "443:443"
+    volumes:
+      - ./secrets/telegram-webhook.crt:/etc/nginx/certs/telegram-webhook.crt:ro
+      - ./secrets/telegram-webhook.key:/etc/nginx/certs/telegram-webhook.key:ro
 
 volumes:
   portal_db_data:

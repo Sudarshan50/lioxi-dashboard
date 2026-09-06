@@ -19,6 +19,7 @@ class DiscoveredResource:
     kind: str
     location: str
     endpoint: str
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class DeploymentInfo:
     model_version: str
     sku: str
     capacity: int
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)

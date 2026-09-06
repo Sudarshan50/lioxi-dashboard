@@ -31,6 +31,7 @@ import {
 import { useCreateModel, useModels } from "@/hooks/useModels";
 import { useRegisteredModels } from "@/hooks/useRegisteredModels";
 import { formatCurrency, formatDateTime, formatRelative } from "@/lib/format";
+import { grantTier } from "@/lib/grantTier";
 import { Account, Deployment, DiscoveredResource } from "@/types";
 
 export default function AccountCard({ account }: { account: Account }) {
@@ -67,6 +68,7 @@ export default function AccountCard({ account }: { account: Account }) {
   const [manualDeploymentName, setManualDeploymentName] = useState("");
   const [manualRegisteredId, setManualRegisteredId] = useState("");
 
+  const tier = grantTier(account);
   const portals = useMemo(
     () => (account.new_api_gateway ?? "").split("+").filter((p): p is "O1" | "O2" => p === "O1" || p === "O2"),
     [account.new_api_gateway]
@@ -545,6 +547,11 @@ export default function AccountCard({ account }: { account: Account }) {
             <div className="min-w-0">
               <div className="flex min-w-0 items-center gap-1.5">
                 <p className="truncate font-medium text-gray-100">{account.name}</p>
+                {tier !== "other" && (
+                  <Badge tone="neutral" className="shrink-0" title="Azure credit grant">
+                    {tier}
+                  </Badge>
+                )}
                 {account.owner_tag && (
                   <Badge tone="info" className="max-w-[8rem] shrink-0 truncate" title="Tag">
                     {account.owner_tag}
@@ -637,7 +644,15 @@ export default function AccountCard({ account }: { account: Account }) {
               {account.new_api_cost_usd != null && (
                 <div className="flex items-center justify-between gap-2 text-xs">
                   <span className="text-gray-500">NewAPI spend</span>
-                  <span className="tabular-nums text-violet-300">{formatCurrency(account.new_api_cost_usd, "USD")}</span>
+                  <span className="text-right">
+                    <span className="tabular-nums text-violet-300">{formatCurrency(account.new_api_cost_usd, "USD")}</span>
+                    {account.new_api_cost_o1_usd != null && account.new_api_cost_o2_usd != null && (
+                      <span className="mt-0.5 block text-[11px] text-gray-500">
+                        O1 {formatCurrency(account.new_api_cost_o1_usd, "USD")} + O2{" "}
+                        {formatCurrency(account.new_api_cost_o2_usd, "USD")}
+                      </span>
+                    )}
+                  </span>
                 </div>
               )}
               {(account.new_api_weight != null || account.new_api_priority != null) && (

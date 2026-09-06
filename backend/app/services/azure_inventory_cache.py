@@ -34,6 +34,13 @@ def _looks_like_json(raw: str) -> bool:
     return text.startswith("{") or text.startswith("[")
 
 
+def _looks_like_quota_tier(label: str) -> bool:
+    text = (label or "").strip().lower()
+    if text.startswith("free"):
+        return True
+    return text.startswith("tier ") and text[5:].replace(" ", "").isdigit()
+
+
 def _clear_newapi(payload: dict) -> dict:
     payload["new_api_present"] = False
     payload["new_api_created"] = False
@@ -140,17 +147,27 @@ async def get_cached_azure_inventory(
         await _delete_keys(client, key)
         return None
     try:
-        return KimiDeployResult.model_validate(_clear_newapi(payload))
+        result = KimiDeployResult.model_validate(_clear_newapi(payload))
     except Exception:  # noqa: BLE001
         logger.debug("Ignoring invalid Azure inventory cache for %s", sub[-12:], exc_info=True)
         await _delete_keys(client, key)
         return None
+    if result.ok and result.quota_limit is None:
+        await _delete_keys(client, key)
+        return None
+    tier = (result.account_tier or "").strip()
+    if result.ok and not _looks_like_quota_tier(tier):
+        await _delete_keys(client, key)
+        return None
+    return result
 
 
 async def store_azure_inventory(result: KimiDeployResult) -> None:
     sub = (result.subscription_id or "").strip()
     resource = (result.account_name or "").strip()
     if not sub or not resource or not result.ok or result.error or not result.credits_available:
+        return
+    if result.quota_limit is None:
         return
     client = _client_or_none()
     if client is None:

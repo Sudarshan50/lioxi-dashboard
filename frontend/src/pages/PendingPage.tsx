@@ -1,19 +1,18 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, Inbox } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import EmptyState from "@/components/ui/EmptyState";
 import Spinner from "@/components/ui/Spinner";
-import { invalidateAfterDeploy } from "@/hooks/useKimiDeploy";
+import { invalidateAfterDeploy, useKimiDeployDefaults, useSaveKimiDeployDefaults } from "@/hooks/useKimiDeploy";
 import apiClient from "@/lib/apiClient";
-import { streamPendingApprove } from "@/lib/submitApi";
+import { useBanSettings } from "@/hooks/useBan";
+import { enqueuePendingApprove, enqueuePendingApproveBatch } from "@/lib/submitApi";
 import { toastError, toastSuccess } from "@/lib/toast";
-import { KimiDeployProgressEvent, KimiDeployResult, PendingListResponse, PendingSubmitRequest } from "@/types";
-
-type RunProgress = { total: number; done: number; phase: string; message: string; startedAt: number };
+import { PendingListResponse, PendingSubmitRequest } from "@/types";
 
 function statusTone(status: string): "info" | "success" | "error" | "warning" | "neutral" {
   if (status === "pending_approval") return "info";
@@ -28,67 +27,18 @@ function statusLabel(status: string) {
   if (status === "approved") return "approved";
   if (status === "rejected") return "rejected";
   if (status === "failed") return "failed";
+  if (status === "approving") return "deploying";
   return status.replace(/_/g, " ");
-}
-
-function deployPercent(progress: RunProgress) {
-  if (progress.phase === "done") return 100;
-  const azure = progress.total > 0 ? progress.done / progress.total : 0;
-  if (progress.phase === "azure") return Math.min(82, Math.max(3, Math.round(azure * 82)));
-  if (progress.phase === "portal") return 88;
-  if (progress.phase === "newapi") return 94;
-  return Math.min(99, Math.max(3, Math.round(azure * 100)));
-}
-
-function formatElapsed(ms: number) {
-  const total = Math.max(0, Math.floor(ms / 1000));
-  const minutes = Math.floor(total / 60);
-  const seconds = total % 60;
-  if (minutes === 0) return `${seconds}s`;
-  return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
-}
-
-function ProgressBar({ progress, elapsedMs, failed }: { progress: RunProgress; elapsedMs: number; failed: number }) {
-  const percent = deployPercent(progress);
-  return (
-    <div className="overflow-hidden rounded-2xl border border-accent/25 bg-accent/[0.07] px-4 py-3 shadow-glow">
-      <div className="flex flex-wrap items-end justify-between gap-2">
-        <div className="min-w-0">
-          <p className="text-sm font-medium text-gray-100">{progress.message}</p>
-          <p className="mt-0.5 text-xs text-gray-400">
-            {progress.phase}
-            {failed ? ` · ${failed} failed` : ""}
-          </p>
-        </div>
-        <div className="flex items-baseline gap-3 tabular-nums">
-          <span className="text-lg font-semibold text-gray-100">{percent}%</span>
-          <span className="text-xs text-gray-500">{formatElapsed(elapsedMs)}</span>
-        </div>
-      </div>
-      <div className="mt-3 h-2 overflow-hidden rounded-full bg-white/[0.08]">
-        <div
-          className="relative h-full overflow-hidden rounded-full bg-accent-gradient transition-[width] duration-700 ease-out"
-          style={{ width: `${percent}%` }}
-        >
-          <span className="absolute inset-y-0 left-0 w-2/3 animate-bar-shimmer bg-gradient-to-r from-transparent via-white/35 to-transparent" />
-        </div>
-      </div>
-    </div>
-  );
 }
 
 function SubmitCard({
   row,
-  deploy,
-  live,
   busy,
   declining,
   onDecline,
   onApprove,
 }: {
   row: PendingSubmitRequest;
-  deploy?: KimiDeployResult;
-  live: boolean;
   busy: boolean;
   declining: boolean;
   onDecline: () => void;
@@ -97,12 +47,16 @@ function SubmitCard({
   const failed = row.status === "failed";
   const rolesFailed = failed && row.error_kind === "roles";
   const deployFailed = failed && row.error_kind === "deploy";
+  const tenantLevel =
+    Boolean(row.subscription_id && row.tenant_id && row.subscription_id === row.tenant_id) ||
+    /tenant level/i.test(row.subscription_name || "") ||
+    /subscriptionnotfound/i.test(row.error_message || "");
   const inFlight = row.status === "creating_sp" || row.status === "approving";
   const canDecline =
     row.status === "pending_approval" || row.status === "failed" || row.status === "creating_sp";
   const canApprove = !inFlight && !rolesFailed && Boolean(row.can_retry_deploy && onApprove);
   return (
-    <Card className={`flex flex-col gap-4 ${live ? "!border-accent/40 shadow-glow" : failed ? "!border-red-500/25" : ""}`}>
+    <Card className={`flex flex-col gap-4 ${inFlight ? "!border-accent/40 shadow-glow" : failed ? "!border-red-500/25" : ""}`}>
       <div className="flex items-start justify-between gap-3">
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -112,8 +66,8 @@ function SubmitCard({
                 {row.person_associated}
               </Badge>
             )}
-            <Badge tone={statusTone(row.status)} className={live ? "animate-pulse" : undefined}>
-              {live ? "deploying" : statusLabel(row.status)}
+            <Badge tone={statusTone(row.status)} className={inFlight ? "animate-pulse" : undefined}>
+              {statusLabel(row.status)}
             </Badge>
           </div>
           <p className="mt-0.5 truncate text-xs text-gray-500">{row.account_holder || "No email"}</p>
@@ -122,7 +76,7 @@ function SubmitCard({
       <dl className="grid grid-cols-1 gap-1 text-xs text-gray-400">
         <div className="truncate">
           <span className="text-gray-500">Subscription · </span>
-          {row.subscription_name || row.subscription_id || "—"}
+          {tenantLevel ? "None (tenant login only)" : row.subscription_name || row.subscription_id || "—"}
         </div>
         {row.subscription_id && <div className="truncate font-mono text-[11px] text-gray-500">{row.subscription_id}</div>}
         {row.tenant_id && (
@@ -132,7 +86,13 @@ function SubmitCard({
           </div>
         )}
         {row.billing_error && <div className="text-amber-400">Billing note: {row.billing_error}</div>}
-        {rolesFailed && (
+        {tenantLevel && (
+          <div className="text-amber-300">
+            This is a Microsoft tenant login, not an Azure subscription. Decline removes the card. They must join
+            again with an account that has a real subscription.
+          </div>
+        )}
+        {rolesFailed && !tenantLevel && (
           <div className="text-amber-300">
             Azure role assignment failed. Ask them to join again — Retry deploy will not fix missing roles.
           </div>
@@ -143,18 +103,12 @@ function SubmitCard({
             and this card.
           </div>
         )}
+        {inFlight && <div className="text-indigo-300">Running on the server. You can leave this page.</div>}
         {row.error_message && (
           <div className="whitespace-pre-wrap break-words rounded-lg border border-red-500/20 bg-red-500/10 px-2.5 py-2 text-red-300">
             {row.error_message}
           </div>
         )}
-        {deploy?.ok && (
-          <div className="text-emerald-400">
-            Deployed {deploy.account_name || deploy.name}
-            {deploy.new_api_name ? ` · ${deploy.new_api_name}` : ""}
-          </div>
-        )}
-        {deploy && !deploy.ok && deploy.error && <div className="text-red-400">{deploy.error}</div>}
       </dl>
       {(canDecline || canApprove) && (
         <div className="flex flex-wrap justify-end gap-2">
@@ -183,7 +137,7 @@ function SubmitCard({
             </Button>
           )}
           {canApprove && (
-            <Button className="px-3 py-1.5 text-xs" disabled={busy} isLoading={live} onClick={onApprove}>
+            <Button className="px-3 py-1.5 text-xs" disabled={busy} onClick={onApprove}>
               {row.status === "failed" ? "Retry deploy" : "Approve"}
             </Button>
           )}
@@ -195,25 +149,34 @@ function SubmitCard({
 
 export default function PendingPage() {
   const queryClient = useQueryClient();
+  const defaults = useKimiDeployDefaults();
+  const saveDefaults = useSaveKimiDeployDefaults();
+  const ban = useBanSettings();
+  const [priority, setPriority] = useState(10);
+  const [weight, setWeight] = useState(1);
+  const seededDefaults = useRef(false);
   const list = useQuery({
     queryKey: ["pending-submits"],
     queryFn: async () => (await apiClient.get<PendingListResponse>("/api/pending")).data,
-    refetchInterval: 15_000,
+    refetchInterval: (query) => {
+      const rows = query.state.data?.requests ?? [];
+      return rows.some((row) => row.status === "approving" || row.status === "creating_sp") ? 3_000 : 8_000;
+    },
   });
-  const [approvingId, setApprovingId] = useState<number | null>(null);
-  const [progress, setProgress] = useState<RunProgress | null>(null);
-  const [now, setNow] = useState(() => Date.now());
-  const [results, setResults] = useState<Record<number, KimiDeployResult>>({});
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (!defaults.data || seededDefaults.current) return;
+    seededDefaults.current = true;
+    setPriority(defaults.data.priority);
+    setWeight(defaults.data.weight);
+  }, [defaults.data]);
 
   useEffect(() => {
     if (list.isError) toastError("Could not load pending submissions.", { toastId: "pending-load" });
   }, [list.isError]);
 
-  useEffect(() => {
-    if (approvingId == null) return;
-    const id = window.setInterval(() => setNow(Date.now()), 400);
-    return () => window.clearInterval(id);
-  }, [approvingId]);
+  const routing = { new_api_priority: priority, new_api_weight: weight };
 
   const reject = useMutation({
     mutationFn: async (id: number) =>
@@ -259,53 +222,42 @@ export default function PendingPage() {
     },
   });
 
+  async function refreshAfterQueue() {
+    await queryClient.invalidateQueries({ queryKey: ["pending-submits"] });
+    invalidateAfterDeploy(queryClient);
+  }
+
   async function approve(row: PendingSubmitRequest) {
-    if (approvingId != null) return;
-    setApprovingId(row.id);
-    setProgress({ total: 1, done: 0, phase: "azure", message: "Starting Kimi K3 deploy…", startedAt: Date.now() });
-    let failed = false;
+    setSubmitting(true);
     try {
-      await streamPendingApprove(row.id, (event: KimiDeployProgressEvent) => {
-        if (event.type === "start" || event.type === "phase") {
-          setProgress((prev) => ({
-            total: event.total ?? prev?.total ?? 1,
-            done: event.done ?? prev?.done ?? 0,
-            phase: event.phase ?? prev?.phase ?? "azure",
-            message: event.message ?? prev?.message ?? "Deploying…",
-            startedAt: prev?.startedAt ?? Date.now(),
-          }));
-        }
-        if (event.type === "account" && event.result) {
-          setResults((prev) => ({ ...prev, [row.id]: event.result as KimiDeployResult }));
-          setProgress((prev) =>
-            prev
-              ? {
-                  ...prev,
-                  done: event.done ?? prev.done + 1,
-                  total: event.total ?? prev.total,
-                  message: event.message ?? prev.message,
-                }
-              : prev
-          );
-        }
-        if (event.type === "done") {
-          const first = event.results?.[0];
-          if (first) setResults((prev) => ({ ...prev, [row.id]: first }));
-          if (first && !first.ok) failed = true;
-          setProgress((prev) => (prev ? { ...prev, phase: "done", done: prev.total, message: "Deploy finished." } : prev));
-        }
-        if (event.type === "error") {
-          failed = true;
-          toastError(event.detail || "Approve failed.");
-        }
-      });
-      invalidateAfterDeploy(queryClient);
-      void queryClient.invalidateQueries({ queryKey: ["pending-submits"] });
-      if (!failed) toastSuccess("Deploy finished.");
+      await enqueuePendingApprove(row.id, routing);
+      toastSuccess("Deploy queued on the server.");
+      await refreshAfterQueue();
     } catch (exc) {
-      toastError(exc instanceof Error ? exc.message : "Approve failed.");
+      toastError(exc instanceof Error ? exc.message : "Could not queue deploy.");
     } finally {
-      setApprovingId(null);
+      setSubmitting(false);
+    }
+  }
+
+  async function approveBatch(retry: boolean) {
+    setSubmitting(true);
+    try {
+      const result = await enqueuePendingApproveBatch({ retry, ...routing });
+      if (result.started.length === 0) {
+        toastError(retry ? "Nothing to retry." : "Nothing to approve.");
+      } else {
+        toastSuccess(
+          retry
+            ? `Queued ${result.started.length} retry job${result.started.length === 1 ? "" : "s"} on the server.`
+            : `Queued ${result.started.length} deploy${result.started.length === 1 ? "" : "s"} on the server.`
+        );
+      }
+      await refreshAfterQueue();
+    } catch (exc) {
+      toastError(exc instanceof Error ? exc.message : "Could not queue deploys.");
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -316,25 +268,83 @@ export default function PendingPage() {
     [rows]
   );
   const failedRows = useMemo(() => rows.filter((row) => row.status === "failed"), [rows]);
+  const retryable = useMemo(
+    () => failedRows.filter((row) => row.can_retry_deploy && row.error_kind === "deploy"),
+    [failedRows]
+  );
   const approvedRows = useMemo(() => rows.filter((row) => row.status === "approved"), [rows]);
-  const busy = approvingId != null || reject.isPending;
-  const empty = !list.isLoading && waiting.length === 0 && inflight.length === 0 && failedRows.length === 0 && approvedRows.length === 0;
+  const busy = submitting || reject.isPending;
+  const empty =
+    !list.isLoading && waiting.length === 0 && inflight.length === 0 && failedRows.length === 0 && approvedRows.length === 0;
 
   return (
     <div className="flex flex-col gap-5">
       <div>
         <h1 className="gradient-title text-2xl font-semibold tracking-tight">Pending</h1>
         <p className="mt-1 text-sm text-gray-500">
-          Approve runs Kimi K3. If deploy fails (quota / model access), Retry deploy reuses the stored identity. Clear leftover
-          deletes the empty Azure stack and this card so they can /join again.
+          Approve queues Kimi K3 on the server. You can leave this page. Retry deploy reuses the stored identity. Clear
+          leftover deletes the empty Azure stack so they can /join again.
         </p>
       </div>
-      {progress && approvingId != null && (
-        <ProgressBar
-          progress={progress}
-          elapsedMs={Math.max(0, now - progress.startedAt)}
-          failed={Object.values(results).filter((item) => !item.ok).length}
-        />
+      {ban.data?.auto_approve && (
+        <p className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] px-4 py-3 text-sm text-emerald-100">
+          Auto-approve is on.
+        </p>
+      )}
+      <Card className="flex flex-wrap items-end gap-3">
+        <div className="min-w-0 flex-1">
+          <h2 className="text-sm font-semibold text-gray-200">Default priority / weight</h2>
+        </div>
+        <label className="flex flex-col gap-1 text-[11px] text-gray-500">
+          Priority
+          <input
+            type="number"
+            min={0}
+            max={10000}
+            value={priority}
+            onChange={(event) => setPriority(Number(event.target.value) || 0)}
+            disabled={busy}
+            className="w-20 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
+          />
+        </label>
+        <label className="flex flex-col gap-1 text-[11px] text-gray-500">
+          Weight
+          <input
+            type="number"
+            min={1}
+            max={10000}
+            value={weight}
+            onChange={(event) => setWeight(Math.max(1, Number(event.target.value) || 1))}
+            disabled={busy}
+            className="w-20 rounded-lg border border-white/[0.08] bg-surface px-2 py-1.5 text-sm text-gray-100 outline-none focus:border-accent"
+          />
+        </label>
+        <Button
+          variant="secondary"
+          className="px-3 py-1.5 text-xs"
+          disabled={busy || saveDefaults.isPending}
+          isLoading={saveDefaults.isPending}
+          onClick={() => {
+            saveDefaults.mutate(
+              { priority, weight },
+              {
+                onSuccess: () => toastSuccess(`Saved default priority ${priority} · weight ${weight}.`),
+                onError: (exc: unknown) => {
+                  const detail = (exc as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+                  toastError(typeof detail === "string" ? detail : "Could not save deploy defaults.");
+                },
+              }
+            );
+          }}
+        >
+          Save defaults
+        </Button>
+      </Card>
+      {inflight.length > 0 && (
+        <p className="rounded-xl border border-accent/25 bg-accent/[0.07] px-4 py-3 text-sm text-indigo-100">
+          {inflight.length} job{inflight.length === 1 ? "" : "s"} running on the server. This page only checks status —
+          closing it does not stop the work.
+        </p>
       )}
       {list.isLoading ? (
         <div className="flex justify-center py-16">
@@ -350,10 +360,20 @@ export default function PendingPage() {
         <>
           {failedRows.length > 0 && (
             <section className="flex flex-col gap-3">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <AlertTriangle size={16} className="text-red-400" />
                 <h2 className="text-sm font-semibold text-gray-100">Join / deploy errors</h2>
                 <Badge tone="error">{failedRows.length}</Badge>
+                {retryable.length > 0 && (
+                  <Button
+                    className="ml-auto px-3 py-1.5 text-xs"
+                    disabled={busy}
+                    isLoading={submitting}
+                    onClick={() => void approveBatch(true)}
+                  >
+                    Retry all ({retryable.length})
+                  </Button>
+                )}
               </div>
               <p className="text-xs text-gray-500">
                 Retry deploy if K3 failed after the identity was stored (quota/model access). Clear leftover deletes the
@@ -364,8 +384,6 @@ export default function PendingPage() {
                   <SubmitCard
                     key={row.id}
                     row={row}
-                    deploy={results[row.id]}
-                    live={approvingId === row.id}
                     busy={busy}
                     declining={reject.isPending && reject.variables === row.id}
                     onDecline={() => reject.mutate(row.id)}
@@ -376,9 +394,19 @@ export default function PendingPage() {
             </section>
           )}
           <section className="flex flex-col gap-3">
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-sm font-semibold text-gray-100">Ready to approve</h2>
               <Badge tone="info">{waiting.length}</Badge>
+              {waiting.length > 0 && (
+                <Button
+                  className="ml-auto px-3 py-1.5 text-xs"
+                  disabled={busy}
+                  isLoading={submitting}
+                  onClick={() => void approveBatch(false)}
+                >
+                  Approve all ({waiting.length})
+                </Button>
+              )}
             </div>
             {waiting.length === 0 && inflight.length === 0 ? (
               <p className="text-xs text-gray-500">No submissions waiting for K3 deploy.</p>
@@ -388,8 +416,6 @@ export default function PendingPage() {
                   <SubmitCard
                     key={row.id}
                     row={row}
-                    deploy={results[row.id]}
-                    live={approvingId === row.id}
                     busy={busy}
                     declining={reject.isPending && reject.variables === row.id}
                     onDecline={() => reject.mutate(row.id)}
@@ -399,8 +425,6 @@ export default function PendingPage() {
                   <SubmitCard
                     key={row.id}
                     row={row}
-                    deploy={results[row.id]}
-                    live={approvingId === row.id}
                     busy={busy}
                     declining={reject.isPending && reject.variables === row.id}
                     onDecline={() => reject.mutate(row.id)}
@@ -418,9 +442,7 @@ export default function PendingPage() {
                   <SubmitCard
                     key={row.id}
                     row={row}
-                    deploy={results[row.id]}
-                    live={false}
-                    busy={busy}
+                    busy={false}
                     declining={false}
                     onDecline={() => undefined}
                   />

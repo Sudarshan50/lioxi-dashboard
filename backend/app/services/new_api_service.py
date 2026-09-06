@@ -164,11 +164,48 @@ def _channel_status(raw) -> int | None:
         return None
 
 
+def _channel_id(channel: dict) -> int | None:
+    try:
+        return int(channel.get("id"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _unique_channels(channels: list[dict]) -> list[dict]:
+    """O2's channel list repeats the same id. Count each channel once."""
+    seen: set[int] = set()
+    unique: list[dict] = []
+    for channel in channels:
+        channel_id = _channel_id(channel)
+        if channel_id is not None:
+            if channel_id in seen:
+                continue
+            seen.add(channel_id)
+        unique.append(channel)
+    return unique
+
+
+def _merge_channel_page(by_id: dict[int, dict], batch: list[dict]) -> int:
+    """Add a page into by_id. Returns how many new ids were inserted."""
+    added = 0
+    for channel in batch:
+        channel_id = _channel_id(channel)
+        if channel_id is None or channel_id in by_id:
+            continue
+        by_id[channel_id] = channel
+        added += 1
+    return added
+
+
+def _portal_quota(channels: list[dict]) -> float:
+    return sum(float(channel.get("used_quota") or 0) for channel in _unique_channels(channels))
+
+
 def _portal_status(channels: list[dict]) -> int | None:
     """On if any channel is enabled (1). Any other known NewAPI status
     (2 = manual disable, 3 = auto-disable) is off.
     """
-    known = [_channel_status(channel.get("status")) for channel in channels]
+    known = [_channel_status(channel.get("status")) for channel in _unique_channels(channels)]
     known = [status for status in known if status is not None]
     if not known:
         return None
@@ -224,15 +261,40 @@ def _recompute_totals(account: ProviderAccount) -> None:
     recompute_overall_status(account)
 
 
-async def fetch_channels(gateway: Gateway) -> list[dict]:
-    items: list[dict] = []
-    page = 1
+def _apply_fetched_portals(
+    account: ProviderAccount, fetched_ok: set[str], channels_by_label: dict[str, list[dict]]
+) -> None:
+    """Write spend/status for portals we actually saw. A successful O2 fetch
+    that simply omitted a channel must not zero last-known O2 spend.
+    """
+    membership = _membership(account)
+    for label in fetched_ok:
+        channels = _unique_channels(channels_by_label.get(label, []))
+        if channels:
+            membership.add(label)
+            _set_portal_cost_status(
+                account, label, _portal_quota(channels), _portal_status(channels)
+            )
+        elif label not in membership:
+            _clear_portal(account, label)
+    account.new_api_gateway = "+".join(sorted(membership)) or None
+    _recompute_totals(account)
+
+
+async def _paginate_channels(gateway: Gateway, extra_params: dict) -> list[dict]:
+    """Walk /api/channel/ by id. O2 p=0 and p=1 are the same page; unsorted
+    lists skip rows. Stop when unique ids cover `total`, a page adds nothing
+    after the first-page alias, or the list ends.
+    """
+    by_id: dict[int, dict] = {}
+    page = 0
     page_size = 100
+    stagnant = 0
     async with httpx.AsyncClient(timeout=30, proxy=gateway.proxy) as client:
-        while True:
+        while page <= 80:
             response = await client.get(
                 f"{gateway.base_url}/api/channel/",
-                params={"tag_mode": "false", "id_sort": "false", "p": page, "page_size": page_size},
+                params={**extra_params, "p": page, "page_size": page_size},
                 headers=_headers(gateway),
             )
             try:
@@ -256,20 +318,45 @@ async def fetch_channels(gateway: Gateway) -> list[dict]:
                 total = data.get("total")
             if not batch:
                 break
-            items.extend(batch)
+            added = _merge_channel_page(by_id, batch)
+            if added == 0:
+                stagnant += 1
+                if stagnant >= 2:
+                    break
+            else:
+                stagnant = 0
             if total is not None:
                 try:
-                    if page * page_size >= int(total):
+                    if len(by_id) >= int(total):
                         break
                 except (TypeError, ValueError):
                     pass
-            if len(batch) < page_size:
-                break
             page += 1
+    return list(by_id.values())
+
+
+async def fetch_channels(gateway: Gateway) -> list[dict]:
+    items = await _paginate_channels(gateway, {"tag_mode": "false", "id_sort": "true"})
     if gateway.tag_filter:
         wanted = gateway.tag_filter.strip().lower()
-        items = [ch for ch in items if (ch.get("tag") or "").strip().lower() == wanted]
-    return items
+        tagged = [ch for ch in items if (ch.get("tag") or "").strip().lower() == wanted]
+        try:
+            extra = await _paginate_channels(
+                gateway, {"tag_mode": "true", "tag": gateway.tag_filter, "id_sort": "true"}
+            )
+            extra = [ch for ch in extra if (ch.get("tag") or "").strip().lower() == wanted]
+            tagged = _unique_channels(tagged + extra)
+        except Exception:
+            logger.warning("Tagged channel supplement failed for %s", gateway.label, exc_info=True)
+        if len(tagged) < 5:
+            logger.warning(
+                "%s tag %r matched only %d channels after full list + tag page",
+                gateway.label,
+                gateway.tag_filter,
+                len(tagged),
+            )
+        return tagged
+    return _unique_channels(items)
 
 
 async def set_channel_status(gateway: Gateway, channel_id: int, status: int) -> bool:
@@ -315,10 +402,7 @@ async def _set_gateway_status_locked(
     key = _account_key(account)
     if not key:
         raise NewApiError("Account has no endpoint to match against")
-    membership = _membership(account)
     targets = [gw for gw in gateways() if gateway_label is None or gw.label == gateway_label]
-    if gateway_label is None and membership:
-        targets = [gw for gw in targets if gw.label in membership]
     if not targets:
         raise NewApiError(f"Gateway {gateway_label} is not configured")
 
@@ -327,11 +411,12 @@ async def _set_gateway_status_locked(
     for gateway in targets:
         try:
             channels = await fetch_channels(gateway)
-            matches = [channel for channel in channels if _host_key(channel.get("base_url")) == key]
+            matches = _unique_channels(
+                [channel for channel in channels if _host_key(channel.get("base_url")) == key]
+            )
             if not matches:
-                if membership and gateway.label not in membership:
-                    continue
-                errors[gateway.label] = "no matching channels"
+                if gateway_label:
+                    errors[gateway.label] = "no matching channels"
                 continue
             changed: list[int] = []
             failed: list[str] = []
@@ -411,32 +496,25 @@ async def _sync_new_api_locked(session: AsyncSession) -> dict:
     on_both = 0
     for account in accounts:
         labelled = matched.get(account.id, [])
-        quota_by_label: dict[str, float] = {}
         channels_by_label: dict[str, list[dict]] = {}
         for label, channel in labelled:
-            quota_by_label[label] = quota_by_label.get(label, 0.0) + float(channel.get("used_quota") or 0)
             channels_by_label.setdefault(label, []).append(channel)
 
+        _apply_fetched_portals(account, fetched_ok, channels_by_label)
         membership = _membership(account)
-        for label in fetched_ok:
-            if label in quota_by_label:
-                membership.add(label)
-                _set_portal_cost_status(
-                    account, label, quota_by_label[label], _portal_status(channels_by_label[label])
-                )
-            else:
-                membership.discard(label)
-                _clear_portal(account, label)
-        account.new_api_gateway = "+".join(sorted(membership)) or None
-        _recompute_totals(account)
 
-        fetched_channels = [channel for label, channel in labelled if label in fetched_ok]
+        fetched_channels = [
+            channel
+            for label, channel in labelled
+            if label in fetched_ok
+        ]
+        fetched_channels = _unique_channels(fetched_channels)
         if fetched_channels:
             existing_id = account.new_api_channel_id
             primary = next((ch for ch in fetched_channels if ch.get("id") == existing_id), None)
             if primary is None:
                 # Prefer O1 when both are present so identity does not flip with quota.
-                o1_channels = channels_by_label.get("O1") or []
+                o1_channels = _unique_channels(channels_by_label.get("O1") or [])
                 pool = o1_channels or fetched_channels
                 primary = max(pool, key=lambda ch: float(ch.get("used_quota") or 0))
             account.new_api_channel_id = primary.get("id")

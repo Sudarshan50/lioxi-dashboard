@@ -23,8 +23,6 @@ from app.models.app_setting import AppSetting
 from app.repositories.account_repository import AccountRepository
 from app.services import telegram_service
 from app.services.account_service import AccountNotFoundError
-from app.services.telegram_service import format_ist
-
 logger = logging.getLogger(__name__)
 
 ALERT_CONFIG_KEY = "alert_config"
@@ -242,38 +240,10 @@ def _level_title(level: int) -> str:
     return "Heads up"
 
 
-def _money(value: float | None, currency: str | None = "USD") -> str:
-    if value is None:
-        return "—"
-    code = (currency or "USD").upper()
-    if code == "INR":
-        return f"₹{value:,.2f}"
-    if code == "USD":
-        return f"${value:,.2f}"
-    return f"{value:,.2f} {code}"
-
-
-def _spend_line(account) -> str:
-    labels = (account.new_api_gateway or "").split("+")
-    parts = []
-    if "O1" in labels:
-        parts.append(f"O1 {_money(account.new_api_cost_o1_usd or 0)}")
-    if "O2" in labels:
-        parts.append(f"O2 {_money(account.new_api_cost_o2_usd or 0)}")
-    split = f" ({' · '.join(parts)})" if len(parts) > 1 else ""
-    return f"{_money(account.new_api_cost_usd or 0)}{split}"
-
-
 def _format_threshold_alert(account, level: int, percent: float) -> str:
-    grant = credit_grant_usd(account)
-    return (
-        f"<b>{_level_title(level)} — {level}% of credit grant spent (NewAPI)</b>\n"
-        f"Account   <b>{html.escape(account.name)}</b>\n"
-        f"Channel   {html.escape(account.new_api_name or '—')} · {account.new_api_gateway or '—'}\n"
-        f"NewAPI    <b>{_spend_line(account)}</b> of {_money(grant)}\n"
-        f"Consumed  <b>{percent:.1f}%</b>\n"
-        f"{format_ist()}"
-    )
+    from app.services.telegram_bot import _account_card
+
+    return f"⚠ <b>{_level_title(level)} — {level}%</b>\n\n{_account_card(account)}"
 
 
 def _format_exhausted_alert(
@@ -291,24 +261,17 @@ def _format_exhausted_alert(
     if not parts:
         parts.append("Channels were already disabled")
     action = "\n".join(parts)
-    grant = credit_grant_usd(account)
-    cap = stop_at_usd(account, overspend_buffer)
-    return (
-        f"<b>NewAPI spend hit grant + buffer — gateway stopped</b>\n"
-        f"Account   <b>{html.escape(account.name)}</b>\n"
-        f"Channel   {html.escape(account.new_api_name or '—')} · {account.new_api_gateway or '—'}\n"
-        f"NewAPI    <b>{_spend_line(account)}</b>\n"
-        f"Grant     {_money(grant)}\n"
-        f"Stop at   {_money(cap)}  <i>(grant + ${overspend_buffer:,.0f})</i>\n"
-        f"{action}\n"
-        f"{format_ist()}"
-    )
+    from app.services.telegram_bot import _account_card
+
+    return f"⛔ <b>Spend hit the stop point</b>\n\n{_account_card(account)}\n\n{action}"
 
 
 async def _send_spaced(text: str, sent_so_far: int) -> None:
     # Telegram allows ~20 messages/min per group; space out bursts.
     if sent_so_far:
         await asyncio.sleep(4)
+    if telegram_service.group_clear_running():
+        return
     await telegram_service.send_message(text)
 
 
@@ -329,6 +292,7 @@ async def alert_state(session: AsyncSession) -> list[dict]:
             {
                 "id": account.id,
                 "name": account.name,
+                "deployed_at": account.created_at.isoformat() if getattr(account, "created_at", None) else None,
                 "new_api_name": account.new_api_name or "",
                 "new_api_tag": account.new_api_tag or "",
                 "owner_tag": account.owner_tag or "",
@@ -357,7 +321,11 @@ async def alert_state(session: AsyncSession) -> list[dict]:
     items.sort(
         key=lambda item: (
             0 if item["gateway_enabled"] else 1,
-            -(item["percent"] if item["percent"] is not None else -1),
+            (
+                -(item["percent"] if item["percent"] is not None else -1)
+                if item["gateway_enabled"]
+                else (item["percent"] if item["percent"] is not None else float("inf"))
+            ),
         )
     )
     return items

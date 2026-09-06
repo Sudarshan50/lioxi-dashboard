@@ -4,11 +4,13 @@ import asyncio
 import importlib.util
 import json
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
 import time
-from functools import lru_cache
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Awaitable, Callable
@@ -38,10 +40,156 @@ from app.services.azure_inventory_cache import (
     store_azure_inventory,
 )
 from app.services.owner_tag import apply_person_associated_tags, person_from_payload, resource_key
+from app.services.service_principal_store import email_or_none
 
 logger = logging.getLogger(__name__)
 
 ProgressFn = Callable[[dict[str, Any]], Awaitable[None]]
+
+_FIREWORKS_QUOTA = "AIServices.DataZoneStandard.Fireworks"
+_DATAZONE_SKU = "DataZoneStandard"
+_USAGE_API = "2023-05-01"
+_QUOTA_TIER_APIS = ("2025-10-01-preview", "2026-01-15-preview")
+
+
+@dataclass
+class _SubscriptionMeta:
+    name: str = ""
+    quota_id: str | None = None
+    quota_tier: str | None = None
+    quota_tier_next: str | None = None
+    quota_tier_upgrade_available: bool = False
+
+
+def normalize_quota_tier_name(value: Any) -> str | None:
+    """Map Azure quotaTiers names (Free-Tier, Tier-1, Tier 1) to a stable label."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    compact = re.sub(r"[\s_-]+", " ", text).strip()
+    lowered = compact.lower()
+    if lowered in ("free", "free tier") or lowered.startswith("free"):
+        return "Free Tier"
+    match = re.search(r"\btier\s*(\d+)\b", lowered)
+    if match:
+        return f"Tier {int(match.group(1))}"
+    return compact
+
+
+def _parse_iso_dt(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def quota_tier_number(label: str | None) -> int | None:
+    text = (label or "").strip().lower()
+    if not text:
+        return None
+    if "free" in text:
+        return 0
+    match = re.search(r"\btier\s*(\d+)\b", text)
+    return int(match.group(1)) if match else None
+
+
+def looks_like_quota_tier(label: str | None) -> bool:
+    text = (label or "").strip().lower()
+    if not text:
+        return False
+    if text.startswith("free"):
+        return True
+    return bool(re.match(r"^tier\s*\d+$", text))
+
+
+def quota_tier_from_arm(body: Any) -> tuple[str | None, str | None, bool]:
+    item = body
+    if isinstance(body, dict) and isinstance(body.get("value"), list):
+        rows = body.get("value") or []
+        item = rows[0] if rows else {}
+    if not isinstance(item, dict):
+        return None, None, False
+    props = item.get("properties") if isinstance(item.get("properties"), dict) else item
+    if not isinstance(props, dict):
+        return None, None, False
+    current = normalize_quota_tier_name(props.get("currentTierName"))
+    info = props.get("tierUpgradeEligibilityInfo")
+    info = info if isinstance(info, dict) else {}
+    nxt = normalize_quota_tier_name(info.get("nextTierName"))
+    status = str(info.get("upgradeAvailabilityStatus") or "").strip().lower()
+    return current, nxt, status == "available"
+
+
+def fireworks_limit_from_usages(usages: Any) -> int | None:
+    items = usages.get("value") if isinstance(usages, dict) else usages
+    if not isinstance(items, list):
+        return None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        value = name.get("value") if isinstance(name, dict) else name
+        if str(value or "") != _FIREWORKS_QUOTA:
+            continue
+        try:
+            return int(float(item.get("limit") or 0))
+        except (TypeError, ValueError):
+            return 0
+    return None
+
+
+def attach_quota_fields(
+    result: KimiDeployResult,
+    quota_limit: int | None,
+    used_by_others: int = 0,
+) -> KimiDeployResult:
+    result.quota_limit = quota_limit
+    capacity = int(result.capacity or 0)
+    if quota_limit is None:
+        result.tpm_available = None
+        result.rpm_available = None
+        result.tpm_upgrade_available = False
+        return result
+    available = max(int(quota_limit) - max(int(used_by_others), 0), 0)
+    result.tpm_available = available * 1000
+    result.rpm_available = available
+    result.tpm_upgrade_available = available > capacity
+    return result
+
+
+def _arm_location(value: str | None) -> str:
+    text = (value or "").replace(" ", "").lower().strip()
+    return text or "eastus2"
+
+
+def _quota_id_from_raw(raw: dict[str, Any]) -> str | None:
+    value = raw.get("quota_id")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    payg = raw.get("payg")
+    if isinstance(payg, dict):
+        nested = payg.get("quota_id")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return None
+
+
+def apply_quota_tier_fields(
+    result: KimiDeployResult,
+    current: str | None,
+    nxt: str | None = None,
+    upgrade_available: bool = False,
+) -> KimiDeployResult:
+    if current:
+        result.account_tier = current
+    if nxt:
+        result.account_tier_available = nxt
+    result.quota_tier_upgrade_available = bool(upgrade_available)
+    return result
+
 
 REQUIRED_FIELDS = {
     "AZURE_SUBSCRIPTION_ID": ("AZURE_SUBSCRIPTION_ID", "subscription_id", "subscriptionId", "subscription"),
@@ -123,16 +271,25 @@ def find_deploy_script() -> Path | None:
     return None
 
 
-@lru_cache(maxsize=1)
+_deploy_module: ModuleType | None = None
+_deploy_mtime: float | None = None
+
+
 def load_deploy_module() -> ModuleType:
+    global _deploy_module, _deploy_mtime
     path = find_deploy_script()
     if path is None:
         raise KimiDeployError("Deploy script scripts/kimi_k3_deploy.py was not found on the backend host.")
+    mtime = path.stat().st_mtime
+    if _deploy_module is not None and _deploy_mtime == mtime:
+        return _deploy_module
     spec = importlib.util.spec_from_file_location("kimi_k3_deploy", path)
     if spec is None or spec.loader is None:
         raise KimiDeployError(f"Could not load deploy script at {path}.")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
+    _deploy_module = module
+    _deploy_mtime = mtime
     return module
 
 
@@ -290,7 +447,7 @@ async def prepare_accounts(
     raw_accounts: list[dict[str, Any]],
     session: AsyncSession | None,
     *,
-    persist: bool = True,
+    persist: bool = False,
 ) -> list[dict[str, str]]:
     accounts = normalize_accounts(raw_accounts)
     if session is not None:
@@ -360,19 +517,29 @@ def _with_person(rows: list[dict[str, Any]], accounts: list[dict[str, str]]) -> 
 
 def _safe_deploy(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
     name = account.get("name") or account.get("account_holder") or "account"
-    try:
-        result = module.deploy_one(account)
-        if isinstance(result, dict):
-            result.setdefault("ok", True)
-            return result
-        return {"ok": False, "name": name, "error": "Deploy returned an unexpected result."}
-    except Exception as exc:  # noqa: BLE001 - surface Azure/CLI failures to the admin UI
-        error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
-        logger.warning("Kimi K3 deploy failed for %s: %s", name, error[-300:])
+    last_error = "Deploy failed."
+    for attempt in range(2):
+        try:
+            result = module.deploy_one(account)
+            if isinstance(result, dict):
+                if result.get("ok", True):
+                    result.setdefault("ok", True)
+                    return result
+                last_error = str(result.get("error") or "Deploy failed.")
+            else:
+                last_error = "Deploy returned an unexpected result."
+        except Exception as exc:  # noqa: BLE001 - surface Azure/CLI failures to the admin UI
+            last_error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
         humanize = getattr(module, "humanize_kimi_deploy_error", None)
         if callable(humanize):
-            error = humanize(error)
-        return {"ok": False, "name": name, "error": error}
+            last_error = humanize(last_error)
+        if attempt == 0:
+            logger.warning("Kimi K3 deploy failed for %s; retrying: %s", name, last_error[-300:])
+            time.sleep(8)
+            continue
+        logger.warning("Kimi K3 deploy failed for %s: %s", name, last_error[-300:])
+        return {"ok": False, "name": name, "error": last_error}
+    return {"ok": False, "name": name, "error": last_error}
 
 
 def _safe_delete(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
@@ -530,7 +697,7 @@ def _is_kimi_deployment(name: str, model_name: str) -> bool:
 
 async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
     name = account.get("name") or account.get("account_holder") or "account"
-    holder = account.get("account_holder") or ""
+    holder = email_or_none(account.get("account_holder")) or ""
     subscription_id = account.get("AZURE_SUBSCRIPTION_ID") or ""
     try:
         credentials = ProviderCredentials(
@@ -549,16 +716,19 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
                 return resource, []
 
         listed = await asyncio.gather(*[deployments_for(resource) for resource in resources]) if resources else []
-        matches: list[tuple[int, Any, Any]] = []
+        matches: list[tuple[int, Any, Any, int]] = []
         for resource, deployments in listed:
-            kimi = next(
-                (item for item in deployments if _is_kimi_deployment(item.name, item.model_name)),
-                None,
-            )
+            kimi = None
+            used_by_others = 0
+            for item in deployments:
+                if _is_kimi_deployment(item.name, item.model_name):
+                    kimi = item
+                elif (item.sku or "") == _DATAZONE_SKU:
+                    used_by_others += int(item.capacity or 0)
             if kimi is None:
                 continue
             score = 2 if "-kimi-" in (resource.name or "").lower() else 1
-            matches.append((score, resource, kimi))
+            matches.append((score, resource, kimi, used_by_others))
         if not matches:
             return KimiDeployResult(
                 ok=False,
@@ -568,9 +738,10 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
                 subscription_name=account.get("subscription_name") or None,
             )
         matches.sort(key=lambda item: -item[0])
-        _score, resource, dep = matches[0]
+        _score, resource, dep, used_by_others = matches[0]
         capacity = int(dep.capacity or 0)
-        return KimiDeployResult(
+        quota_limit = await _fireworks_quota_limit(credentials, resource.location)
+        result = KimiDeployResult(
             ok=True,
             name=name,
             email=holder,
@@ -586,7 +757,9 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
             resource_group=resource.resource_group,
             subscription_id=subscription_id,
             subscription_name=account.get("subscription_name") or None,
+            deployed_at=_parse_iso_dt(dep.created_at or resource.created_at),
         )
+        return attach_quota_fields(result, quota_limit, used_by_others)
     except (AzureApiError, Exception) as exc:  # noqa: BLE001
         logger.warning("Kimi inventory lookup failed for %s: %s", name, str(exc)[-300:])
         detail = str(exc)
@@ -606,11 +779,28 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
         )
 
 
-async def _lookup_subscription_name(account: dict[str, str]) -> str:
+async def _fireworks_quota_limit(credentials: ProviderCredentials, location: str | None) -> int | None:
+    loc = _arm_location(location)
+    try:
+        body = await AzureArmClient(AzureTokenProvider()).get(
+            credentials,
+            (
+                f"/subscriptions/{credentials.subscription_id}"
+                f"/providers/Microsoft.CognitiveServices/locations/{loc}/usages"
+            ),
+            params={"api-version": _USAGE_API},
+        )
+    except Exception:  # noqa: BLE001
+        logger.info("Fireworks quota lookup failed for %s", loc, exc_info=True)
+        return None
+    return fireworks_limit_from_usages(body)
+
+
+async def _lookup_subscription_meta(account: dict[str, str]) -> _SubscriptionMeta:
     fallback = account.get("subscription_name") or ""
     subscription_id = account.get("AZURE_SUBSCRIPTION_ID") or ""
     if not subscription_id:
-        return fallback
+        return _SubscriptionMeta(name=fallback)
     try:
         credentials = ProviderCredentials(
             tenant_id=account["AZURE_TENANT_ID"],
@@ -618,20 +808,50 @@ async def _lookup_subscription_name(account: dict[str, str]) -> str:
             client_secret=account["AZURE_CLIENT_SECRET"],
             subscription_id=subscription_id,
         )
-        detail = await AzureArmClient(AzureTokenProvider()).get(
-            credentials,
-            f"/subscriptions/{subscription_id}",
-            params={"api-version": "2022-12-01"},
+        detail, quota_tier = await asyncio.gather(
+            AzureArmClient(AzureTokenProvider()).get(
+                credentials,
+                f"/subscriptions/{subscription_id}",
+                params={"api-version": "2022-12-01"},
+            ),
+            _fetch_quota_tier(credentials),
         )
-        return str(detail.get("displayName") or detail.get("name") or fallback).strip()
+        policies = detail.get("subscriptionPolicies") or {}
+        quota_id = policies.get("quotaId") if isinstance(policies, dict) else None
+        current, nxt, upgrade_available = quota_tier
+        return _SubscriptionMeta(
+            name=str(detail.get("displayName") or detail.get("name") or fallback).strip(),
+            quota_id=str(quota_id).strip() if quota_id else None,
+            quota_tier=current,
+            quota_tier_next=nxt,
+            quota_tier_upgrade_available=upgrade_available,
+        )
     except Exception:  # noqa: BLE001
         logger.info("Subscription name lookup failed for %s", subscription_id[-12:], exc_info=True)
-        return fallback
+        return _SubscriptionMeta(name=fallback)
+
+
+async def _fetch_quota_tier(credentials: ProviderCredentials) -> tuple[str | None, str | None, bool]:
+    arm = AzureArmClient(AzureTokenProvider())
+    paths = (
+        f"/subscriptions/{credentials.subscription_id}/providers/Microsoft.CognitiveServices/quotaTiers/default",
+        f"/subscriptions/{credentials.subscription_id}/providers/Microsoft.CognitiveServices/quotaTiers",
+    )
+    for version in _QUOTA_TIER_APIS:
+        for path in paths:
+            try:
+                body = await arm.get(credentials, path, params={"api-version": version})
+            except Exception:  # noqa: BLE001
+                continue
+            current, nxt, available = quota_tier_from_arm(body)
+            if current or nxt or available:
+                return current, nxt, available
+    return None, None, False
 
 
 def _with_account_meta(result: KimiDeployResult, account: dict[str, str]) -> KimiDeployResult:
     result.name = account.get("name") or result.name
-    result.email = account.get("account_holder") or result.email
+    result.email = email_or_none(account.get("account_holder")) or email_or_none(result.email)
     if account.get("subscription_name") and not result.subscription_name:
         result.subscription_name = account["subscription_name"]
     if account.get("person_associated"):
@@ -655,16 +875,24 @@ async def lookup_account_inventory(account: dict[str, str]) -> KimiDeployResult:
     )
     if cached is not None:
         return _with_account_meta(cached, account)
-    stack, credits, subscription_name = await asyncio.gather(
+    stack, credits, subscription_meta = await asyncio.gather(
         _find_kimi_stack(account),
         _fetch_account_credits(account),
-        _lookup_subscription_name(account),
+        _lookup_subscription_meta(account),
     )
     result = _merge_credits(stack, credits)
-    if subscription_name:
-        result.subscription_name = subscription_name
+    if subscription_meta.name:
+        result.subscription_name = subscription_meta.name
     elif not result.subscription_name:
         result.subscription_name = credits.subscription_name
+    if subscription_meta.quota_id:
+        result.quota_id = subscription_meta.quota_id
+    apply_quota_tier_fields(
+        result,
+        subscription_meta.quota_tier,
+        subscription_meta.quota_tier_next,
+        subscription_meta.quota_tier_upgrade_available,
+    )
     result = _with_account_meta(result, account)
     await store_azure_inventory(result)
     return result
@@ -692,10 +920,9 @@ async def lookup_accounts_inventory(
         repo = AccountRepository(session)
         portal_rows = await repo.list_all()
         for result, account in zip(results, accounts, strict=True):
-            if result.owner_tag:
-                continue
-            if account.get("person_associated"):
+            if not result.owner_tag and account.get("person_associated"):
                 result.owner_tag = account["person_associated"]
+            if result.owner_tag and result.deployed_at:
                 continue
             sub = (result.subscription_id or account.get("AZURE_SUBSCRIPTION_ID") or "").strip()
             resource = (result.account_name or account.get("account_name") or "").strip()
@@ -707,10 +934,34 @@ async def lookup_accounts_inventory(
                     continue
                 if (portal.resource_name or "").strip().lower() != wanted_res:
                     continue
-                if portal.owner_tag:
+                if not result.owner_tag and portal.owner_tag:
                     result.owner_tag = portal.owner_tag
+                if result.ok and not result.deployed_at and portal.created_at:
+                    result.deployed_at = portal.created_at
                 break
     return results
+
+
+def _copy_deploy_outputs(accounts: list[dict[str, str]], raw_results: list[dict[str, Any]]) -> None:
+    """Keep Foundry names/keys on the account dict so NewAPI attach does not depend on a DB flush."""
+    for account, raw in zip(accounts, raw_results, strict=True):
+        if not isinstance(raw, dict):
+            continue
+        for src, dest in (
+            ("account_name", "account_name"),
+            ("resource_group", "resource_group"),
+            ("azure_openai_endpoint", "azure_openai_endpoint"),
+            ("deployment_name", "deployment_name"),
+            ("subscription_id", "AZURE_SUBSCRIPTION_ID"),
+        ):
+            value = str(raw.get(src) or "").strip()
+            if value and not str(account.get(dest) or "").strip():
+                account[dest] = value
+        for key in ("api_key", "key1", "Key1", "key2", "Key2"):
+            secret = str(raw.get(key) or "").strip()
+            if secret:
+                account["api_key"] = secret
+                break
 
 
 def _merge_credits(result: KimiDeployResult, credits: KimiCreditSnapshot) -> KimiDeployResult:
@@ -726,7 +977,8 @@ def _merge_credits(result: KimiDeployResult, credits: KimiCreditSnapshot) -> Kim
 
 
 def _to_result(raw: dict[str, Any]) -> KimiDeployResult:
-    return KimiDeployResult(
+    quota_id = _quota_id_from_raw(raw)
+    result = KimiDeployResult(
         ok=bool(raw.get("ok")),
         name=raw.get("name"),
         email=raw.get("email"),
@@ -738,6 +990,13 @@ def _to_result(raw: dict[str, Any]) -> KimiDeployResult:
         rpm=raw.get("rpm"),
         capacity=raw.get("capacity"),
         quota_limit=raw.get("quota_limit"),
+        tpm_available=raw.get("tpm_available"),
+        rpm_available=raw.get("rpm_available"),
+        tpm_upgrade_available=bool(raw.get("tpm_upgrade_available")),
+        quota_id=quota_id,
+        account_tier=normalize_quota_tier_name(raw.get("account_tier")),
+        account_tier_available=normalize_quota_tier_name(raw.get("account_tier_available")),
+        quota_tier_upgrade_available=bool(raw.get("quota_tier_upgrade_available")),
         region=raw.get("region"),
         account_name=raw.get("account_name"),
         resource_group=raw.get("resource_group"),
@@ -752,7 +1011,18 @@ def _to_result(raw: dict[str, Any]) -> KimiDeployResult:
         error=raw.get("error"),
         owner_tag=raw.get("owner_tag") or raw.get("person_associated"),
         rai_policy_name=raw.get("rai_policy_name"),
+        deployed_at=_parse_iso_dt(raw.get("deployed_at") or raw.get("created_at")),
     )
+    if result.ok and result.deployed_at is None:
+        result.deployed_at = datetime.now(timezone.utc)
+    if result.tpm_available is None and result.quota_limit is not None:
+        used = raw.get("quota_used_by_others") or 0
+        try:
+            used_by_others = int(used)
+        except (TypeError, ValueError):
+            used_by_others = 0
+        attach_quota_fields(result, result.quota_limit, used_by_others)
+    return result
 
 
 def _to_secrets_row(raw: dict[str, Any]) -> KimiSecretsRow:
@@ -792,7 +1062,7 @@ async def deploy_accounts(
     raw_accounts: list[dict[str, Any]],
     jobs: int,
     session: AsyncSession | None = None,
-    new_api_priority: int = 13,
+    new_api_priority: int = 10,
     new_api_weight: int = 1,
     on_progress: ProgressFn | None = None,
     persist_principals: bool = True,
@@ -866,6 +1136,17 @@ async def deploy_accounts(
                 )[-400:]
                 result.ok = False
                 result.error = raw["error"]
+                return
+            from app.services.service_principal_store import persist_service_principals
+
+            payload = dict(account)
+            if result.email:
+                payload["account_holder"] = result.email
+                payload["email"] = result.email
+            try:
+                await persist_service_principals(session, [payload], elevated_access=True)
+            except Exception:
+                logger.exception("Could not store Deploy K3 identity for %s", result.account_name)
 
     async def run_one(index: int, account: dict[str, str]) -> dict[str, Any]:
         nonlocal finished
@@ -898,6 +1179,7 @@ async def deploy_accounts(
         asyncio.gather(*[_fetch_account_credits(account) for account in accounts]),
     )
     results = [_merge_credits(_to_result(item), credits) for item, credits in zip(raw_results, credit_results, strict=True)]
+    _copy_deploy_outputs(accounts, raw_results)
     for result, account in zip(results, accounts, strict=True):
         if account.get("person_associated"):
             result.owner_tag = account["person_associated"]
@@ -952,7 +1234,7 @@ async def add_kimi_newapi_channels(
     raw_accounts: list[dict[str, Any]],
     session: AsyncSession,
     *,
-    priority: int = 13,
+    priority: int = 10,
     weight: int = 1,
 ) -> list[KimiDeployResult]:
     accounts = await prepare_accounts(raw_accounts, session)
@@ -1015,7 +1297,7 @@ async def regenerate_accounts(
                 rotated.append(row)
         if rotated:
             try:
-                await persist_service_principals(session, rotated)
+                await persist_service_principals(session, rotated, elevated_access=True)
             except Exception:
                 logger.exception("Could not store rotated service principal secrets")
     for account in accounts:
@@ -1045,11 +1327,15 @@ async def delete_accounts(
 
     raw_results = await asyncio.gather(*[run_one(account) for account in accounts])
     results = [_to_delete_result(item) for item in raw_results]
+    from app.services.service_principal_store import drop_stored_principal
+
     for account, result in zip(accounts, results, strict=True):
         sub = account.get("AZURE_SUBSCRIPTION_ID") or result.subscription_id
         await drop_azure_inventory(sub, account.get("account_name"))
         if result.account_name:
             await drop_azure_inventory(result.subscription_id or sub, result.account_name)
+        if result.ok and session is not None:
+            await drop_stored_principal(session, sub)
     return results
 
 
@@ -1094,6 +1380,79 @@ async def apply_content_filters(
     ]
 
 
+def _safe_scale_quota(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
+    name = account.get("name") or account.get("account_holder") or "account"
+    try:
+        result = module.scale_kimi_one(account)
+        if isinstance(result, dict):
+            result.setdefault("ok", True)
+            return result
+        return {"ok": False, "name": name, "error": "TPM upgrade returned an unexpected result."}
+    except Exception as exc:  # noqa: BLE001
+        error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
+        logger.warning("Kimi TPM/RPM scale failed for %s: %s", name, error[-300:])
+        return {"ok": False, "name": name, "error": error}
+
+
+async def scale_accounts(
+    raw_accounts: list[dict[str, Any]],
+    jobs: int,
+    session: AsyncSession | None = None,
+) -> list[KimiDeployResult]:
+    status = deploy_status()
+    if not status.ready:
+        raise KimiDeployError(status.message)
+
+    accounts = await prepare_accounts(raw_accounts, session)
+    module = load_deploy_module()
+    if not hasattr(module, "scale_kimi_one"):
+        raise KimiDeployError("Deploy script is missing scale_kimi_one.")
+    workers = _job_workers(jobs, len(accounts))
+    logger.info("Kimi TPM/RPM scale started for %s account(s), jobs=%s", len(accounts), workers)
+
+    sem = asyncio.Semaphore(workers)
+
+    async def run_one(account: dict[str, str]) -> dict[str, Any]:
+        async with sem:
+            return await asyncio.to_thread(_safe_scale_quota, module, account)
+
+    raw_results = await asyncio.gather(*[run_one(account) for account in accounts])
+    scaled: list[KimiDeployResult] = []
+    for account, raw in zip(accounts, raw_results, strict=True):
+        await drop_azure_inventory(account.get("AZURE_SUBSCRIPTION_ID"), account.get("account_name"))
+        if not raw.get("ok"):
+            result = _to_result(raw)
+            result.name = result.name or account.get("name")
+            result.email = email_or_none(account.get("account_holder")) or result.email
+            scaled.append(result)
+            continue
+        inventory = await lookup_account_inventory(account)
+        target = raw.get("rpm") if raw.get("rpm") is not None else inventory.rpm_available
+        if raw.get("tpm") is not None:
+            inventory.tpm = raw.get("tpm")
+        if raw.get("rpm") is not None:
+            inventory.rpm = raw.get("rpm")
+        if raw.get("capacity") is not None:
+            inventory.capacity = raw.get("capacity")
+        if inventory.quota_limit is not None and target is not None:
+            try:
+                used = max(int(inventory.quota_limit) - int(target), 0)
+            except (TypeError, ValueError):
+                used = 0
+            attach_quota_fields(inventory, inventory.quota_limit, used)
+        inventory.error = None
+        scaled.append(inventory)
+        await store_azure_inventory(inventory)
+    if session is not None:
+        from app.services.kimi_newapi import attach_kimi_newapi_status
+
+        await attach_kimi_newapi_status(session, scaled, accounts)
+    from app.services.google_sheet_inventory import sync_deploy_results
+
+    await sync_deploy_results([item for item in scaled if item.ok])
+    return scaled
+
+
 def _run_bootstrap(name: str, email: str) -> dict[str, Any]:
     module = load_deploy_module()
     with tempfile.NamedTemporaryFile(prefix=f"kimi-{name}-", suffix=".json", delete=False) as handle:
@@ -1105,7 +1464,7 @@ def _run_bootstrap(name: str, email: str) -> dict[str, Any]:
         path.unlink(missing_ok=True)
 
 
-async def bootstrap_account(name: str, email: str) -> KimiSecretsRow:
+async def bootstrap_account(name: str, email: str, session: AsyncSession | None = None) -> KimiSecretsRow:
     status = deploy_status()
     if not status.can_bootstrap:
         raise KimiDeployError(status.bootstrap_message or "Owner user `az login` is required to generate keys.")
@@ -1114,6 +1473,10 @@ async def bootstrap_account(name: str, email: str) -> KimiSecretsRow:
         raise KimiDeployError("Name must include letters or numbers.")
     logger.info("Kimi K3 bootstrap started for %s", slug)
     record = await asyncio.to_thread(_run_bootstrap, slug, email.strip())
+    if session is not None:
+        from app.services.service_principal_store import persist_service_principals
+
+        await persist_service_principals(session, [record], elevated_access=True)
     record["ok"] = True
     return _to_secrets_row(record)
 

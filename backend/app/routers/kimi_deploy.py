@@ -14,6 +14,10 @@ from app.schemas.kimi_deploy import (
     KimiCreditsRequest,
     KimiCreditsResponse,
     KimiDeleteResponse,
+    KimiDropStoredRequest,
+    KimiDropStoredResponse,
+    KimiDeployDefaults,
+    KimiDeployJobSnapshot,
     KimiDeployRequest,
     KimiDeployResponse,
     KimiDeployResult,
@@ -32,6 +36,8 @@ from app.schemas.kimi_deploy import (
     KimiStoredResponse,
     KimiTestResponse,
 )
+from app.services.deploy_defaults import get_deploy_defaults, resolve_routing, save_deploy_defaults
+from app.services.deploy_job_runner import kimi_job_snapshot, start_kimi_deploy_job
 from app.services.kimi_deploy_service import (
     KimiDeployError,
     add_kimi_newapi_channels,
@@ -43,10 +49,11 @@ from app.services.kimi_deploy_service import (
     lookup_accounts_credits,
     lookup_accounts_inventory,
     regenerate_accounts,
+    scale_accounts,
     test_accounts,
 )
 from app.services.kimi_newapi import kimi_newapi_auth, kimi_newapi_pool, rename_kimi_newapi_channel
-from app.services.service_principal_store import list_service_principals
+from app.services.service_principal_store import drop_stored_principal, list_service_principals
 
 router = APIRouter(prefix="/api/kimi-deploy", tags=["kimi-deploy"], dependencies=[Depends(get_current_admin)])
 
@@ -54,6 +61,19 @@ router = APIRouter(prefix="/api/kimi-deploy", tags=["kimi-deploy"], dependencies
 @router.get("/status", response_model=KimiDeployStatus)
 async def get_status() -> KimiDeployStatus:
     return deploy_status()
+
+
+@router.get("/defaults", response_model=KimiDeployDefaults)
+async def read_deploy_defaults(db: AsyncSession = Depends(get_db)) -> KimiDeployDefaults:
+    return KimiDeployDefaults(**await get_deploy_defaults(db))
+
+
+@router.put("/defaults", response_model=KimiDeployDefaults)
+async def update_deploy_defaults(payload: KimiDeployDefaults, db: AsyncSession = Depends(get_db)) -> KimiDeployDefaults:
+    try:
+        return KimiDeployDefaults(**await save_deploy_defaults(db, payload.model_dump()))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @router.get("/stored", response_model=KimiStoredResponse)
@@ -69,16 +89,34 @@ async def stored_accounts(db: AsyncSession = Depends(get_db)) -> KimiStoredRespo
                 AZURE_SUBSCRIPTION_ID=row.subscription_id,
                 subscription_name=row.subscription_name,
                 owner_tag=row.owner_tag,
+                created_at=row.created_at,
             )
             for row in rows
         ]
     )
 
 
+@router.post("/stored/drop", response_model=KimiDropStoredResponse)
+async def drop_stored(
+    payload: KimiDropStoredRequest, db: AsyncSession = Depends(get_db)
+) -> KimiDropStoredResponse:
+    from app.services.azure_inventory_cache import drop_azure_inventory
+
+    dropped = 0
+    for subscription_id in payload.subscription_ids:
+        sub = (subscription_id or "").strip()
+        if not sub:
+            continue
+        await drop_stored_principal(db, sub)
+        await drop_azure_inventory(sub)
+        dropped += 1
+    return KimiDropStoredResponse(ok=True, dropped=dropped)
+
+
 @router.post("/bootstrap", response_model=KimiSecretsRow)
-async def bootstrap(payload: KimiBootstrapRequest) -> KimiSecretsRow:
+async def bootstrap(payload: KimiBootstrapRequest, db: AsyncSession = Depends(get_db)) -> KimiSecretsRow:
     try:
-        return await bootstrap_account(payload.name, payload.email)
+        return await bootstrap_account(payload.name, payload.email, session=db)
     except KimiDeployError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -125,11 +163,12 @@ async def newapi_auth() -> KimiNewApiAuth:
 @router.post("/newapi", response_model=KimiDeployResponse)
 async def add_newapi(payload: KimiNewApiRequest, db: AsyncSession = Depends(get_db)) -> KimiDeployResponse:
     try:
+        priority, weight = await resolve_routing(db, payload.priority, payload.weight)
         results = await add_kimi_newapi_channels(
             payload.accounts,
             db,
-            priority=payload.priority,
-            weight=payload.weight,
+            priority=priority,
+            weight=weight,
         )
     except KimiDeployError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -210,6 +249,35 @@ async def content_filter(payload: KimiRegenerateRequest, db: AsyncSession = Depe
     return KimiContentFilterResponse(ok_count=ok_count, fail_count=len(results) - ok_count, results=results)
 
 
+@router.post("/scale-quota", response_model=KimiDeployResponse)
+async def scale_quota(payload: KimiRegenerateRequest, db: AsyncSession = Depends(get_db)) -> KimiDeployResponse:
+    try:
+        results = await scale_accounts(payload.accounts, payload.jobs, session=db)
+    except KimiDeployError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    ok_count = sum(1 for item in results if item.ok)
+    return KimiDeployResponse(ok_count=ok_count, fail_count=len(results) - ok_count, results=results)
+
+
+@router.get("/job", response_model=KimiDeployJobSnapshot)
+async def deploy_job_status() -> KimiDeployJobSnapshot:
+    return kimi_job_snapshot()
+
+
+@router.post("/job", response_model=KimiDeployJobSnapshot)
+async def start_deploy_job(payload: KimiDeployRequest, db: AsyncSession = Depends(get_db)) -> KimiDeployJobSnapshot:
+    try:
+        priority, weight = await resolve_routing(db, payload.new_api_priority, payload.new_api_weight)
+        return await start_kimi_deploy_job(
+            payload.accounts,
+            payload.jobs,
+            priority,
+            weight,
+        )
+    except KimiDeployError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/stream")
 async def deploy_stream(payload: KimiDeployRequest, db: AsyncSession = Depends(get_db)) -> StreamingResponse:
     queue: asyncio.Queue[dict | None] = asyncio.Queue()
@@ -219,12 +287,13 @@ async def deploy_stream(payload: KimiDeployRequest, db: AsyncSession = Depends(g
 
     async def run() -> None:
         try:
+            priority, weight = await resolve_routing(db, payload.new_api_priority, payload.new_api_weight)
             results = await deploy_accounts(
                 payload.accounts,
                 payload.jobs,
                 session=db,
-                new_api_priority=payload.new_api_priority,
-                new_api_weight=payload.new_api_weight,
+                new_api_priority=priority,
+                new_api_weight=weight,
                 on_progress=on_progress,
             )
             await queue.put(
@@ -255,8 +324,6 @@ async def deploy_stream(payload: KimiDeployRequest, db: AsyncSession = Depends(g
                     break
                 yield f"data: {json.dumps(item, default=str)}\n\n"
         finally:
-            if not task.done():
-                task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
@@ -274,12 +341,13 @@ async def deploy_stream(payload: KimiDeployRequest, db: AsyncSession = Depends(g
 @router.post("", response_model=KimiDeployResponse)
 async def deploy(payload: KimiDeployRequest, db: AsyncSession = Depends(get_db)) -> KimiDeployResponse:
     try:
+        priority, weight = await resolve_routing(db, payload.new_api_priority, payload.new_api_weight)
         results = await deploy_accounts(
             payload.accounts,
             payload.jobs,
             session=db,
-            new_api_priority=payload.new_api_priority,
-            new_api_weight=payload.new_api_weight,
+            new_api_priority=priority,
+            new_api_weight=weight,
         )
     except KimiDeployError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

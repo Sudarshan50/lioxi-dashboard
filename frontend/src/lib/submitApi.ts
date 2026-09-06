@@ -1,4 +1,4 @@
-import { KimiDeployProgressEvent, PendingSubmitRequest, SubmitSessionSnapshot } from "@/types";
+import { PendingSubmitRequest, SubmitSessionSnapshot } from "@/types";
 
 export const SUBMIT_SESSION_KEY = "submit_session_id";
 export const JOIN_PASSWORD_KEY = "join_password";
@@ -234,12 +234,16 @@ export async function commitSubmitSession(
   const deadline = Date.now() + 10 * 60 * 1000;
   while (true) {
     const snap = await fetchSubmitSnapshot(sessionId);
-    if (snap?.status === "pending_approval" || snap?.status === "approved") {
+    if (snap?.status === "pending_approval" || snap?.status === "approved" || snap?.status === "approving") {
       onEvent({
         type: "done",
         session_id: sessionId,
         status: snap.status,
-        message: snap.message || "Submitted. An admin will deploy Kimi K3.",
+        message:
+          snap.message ||
+          (snap.status === "pending_approval"
+            ? "Submitted. An admin will deploy Kimi K3."
+            : "Submitted. Kimi K3 deploy is starting automatically."),
       });
       return;
     }
@@ -257,9 +261,9 @@ export async function commitSubmitSession(
   }
 }
 
-export async function streamPendingApprove(
+export async function enqueuePendingApprove(
   requestId: number,
-  onEvent: (event: KimiDeployProgressEvent) => void
+  routing?: { new_api_priority?: number; new_api_weight?: number }
 ) {
   const token = localStorage.getItem("access_token");
   const response = await fetch(`${submitBaseUrl()}/api/pending/${requestId}/approve`, {
@@ -267,10 +271,10 @@ export async function streamPendingApprove(
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
-      Accept: "text/event-stream",
+      Accept: "application/json",
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
-    body: JSON.stringify({ jobs: 1, new_api_priority: 13, new_api_weight: 1 }),
+    body: JSON.stringify(routing ?? {}),
   });
   if (response.status === 401) {
     localStorage.removeItem("access_token");
@@ -278,8 +282,32 @@ export async function streamPendingApprove(
     throw new Error("Your session expired. Sign in again.");
   }
   if (!response.ok) throw new Error(await readError(response, `Approve failed (${response.status}).`));
-  const saw = await parseSseStream(response, (event) => onEvent(event as unknown as KimiDeployProgressEvent));
-  if (!saw) throw new Error("Approve stream ended before results arrived.");
+}
+
+export async function enqueuePendingApproveBatch(payload: {
+  ids?: number[];
+  retry: boolean;
+  new_api_priority?: number;
+  new_api_weight?: number;
+}) {
+  const token = localStorage.getItem("access_token");
+  const response = await fetch(`${submitBaseUrl()}/api/pending/approve-batch`, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(payload),
+  });
+  if (response.status === 401) {
+    localStorage.removeItem("access_token");
+    window.location.href = "/login";
+    throw new Error("Your session expired. Sign in again.");
+  }
+  if (!response.ok) throw new Error(await readError(response, `Approve failed (${response.status}).`));
+  return (await response.json()) as { started: number[]; skipped: { id: number; error: string }[] };
 }
 
 export type { PendingSubmitRequest };

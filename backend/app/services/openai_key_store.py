@@ -16,8 +16,12 @@ async def persist_foundry_api_keys(
     box = box or get_secret_box()
     wrote = False
     for row in rows:
-        api_key = str(row.get("api_key") or "").strip()
-        subscription_id = str(row.get("subscription_id") or "").strip()
+        api_key = ""
+        for key in ("api_key", "key1", "Key1", "key2", "Key2"):
+            api_key = str(row.get(key) or "").strip()
+            if api_key:
+                break
+        subscription_id = str(row.get("subscription_id") or row.get("AZURE_SUBSCRIPTION_ID") or "").strip()
         resource_name = str(row.get("resource_name") or row.get("account_name") or "").strip()
         if not api_key or not subscription_id or not resource_name:
             continue

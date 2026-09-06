@@ -37,7 +37,10 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
-    telegram_admin_ids: str = ""  # comma-separated Telegram user ids allowed to command the bot
+    telegram_admin_ids: str = ""
+    telegram_owner_id: str = ""
+    telegram_webhook_url: str | None = None
+    telegram_webhook_secret: str | None = None
 
     redis_url: str = "redis://redis:6379/0"
     kimi_azure_cache_ttl_seconds: int = 900
@@ -50,8 +53,26 @@ class Settings(BaseSettings):
     google_sheets_credentials_json: str = ""
 
     @property
+    def telegram_admin_ids_list(self) -> list[str]:
+        return [part.strip() for part in self.telegram_admin_ids.split(",") if part.strip()]
+
+    @property
     def telegram_admin_id_set(self) -> set[str]:
-        return {part.strip() for part in self.telegram_admin_ids.split(",") if part.strip()}
+        return set(self.telegram_admin_ids_list)
+
+    @property
+    def telegram_owner_ids_list(self) -> list[str]:
+        owners = [part.strip() for part in (self.telegram_owner_id or "").split(",") if part.strip()]
+        return owners or self.telegram_admin_ids_list
+
+    @property
+    def telegram_owner_id_set(self) -> set[str]:
+        return set(self.telegram_owner_ids_list)
+
+    @property
+    def telegram_owner_id_value(self) -> str:
+        ids = self.telegram_owner_ids_list
+        return ids[0] if ids else ""
 
     @property
     def database_url(self) -> str:

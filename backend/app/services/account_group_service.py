@@ -5,8 +5,12 @@ from app.repositories.account_repository import AccountRepository
 from app.schemas.account_group import AccountGroupCreateRequest, AccountGroupUpdateRequest
 
 ONE_K_GROUP_NAME = "1k Accounts"
+TEN_K_GROUP_NAME = "10k Accounts"
 ONE_K_GRANT_MIN = 800
 ONE_K_GRANT_MAX = 1500
+TEN_K_GRANT_MIN = 8000
+TEN_K_GRANT_MAX = 15000
+AUTO_GROUP_NAMES = {ONE_K_GROUP_NAME.lower(), TEN_K_GROUP_NAME.lower()}
 
 
 class AccountGroupNotFoundError(Exception):
@@ -23,7 +27,7 @@ class AccountGroupService:
         self._account_repository = account_repository
 
     async def list_groups(self) -> list[dict]:
-        await self.ensure_1k_group()
+        await self.ensure_grant_groups()
         groups = await self._group_repository.list_all()
         if not groups:
             return []
@@ -52,13 +56,24 @@ class AccountGroupService:
         group = await self._get_or_raise(group_id)
         await self._group_repository.delete(group)
 
+    async def ensure_grant_groups(self) -> None:
+        await self.ensure_1k_group()
+        await self.ensure_10k_group()
+
     async def ensure_1k_group(self) -> dict:
         """Keep the 1k Accounts group in sync with every ~$1,000 grant."""
+        return await self._ensure_auto_group(ONE_K_GROUP_NAME, is_1k_account)
+
+    async def ensure_10k_group(self) -> dict:
+        """Keep the 10k Accounts group in sync with every ~$10,000 grant."""
+        return await self._ensure_auto_group(TEN_K_GROUP_NAME, is_10k_account)
+
+    async def _ensure_auto_group(self, name: str, matches) -> dict:
         accounts = await self._account_repository.list_all()
-        member_ids = [account.id for account in accounts if is_1k_account(account)]
-        group = await self._group_repository.get_by_name(ONE_K_GROUP_NAME)
+        member_ids = [account.id for account in accounts if matches(account)]
+        group = await self._group_repository.get_by_name(name)
         if group is None:
-            group = await self._group_repository.create(AccountGroup(name=ONE_K_GROUP_NAME))
+            group = await self._group_repository.create(AccountGroup(name=name))
         current = set(await self._group_repository.member_account_ids(group.id))
         if current != set(member_ids):
             await self._group_repository.set_members(group.id, member_ids)
@@ -94,17 +109,36 @@ class AccountGroupService:
                 if account_id in account_names
             ],
             "created_at": group.created_at,
-            "auto": group.name.lower() == ONE_K_GROUP_NAME.lower(),
+            "auto": group.name.lower() in AUTO_GROUP_NAMES,
         }
 
 
-def is_1k_account(account: ProviderAccount) -> bool:
-    compact = account.name.lower().replace(" ", "")
-    if "1k" in compact or compact.endswith("-1k") or compact.endswith("_1k"):
-        return True
+def _compact_account_name(name: str) -> str:
+    return name.lower().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def _grant_usd(account: ProviderAccount) -> float | None:
     limit = account.credits_limit
     if limit is None:
-        return False
+        return None
     if (account.credits_currency or "USD").upper() != "USD":
-        return False
-    return ONE_K_GRANT_MIN <= float(limit) <= ONE_K_GRANT_MAX
+        return None
+    value = float(limit)
+    if value <= 0:
+        return None
+    return value
+
+
+def is_10k_account(account: ProviderAccount) -> bool:
+    grant = _grant_usd(account)
+    if grant is not None:
+        return TEN_K_GRANT_MIN <= grant <= TEN_K_GRANT_MAX
+    return "10k" in _compact_account_name(account.name)
+
+
+def is_1k_account(account: ProviderAccount) -> bool:
+    grant = _grant_usd(account)
+    if grant is not None:
+        return ONE_K_GRANT_MIN <= grant <= ONE_K_GRANT_MAX
+    compact = _compact_account_name(account.name)
+    return "1k" in compact and "10k" not in compact

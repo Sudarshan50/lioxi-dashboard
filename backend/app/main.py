@@ -1,5 +1,4 @@
-import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -11,7 +10,7 @@ from app.database import SessionLocal, init_models
 from app.runtime import configure_runtime
 from app.dependencies import get_sync_orchestrator
 from app.repositories.admin_repository import AdminRepository
-from app.routers import account_groups, accounts, alerts, auth, dashboard, kimi_deploy, models, pending, registered_models, submit
+from app.routers import account_groups, accounts, alerts, auth, ban, dashboard, kimi_deploy, models, pending, registered_models, submit, system, telegram
 from app.services.alert_service import (
     DEFAULT_AZURE_SYNC_INTERVAL_MINUTES,
     DEFAULT_SYNC_INTERVAL_MINUTES,
@@ -20,7 +19,7 @@ from app.services.alert_service import (
 from app.services.bootstrap import ensure_admin_seeded
 from app.services.owner_tag import apply_owner_tags
 from app.services.sync_scheduler import AZURE_JOB_ID, NEWAPI_JOB_ID, bind_scheduler
-from app.services.telegram_bot import run_bot_polling
+from app.services.telegram_bot import setup_telegram_webhook
 
 scheduler = AsyncIOScheduler()
 
@@ -34,9 +33,16 @@ async def lifespan(app: FastAPI):
     async with SessionLocal() as session:
         await ensure_admin_seeded(AdminRepository(session), settings.admin_username, settings.admin_password)
         await apply_owner_tags(session)
-        from app.services.submit_service import expire_stale
+        from app.services.join_enrollee_service import ensure_enrollees_seeded, is_auto_approve_enabled
+        from app.services.submit_service import expire_stale, kick_auto_approve_queue
 
-        await expire_stale(session)
+        await expire_stale(session, orphan_open=True)
+        await ensure_enrollees_seeded(session)
+        if await is_auto_approve_enabled(session):
+            await kick_auto_approve_queue(session)
+        from app.services.service_principal_store import apply_join_emails
+
+        await apply_join_emails(session)
         config = await get_alert_config(session)
     from app.services.az_cli_session import cleanup_stale_config_dirs
 
@@ -70,13 +76,10 @@ async def lifespan(app: FastAPI):
     )
     scheduler.start()
 
-    bot_task = asyncio.create_task(run_bot_polling())
+    await setup_telegram_webhook()
     try:
         yield
     finally:
-        bot_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await bot_task
         scheduler.shutdown(wait=False)
         from app.services.azure_inventory_cache import close_azure_inventory_cache
         from app.services.az_cli_session import cleanup_stale_config_dirs
@@ -105,6 +108,9 @@ app.include_router(dashboard.router)
 app.include_router(kimi_deploy.router)
 app.include_router(submit.router)
 app.include_router(pending.router)
+app.include_router(ban.router)
+app.include_router(system.router)
+app.include_router(telegram.router)
 
 
 @app.get("/api/health")

@@ -129,11 +129,23 @@ export interface DashboardOverview {
   peak_rpm: number;
 }
 
+export interface ClearGroupChatStatus {
+  running: boolean;
+  phase?: "finding" | "deleting" | "done" | "cancelled" | "error" | string;
+  newest_id: number | null;
+  attempted: number;
+  total: number;
+  failed_batches: number;
+  ok: boolean | null;
+  error: string | null;
+}
+
 export interface AlertStatus {
   telegram_configured: boolean;
   chat_id_set: boolean;
   admin_count: number;
   alerts_enabled: boolean;
+  clear_chats?: ClearGroupChatStatus;
 }
 
 export interface AlertConfig {
@@ -148,6 +160,7 @@ export interface AlertConfig {
 export interface AlertStateItem {
   id: number;
   name: string;
+  deployed_at?: string | null;
   new_api_name?: string | null;
   new_api_tag?: string | null;
   owner_tag?: string | null;
@@ -247,10 +260,16 @@ export interface KimiStoredAccount {
   AZURE_SUBSCRIPTION_ID: string;
   subscription_name?: string | null;
   owner_tag?: string | null;
+  created_at?: string | null;
 }
 
 export interface KimiStoredResponse {
   accounts: KimiStoredAccount[];
+}
+
+export interface KimiDropStoredResponse {
+  ok: boolean;
+  dropped: number;
 }
 
 export interface KimiSecretsRow {
@@ -301,6 +320,13 @@ export interface KimiDeployResult {
   rpm?: number | null;
   capacity?: number | null;
   quota_limit?: number | null;
+  tpm_available?: number | null;
+  rpm_available?: number | null;
+  tpm_upgrade_available?: boolean;
+  quota_id?: string | null;
+  account_tier?: string | null;
+  account_tier_available?: string | null;
+  quota_tier_upgrade_available?: boolean;
   region?: string | null;
   account_name?: string | null;
   resource_group?: string | null;
@@ -324,10 +350,24 @@ export interface KimiDeployResult {
   new_api_weight?: number | null;
   new_api_error?: string | null;
   rai_policy_name?: string | null;
+  deployed_at?: string | null;
   removed?: boolean;
   deleted_resources?: string[];
   deleted_message?: string | null;
   pending?: boolean;
+}
+
+export interface KimiDeployDefaults {
+  priority: number;
+  weight: number;
+}
+
+export interface KimiDeployJob {
+  running: boolean;
+  job_id?: string | null;
+  total: number;
+  error?: string | null;
+  results?: KimiDeployResult[] | null;
 }
 
 export interface KimiDeleteResult {
@@ -483,5 +523,54 @@ export interface PendingListResponse {
   requests: PendingSubmitRequest[];
   pending_count: number;
   failed_count: number;
+}
+
+export interface PendingApproveAccepted {
+  ok: boolean;
+  request_id: number;
+  status: string;
+}
+
+export interface PendingBatchApproveResponse {
+  ok: boolean;
+  started: number[];
+  skipped: { id: number; error: string }[];
+}
+
+export interface JoinEnrollee {
+  id: number;
+  name: string;
+  banned: boolean;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface BanSettings {
+  auto_approve: boolean;
+  names: JoinEnrollee[];
+}
+
+export interface BanAutoApproveResponse {
+  auto_approve: boolean;
+  started: number[];
+  skipped: number[];
+}
+
+export interface ResourceMetric {
+  used_bytes: number;
+  total_bytes: number;
+  available_bytes: number;
+  percent: number;
+}
+
+export interface SystemStats {
+  cpu_percent: number | null;
+  cpu_count: number;
+  load_avg_1: number;
+  load_avg_5: number;
+  load_avg_15: number;
+  memory: ResourceMetric;
+  storage: ResourceMetric;
+  collected_at: string;
 }
 

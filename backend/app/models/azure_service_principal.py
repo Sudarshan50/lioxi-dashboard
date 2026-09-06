@@ -1,4 +1,4 @@
-from sqlalchemy import String, Text
+from sqlalchemy import Boolean, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -19,3 +19,4 @@ class AzureServicePrincipal(Base, TimestampMixin):
     account_holder: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
     subscription_name: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
     owner_tag: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    elevated_access: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")

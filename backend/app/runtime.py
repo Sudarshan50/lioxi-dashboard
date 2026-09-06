@@ -25,6 +25,15 @@ def configure_runtime() -> None:
     workers = max(4, THREAD_POOL_WORKERS)
     loop = asyncio.get_running_loop()
     loop.set_default_executor(ThreadPoolExecutor(max_workers=workers, thread_name_prefix="portal"))
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+    for name in ("app.services.telegram_bot", "app.services.telegram_service"):
+        telegram_log = logging.getLogger(name)
+        telegram_log.setLevel(logging.INFO)
+        if not telegram_log.handlers:
+            handler = logging.StreamHandler()
+            handler.setFormatter(formatter)
+            telegram_log.addHandler(handler)
+        telegram_log.propagate = False
     logger.info(
         "Runtime: thread_pool=%s az_cli=%s azure_sync=%s deploy_jobs=%s/%s",
         workers,

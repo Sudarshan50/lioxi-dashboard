@@ -242,6 +242,7 @@ export interface AzureDeploySecret {
   subscriptionId: string;
   subscriptionName?: string;
   personAssociated?: string;
+  createdAt?: string;
   priority?: number;
   weight?: number;
   accountName?: string;

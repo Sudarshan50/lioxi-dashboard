@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -27,6 +27,7 @@ class SpSubmitRequest(Base, TimestampMixin):
     billing_error: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     error_kind: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    auto_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     device_user_code: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)
     device_verification_uri: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
     subscriptions_json: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)

@@ -1,5 +1,7 @@
+import html
+
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -15,7 +17,14 @@ from app.services.alert_service import (
 )
 from app.services.account_service import AccountNotFoundError
 from app.services.sync_scheduler import apply_azure_sync_interval, apply_sync_interval
-from app.services.telegram_service import TelegramError, is_configured, send_message
+from app.services.telegram_bot import poller_snapshot, start_clear_group_chat
+from app.services.telegram_service import (
+    TelegramError,
+    cancel_clear_group_chat,
+    clear_group_snapshot,
+    is_configured,
+    send_message,
+)
 
 router = APIRouter(prefix="/api/alerts", tags=["alerts"], dependencies=[Depends(get_current_admin)])
 
@@ -38,6 +47,8 @@ async def get_status(db: AsyncSession = Depends(get_db)):
         "chat_id_set": bool(settings.telegram_chat_id),
         "admin_count": len(settings.telegram_admin_id_set),
         "alerts_enabled": config["enabled"],
+        "clear_chats": clear_group_snapshot(),
+        "bot_poller": poller_snapshot(),
     }
 
 
@@ -90,6 +101,40 @@ async def update_at_cap_manual(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+class GroupMessagePayload(BaseModel):
+    text: str = Field(min_length=1, max_length=3900)
+
+
+@router.post("/message")
+async def send_group_message(payload: GroupMessagePayload):
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message is empty.")
+    try:
+        await send_message(html.escape(text))
+    except TelegramError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "sent"}
+
+
+@router.get("/clear-chats")
+async def read_clear_group_chat():
+    return clear_group_snapshot()
+
+
+@router.post("/clear-chats")
+async def start_clear_group():
+    try:
+        return await start_clear_group_chat()
+    except TelegramError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/clear-chats")
+async def stop_clear_group():
+    return await cancel_clear_group_chat()
 
 
 @router.post("/test")

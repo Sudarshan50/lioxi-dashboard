@@ -1,15 +1,22 @@
+from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
 from app.runtime import DEPLOY_JOBS_DEFAULT, DEPLOY_JOBS_MAX
+from app.services.deploy_defaults import DEFAULT_PRIORITY, DEFAULT_WEIGHT
+
+
+class KimiDeployDefaults(BaseModel):
+    priority: int = Field(default=DEFAULT_PRIORITY, ge=0, le=10000)
+    weight: int = Field(default=DEFAULT_WEIGHT, ge=1, le=10000)
 
 
 class KimiDeployRequest(BaseModel):
     accounts: list[dict[str, Any]] = Field(min_length=1)
     jobs: int = Field(default=DEPLOY_JOBS_DEFAULT, ge=1, le=DEPLOY_JOBS_MAX)
-    new_api_priority: int = Field(default=13, ge=0, le=10000)
-    new_api_weight: int = Field(default=1, ge=1, le=10000)
+    new_api_priority: int | None = Field(default=None, ge=0, le=10000)
+    new_api_weight: int | None = Field(default=None, ge=1, le=10000)
 
 
 class KimiCreditsRequest(BaseModel):
@@ -57,6 +64,13 @@ class KimiDeployResult(BaseModel):
     rpm: int | None = None
     capacity: int | None = None
     quota_limit: int | None = None
+    tpm_available: int | None = None
+    rpm_available: int | None = None
+    tpm_upgrade_available: bool = False
+    quota_id: str | None = None
+    account_tier: str | None = None
+    account_tier_available: str | None = None
+    quota_tier_upgrade_available: bool = False
     region: str | None = None
     account_name: str | None = None
     resource_group: str | None = None
@@ -80,12 +94,21 @@ class KimiDeployResult(BaseModel):
     new_api_weight: int | None = None
     new_api_error: str | None = None
     rai_policy_name: str | None = None
+    deployed_at: datetime | None = None
 
 
 class KimiDeployResponse(BaseModel):
     ok_count: int
     fail_count: int
     results: list[KimiDeployResult]
+
+
+class KimiDeployJobSnapshot(BaseModel):
+    running: bool = False
+    job_id: str | None = None
+    total: int = 0
+    error: str | None = None
+    results: list[KimiDeployResult] | None = None
 
 
 class KimiNewApiChannel(BaseModel):
@@ -120,8 +143,8 @@ class KimiNewApiAuth(BaseModel):
 
 class KimiNewApiRequest(BaseModel):
     accounts: list[dict[str, Any]] = Field(min_length=1)
-    priority: int = Field(default=13, ge=0, le=10000)
-    weight: int = Field(default=1, ge=1, le=10000)
+    priority: int | None = Field(default=None, ge=0, le=10000)
+    weight: int | None = Field(default=None, ge=1, le=10000)
 
 
 class KimiNewApiRenameRequest(BaseModel):
@@ -148,6 +171,7 @@ class KimiStoredAccount(BaseModel):
     AZURE_SUBSCRIPTION_ID: str
     subscription_name: str | None = None
     owner_tag: str | None = None
+    created_at: datetime | None = None
 
 
 class KimiStoredResponse(BaseModel):
@@ -240,6 +264,15 @@ class KimiDeployStatus(BaseModel):
     subscription_id: str | None = None
     subscription_name: str | None = None
     bootstrap_message: str = ""
+
+
+class KimiDropStoredRequest(BaseModel):
+    subscription_ids: list[str] = Field(min_length=1)
+
+
+class KimiDropStoredResponse(BaseModel):
+    ok: bool = True
+    dropped: int = 0
 
 
 class KimiSheetStatus(BaseModel):

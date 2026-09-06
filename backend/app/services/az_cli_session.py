@@ -67,8 +67,40 @@ MSA_TENANTS = {
     "9188040d-6c67-4c5b-b112-36a304b66dad",
     "f8cdef31-a31e-4b4a-93e4-5f571e91255a",
 }
-MAX_TENANT_RETRIES = 3
-SECURITY_DEFAULTS_MESSAGE = "Microsoft needs another sign-in. Try again and enter the new code when it appears."
+# Microsoft's own directory shows up in az login noise; silent ARM against it just wastes time.
+SKIP_DISCOVERY_TENANTS = MSA_TENANTS | {
+    "72f988bf-86f1-41af-91ab-2d7cd011db47",
+}
+_MSA_EMAIL_DOMAINS = {
+    "outlook.com",
+    "hotmail.com",
+    "live.com",
+    "msn.com",
+    "gmail.com",
+    "googlemail.com",
+    "icloud.com",
+    "me.com",
+    "mac.com",
+    "yahoo.com",
+    "ymail.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+}
+MAX_SILENT_TENANTS = 8
+NO_SUBSCRIPTION_MESSAGE = "No Azure subscription was found on this Microsoft account."
+_USABLE_SUB_STATES = {"enabled", "warned", ""}
+ACCESS_DENIED_MESSAGE = (
+    "This Microsoft account cannot sign in to that Azure directory. "
+    "Use the same account you use at portal.azure.com for this subscription."
+)
+SECURITY_DEFAULTS_RETRY_MESSAGE = "Microsoft needs one more sign-in. Wait for a new code — do not reuse the previous one."
+SECURITY_DEFAULTS_STILL_BLOCKED = (
+    "Microsoft Security Defaults blocked this Azure directory (AADSTS530035). "
+    "A second device code with --tenant cannot bypass that. "
+    "On portal.azure.com with the same Microsoft account: Microsoft Entra ID → Properties → "
+    "Manage security defaults → Disabled → Save. Then start /join again."
+)
 
 
 class AzCliError(RuntimeError):
@@ -198,6 +230,19 @@ def normalize_tenant_id(value: str | None) -> str | None:
     return lowered
 
 
+def parse_failed_against_tenants(text: str) -> list[str]:
+    """Tenants Azure CLI named in 'Authentication failed against tenant <guid>'."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for match in FAILED_AGAINST_TENANT_RE.finditer(text or ""):
+        tid = normalize_tenant_id(match.group(1))
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        ordered.append(tid)
+    return ordered
+
+
 def parse_blocked_tenants(text: str) -> list[str]:
     """Tenant IDs Azure CLI named after a security-defaults / ARM token failure.
 
@@ -214,8 +259,8 @@ def parse_blocked_tenants(text: str) -> list[str]:
         ordered.append(tid)
 
     blob = text or ""
-    for match in FAILED_AGAINST_TENANT_RE.finditer(blob):
-        add(match.group(1))
+    for tid in parse_failed_against_tenants(blob):
+        add(tid)
     for match in TENANT_NAME_LINE_RE.finditer(blob):
         add(match.group(1))
     return ordered
@@ -226,12 +271,206 @@ def security_defaults_blocked(text: str) -> bool:
     return "aadsts530035" in lowered or "blocked by security defaults" in lowered
 
 
-def humanize_login_failure(text: str) -> str:
-    if security_defaults_blocked(text) or parse_blocked_tenants(text):
-        return SECURITY_DEFAULTS_MESSAGE
+def login_access_denied(text: str) -> bool:
     lowered = (text or "").lower()
-    if "no subscriptions found" in lowered:
-        return "No Azure subscription was found on this Microsoft account."
+    return (
+        "aadsts50020" in lowered
+        or "aadsts50034" in lowered
+        or "aadsts50059" in lowered
+        or "don't have access to this" in lowered
+        or "do not have access to this" in lowered
+        or "does not exist in tenant" in lowered
+        or "cannot access the application" in lowered
+        or "you don't have access to this resource" in lowered
+    )
+
+
+def _account_email(user_name: str | None) -> str:
+    raw = (user_name or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if "#ext#" in lowered:
+        left = raw.split("#", 1)[0]
+        if "@" in left:
+            return left
+        if "_" in left:
+            local, domain = left.split("_", 1)
+            return f"{local}@{domain}"
+        return left
+    return raw
+
+
+def is_personal_microsoft_account(user_name: str | None, tenant_id: str | None = None) -> bool:
+    """Unknown identity is treated as personal so we never guess `az login --tenant`."""
+    email = _account_email(user_name)
+    if not email:
+        return True
+    domain = email.rsplit("@", 1)[-1].lower() if "@" in email else ""
+    if domain in _MSA_EMAIL_DOMAINS:
+        return True
+    tid = normalize_tenant_id(tenant_id)
+    if tid is None and tenant_id:
+        return True
+    return False
+
+
+def needs_second_interactive_login(text: str) -> bool:
+    return security_defaults_blocked(text) or bool(parse_failed_against_tenants(text))
+
+
+def interactive_retry_tenant_id(*, personal: bool, buffer: str) -> str | None:
+    """`--tenant` only for work accounts. Personal Outlook/Gmail + Security Defaults
+    still fail with AADSTS50020 or the same AADSTS530035 on `--tenant`.
+    """
+    if personal or login_access_denied(buffer):
+        return None
+    if not security_defaults_blocked(buffer):
+        return None
+    failed = parse_failed_against_tenants(buffer) or parse_blocked_tenants(buffer)
+    if len(failed) == 1:
+        return failed[0]
+    return None
+
+
+def accounts_from_arm_subscriptions(text: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(text or "")
+    except json.JSONDecodeError:
+        return []
+    rows = data.get("value") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_id = str(row.get("subscriptionId") or row.get("id") or "").strip()
+        sid = raw_id.rsplit("/", 1)[-1]
+        if not sid or not TENANT_GUID_RE.fullmatch(sid):
+            continue
+        out.append(
+            {
+                "id": sid,
+                "name": str(row.get("displayName") or row.get("name") or ""),
+                "state": str(row.get("state") or "Enabled"),
+                "tenantId": str(row.get("tenantId") or ""),
+                "isDefault": bool(row.get("isDefault")),
+            }
+        )
+    return out
+
+
+def tenant_ids_from_json(text: str) -> list[str]:
+    try:
+        data = json.loads(text or "")
+    except json.JSONDecodeError:
+        return []
+    rows = data.get("value") if isinstance(data, dict) else data
+    if not isinstance(rows, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        tid = normalize_tenant_id(str(row.get("tenantId") or row.get("id") or ""))
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(tid)
+    return out
+
+
+def is_tenant_level_account(
+    item: dict[str, Any] | None = None,
+    *,
+    subscription_id: str = "",
+    tenant_id: str = "",
+    name: str = "",
+) -> bool:
+    """True for `az login --allow-no-subscriptions` placeholders (id == tenant, name N/A)."""
+    if isinstance(item, dict):
+        subscription_id = subscription_id or str(item.get("id") or item.get("subscription_id") or "")
+        tenant_id = tenant_id or str(item.get("tenantId") or item.get("tenant_id") or "")
+        name = name or str(item.get("name") or item.get("displayName") or "")
+    sid = (subscription_id or "").strip().lower()
+    tid = (tenant_id or "").strip().lower()
+    label = (name or "").strip().lower()
+    if "tenant level" in label:
+        return True
+    return bool(sid and tid and sid == tid)
+
+
+def enabled_subscription_accounts(accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            continue
+        state = str(item.get("state") or "Enabled")
+        if state.lower() not in _USABLE_SUB_STATES:
+            continue
+        if is_tenant_level_account(item):
+            continue
+        out.append(item)
+    return out
+
+
+def account_digest(accounts: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for item in accounts:
+        if not isinstance(item, dict):
+            continue
+        sid = str(item.get("id") or "").strip()
+        if not sid:
+            continue
+        state = str(item.get("state") or "?")
+        name = str(item.get("name") or "").strip() or "unnamed"
+        parts.append(f"{name}={state}")
+    return ", ".join(parts[:8]) or "none"
+
+
+_NO_SUBS_FOR_RE = re.compile(r"No subscriptions found for\s+(\S+)", re.I)
+
+
+def email_from_login_buffer(text: str) -> str:
+    match = _NO_SUBS_FOR_RE.search(text or "")
+    if not match:
+        return ""
+    raw = match.group(1).strip().rstrip(".,;:")
+    return raw if "@" in raw else ""
+
+
+def no_subscription_message(accounts: list[dict[str, Any]], email: str = "") -> str:
+    who = (email or "").strip()
+    listed = [item for item in accounts if isinstance(item, dict) and str(item.get("id") or "").strip()]
+    if listed:
+        digest = account_digest(listed)
+        prefix = f"{who}: " if who else ""
+        return (
+            f"{prefix}Azure listed {len(listed)} subscription(s) on this login but none are usable ({digest}). "
+            "The portal only accepts Enabled or Warned subscriptions."
+        )
+    if who:
+        return (
+            f"No Azure subscription was found on {who}. "
+            "Sign in with the same Microsoft account that owns the subscription at portal.azure.com."
+        )
+    return NO_SUBSCRIPTION_MESSAGE
+
+
+def humanize_login_failure(text: str) -> str:
+    if security_defaults_blocked(text):
+        return SECURITY_DEFAULTS_STILL_BLOCKED
+    if login_access_denied(text):
+        return ACCESS_DENIED_MESSAGE
+    lowered = (text or "").lower()
+    if "no subscriptions found" in lowered or "no azure subscription" in lowered:
+        email = email_from_login_buffer(text)
+        return no_subscription_message([], email) if email else NO_SUBSCRIPTION_MESSAGE
     return "Could not finish Microsoft sign-in. Try again."
 
 
@@ -329,7 +568,11 @@ class AzCliSession:
         timeout: int = LOGIN_TIMEOUT_SEC,
         tenant_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """One Microsoft device login. Tenant ID is parsed from Azure's response, then ARM is retried silently."""
+        """Device-code login against /organizations, then silent ARM, then at most one retry.
+
+        The first `az login` never uses `--tenant`. If Security Defaults block the
+        Default Directory, the one retry uses `--tenant` on the GUID Azure printed.
+        """
         az = shutil.which("az")
         if not az:
             raise AzCliError("Azure CLI (az) is not on the backend PATH.")
@@ -340,93 +583,166 @@ class AzCliSession:
         accounts, buffer, ok = await self._device_login_once(
             on_event,
             timeout=timeout,
-            tenant_id=hint,
+            tenant_id=None,
             retry=False,
             allow_no_subscriptions=True,
         )
-        last_buffer = buffer
-        listed = await self._accounts_if_user(accounts if ok else [])
+        listed = await self._usable_accounts(accounts) if ok else []
         if listed:
             return listed
+        if login_access_denied(buffer) and not security_defaults_blocked(buffer):
+            raise AzCliError(ACCESS_DENIED_MESSAGE)
+        if security_defaults_blocked(buffer) and not ok:
+            email = email_from_login_buffer(buffer)
+            personal_first = is_personal_microsoft_account(email, hint)
+            if personal_first or not interactive_retry_tenant_id(personal=False, buffer=buffer):
+                raise AzCliError(SECURITY_DEFAULTS_STILL_BLOCKED)
 
-        tenants = await self._discover_tenant_ids(buffer, hint)
-        for tid in tenants:
-            silent = await self._try_silent_tenant(tid)
-            if silent:
-                logger.info("join login used parsed tenant %s silently session=%s", tid, self.session_id)
-                return silent
+        identity = await self._identity_or_empty() if ok else {}
+        personal = is_personal_microsoft_account(
+            str((identity.get("user") or {}).get("name") or "") or email_from_login_buffer(buffer),
+            str(identity.get("tenantId") or "") or hint,
+        )
+        logger.warning(
+            "join login first session=%s ok=%s usable=%s personal=%s defaults=%s raw=%s",
+            self.session_id,
+            ok,
+            len(listed),
+            personal,
+            security_defaults_blocked(buffer),
+            account_digest(accounts),
+        )
 
-        for tid in tenants:
-            self._clear_login_cache()
-            await self.kill_login()
+        if ok:
+            listed = await self._silent_tenant_accounts(buffer, hint)
+            if listed:
+                return listed
+
+        need_token = (not ok) or (not identity)
+        need_defaults = needs_second_interactive_login(buffer)
+        if need_token or need_defaults:
+            retry_tenant = interactive_retry_tenant_id(personal=personal, buffer=buffer)
+            logger.warning(
+                "join login retry session=%s personal=%s tenant=%s token=%s defaults=%s",
+                self.session_id,
+                personal,
+                retry_tenant or "organizations",
+                need_token,
+                need_defaults,
+            )
             await on_event(
                 {
                     "type": "device_code_wait",
-                    "message": "Microsoft needs one more sign-in. Wait for a new code.",
+                    "message": (
+                        "Microsoft blocked the first sign-in (security defaults). "
+                        "Enter this new code — it signs into the Azure directory that has the subscription."
+                        if retry_tenant
+                        else (
+                            SECURITY_DEFAULTS_RETRY_MESSAGE
+                            if need_defaults
+                            else "Microsoft signed in but Azure did not attach a subscription. "
+                            "Enter this new code so we can look in your other directories."
+                        )
+                    ),
                 }
             )
-            accounts, buffer, ok = await self._device_login_once(
+            self._clear_login_cache()
+            await self.kill_login()
+            accounts, extra, ok = await self._device_login_once(
                 on_event,
                 timeout=timeout,
-                tenant_id=tid,
+                tenant_id=retry_tenant,
                 retry=True,
                 allow_no_subscriptions=True,
             )
-            last_buffer = buffer
-            listed = await self._accounts_if_user(accounts if ok else [])
+            buffer = f"{buffer}\n{extra}"
+            if login_access_denied(extra):
+                raise AzCliError(
+                    SECURITY_DEFAULTS_STILL_BLOCKED if personal or security_defaults_blocked(buffer) else ACCESS_DENIED_MESSAGE
+                )
+            listed = await self._usable_accounts(accounts if ok else [])
             if listed:
                 return listed
-            silent = await self._try_silent_tenant(tid)
-            if silent:
-                return silent
+            listed = await self._silent_tenant_accounts(buffer, retry_tenant or hint)
+            if listed:
+                return listed
 
-        if not security_defaults_blocked(last_buffer) and not parse_blocked_tenants(last_buffer):
-            raise AzCliError("No Azure subscription was found on this Microsoft account.")
-        raise AzCliError(humanize_login_failure(last_buffer))
+        if security_defaults_blocked(buffer):
+            raise AzCliError(SECURITY_DEFAULTS_STILL_BLOCKED)
+        if ok:
+            raise AzCliError(await self._no_subscription_error(buffer))
+        raise AzCliError(humanize_login_failure(buffer))
 
-    async def _accounts_if_user(self, accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        if not accounts:
+    async def _no_subscription_error(self, buffer: str = "") -> str:
+        identity = await self._identity_or_empty()
+        email = str((identity.get("user") or {}).get("name") or "").strip() or email_from_login_buffer(buffer)
+        raw: list[dict[str, Any]] = []
+        for all_tenants in (True, False):
             try:
-                accounts = await self.account_list()
+                raw = await self.account_list(all_tenants=all_tenants)
             except AzCliError:
-                return []
-        if not accounts:
-            return []
+                continue
+            if raw:
+                break
+        logger.warning(
+            "join login no usable subscription session=%s email=%s raw=%s",
+            self.session_id,
+            email or "-",
+            account_digest(raw),
+        )
+        return no_subscription_message(raw, email)
+
+    async def _identity_or_empty(self) -> dict[str, Any]:
         try:
-            identity = await self.account_show()
+            data = await self.account_show()
         except AzCliError:
-            return accounts
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def _silent_tenant_accounts(self, buffer: str, hint: str | None) -> list[dict[str, Any]]:
+        tenants = await self._discover_tenant_ids(buffer, hint)
+        for tid in tenants:
+            silent = await self._try_silent_tenant(tid)
+            if not silent:
+                continue
+            listed = await self._usable_accounts(silent)
+            if listed:
+                logger.warning("join login used parsed tenant %s silently session=%s", tid, self.session_id)
+                return listed
+        return await self._usable_accounts([])
+
+    async def _usable_accounts(self, accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        enabled = enabled_subscription_accounts(accounts)
+        if not enabled:
+            for kwargs in (
+                {"all_tenants": True, "refresh": True},
+                {"all_tenants": True, "refresh": False},
+                {"all_tenants": False, "refresh": False},
+            ):
+                try:
+                    enabled = enabled_subscription_accounts(await self.account_list(**kwargs))
+                except AzCliError:
+                    continue
+                if enabled:
+                    break
+        if not enabled:
+            enabled = enabled_subscription_accounts(await self._arm_subscription_accounts())
+        if not enabled:
+            return []
+        identity = await self._identity_or_empty()
+        if not identity:
+            return enabled
         user = identity.get("user") or {}
         if user.get("type") not in {"user", None, ""}:
             raise AzCliError(
                 "Sign in with the Microsoft account that owns the Azure subscription, not an app login."
             )
-        return accounts
+        return enabled
 
-    async def _discover_tenant_ids(self, buffer: str, hint: str | None) -> list[str]:
-        ordered: list[str] = []
-        seen: set[str] = set()
+    async def _accounts_if_user(self, accounts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return await self._usable_accounts(accounts)
 
-        def add(raw: str | None) -> None:
-            tid = normalize_tenant_id(raw)
-            if not tid or tid in seen:
-                return
-            seen.add(tid)
-            ordered.append(tid)
-
-        add(hint)
-        for tid in parse_blocked_tenants(buffer):
-            add(tid)
-        try:
-            identity = await self.account_show()
-        except AzCliError:
-            identity = {}
-        add(str((identity or {}).get("tenantId") or ""))
-        for tid in await self._graph_tenant_ids():
-            add(tid)
-        return ordered[:MAX_TENANT_RETRIES]
-
-    async def _graph_tenant_ids(self) -> list[str]:
+    async def _arm_subscription_accounts(self) -> list[dict[str, Any]]:
         ok, text = await self._run_ok(
             [
                 "az",
@@ -434,9 +750,7 @@ class AzCliSession:
                 "--method",
                 "get",
                 "--url",
-                "https://graph.microsoft.com/v1.0/organization",
-                "--resource",
-                "https://graph.microsoft.com/",
+                "https://management.azure.com/subscriptions?api-version=2022-12-01",
                 "-o",
                 "json",
             ],
@@ -444,20 +758,57 @@ class AzCliSession:
         )
         if not ok:
             return []
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            return []
-        rows = data.get("value") if isinstance(data, dict) else data
-        if not isinstance(rows, list):
-            return []
-        out: list[str] = []
-        for row in rows:
-            if isinstance(row, dict):
-                tid = normalize_tenant_id(str(row.get("id") or ""))
-                if tid:
-                    out.append(tid)
-        return out
+        found = accounts_from_arm_subscriptions(text)
+        if found:
+            logger.warning(
+                "join login ARM subscriptions session=%s raw=%s",
+                self.session_id,
+                account_digest(found),
+            )
+        return found
+
+    async def _discover_tenant_ids(self, buffer: str, hint: str | None) -> list[str]:
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def add(raw: str | None) -> None:
+            tid = normalize_tenant_id(raw)
+            if not tid or tid in seen or tid in SKIP_DISCOVERY_TENANTS:
+                return
+            seen.add(tid)
+            ordered.append(tid)
+
+        add(hint)
+        identity = await self._identity_or_empty()
+        add(str((identity or {}).get("tenantId") or ""))
+        for tid in await self._arm_tenant_ids():
+            add(tid)
+        for tid in parse_blocked_tenants(buffer):
+            add(tid)
+        return ordered[:MAX_SILENT_TENANTS]
+
+    async def _arm_tenant_ids(self) -> list[str]:
+        commands = (
+            ["az", "account", "tenant", "list", "-o", "json"],
+            [
+                "az",
+                "rest",
+                "--method",
+                "get",
+                "--url",
+                "https://management.azure.com/tenants?api-version=2022-12-01",
+                "-o",
+                "json",
+            ],
+        )
+        for cmd in commands:
+            ok, text = await self._run_ok(cmd, timeout=45)
+            if not ok:
+                continue
+            ids = tenant_ids_from_json(text)
+            if ids:
+                return ids
+        return []
 
     async def _try_silent_tenant(self, tenant_id: str) -> list[dict[str, Any]]:
         ok, _err = await self._run_ok(
@@ -477,10 +828,15 @@ class AzCliSession:
         if not ok:
             return []
         try:
-            listed = await self.account_list()
+            listed = await self.account_list(all_tenants=True, refresh=True)
         except AzCliError:
-            return []
-        return [item for item in listed if isinstance(item, dict)]
+            try:
+                listed = await self.account_list(all_tenants=True)
+            except AzCliError:
+                listed = []
+        if not listed:
+            listed = await self._arm_subscription_accounts()
+        return enabled_subscription_accounts(listed)
 
     async def _device_login_once(
         self,
@@ -564,7 +920,7 @@ class AzCliSession:
         if rc is None:
             rc = await proc.wait()
         if rc != 0:
-            logger.info(
+            logger.warning(
                 "az login failed session=%s tenant=%s rc=%s defaults_block=%s",
                 self.session_id,
                 tenant_id or "organizations",
@@ -573,11 +929,26 @@ class AzCliSession:
             )
             await self._relay(f"exit {rc}", "err")
             return [], buffer, False
+        identity = await self._identity_or_empty()
+        if not identity and (
+            security_defaults_blocked(buffer) or "no subscriptions found" in buffer.lower()
+        ):
+            logger.warning(
+                "az login exit 0 but no session session=%s tenant=%s defaults=%s",
+                self.session_id,
+                tenant_id or "organizations",
+                security_defaults_blocked(buffer),
+            )
+            await self._relay("no azure session after login", "err")
+            return [], buffer, False
         await self._relay("ok", "ok")
         try:
-            listed = await self.account_list()
+            listed = await self.account_list(all_tenants=True)
         except AzCliError:
-            listed = []
+            try:
+                listed = await self.account_list(all_tenants=False)
+            except AzCliError:
+                listed = []
         return listed, buffer, True
 
     async def kill_login(self) -> None:
@@ -604,8 +975,14 @@ class AzCliSession:
         data = await self._run_json(["az", "account", "show", "-o", "json"], timeout=30)
         return data if isinstance(data, dict) else {}
 
-    async def account_list(self) -> list[dict[str, Any]]:
-        data = await self._run_json(["az", "account", "list", "-o", "json"], timeout=45)
+    async def account_list(self, *, all_tenants: bool = False, refresh: bool = False) -> list[dict[str, Any]]:
+        cmd = ["az", "account", "list"]
+        if all_tenants:
+            cmd.append("--all")
+        if refresh:
+            cmd.append("--refresh")
+        cmd.extend(["-o", "json"])
+        data = await self._run_json(cmd, timeout=60)
         if isinstance(data, list):
             return [item for item in data if isinstance(item, dict)]
         return []

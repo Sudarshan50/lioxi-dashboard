@@ -164,11 +164,21 @@ def role_assignment_cmd(
     return cmd
 
 
+def _cmd_label(cmd: list[str]) -> str:
+    parts = []
+    for arg in cmd[:8]:
+        if arg.startswith("--password=") or arg.startswith("-p="):
+            parts.append("-p=***")
+        else:
+            parts.append(arg)
+    return " ".join(parts)
+
+
 def az_json(cmd: list[str], env: dict[str, str] | None = None, timeout: int = 180) -> Any:
     r = _run(cmd, env=env, timeout=timeout)
     if r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip()
-        raise AzError(f"{' '.join(cmd[:6])} … failed ({r.returncode}): {err[-1200:]}")
+        raise AzError(f"{_cmd_label(cmd)} … failed ({r.returncode}): {err[-1200:]}")
     text = (r.stdout or "").strip()
     if not text:
         return None
@@ -254,8 +264,7 @@ def sp_login(env: dict[str, str], tenant: str, client: str, secret: str, sub: st
                     "--service-principal",
                     "-u",
                     client,
-                    "-p",
-                    secret,
+                    f"-p={secret}",
                     "--tenant",
                     tenant,
                     "--skip-subscription-discovery",
@@ -439,13 +448,19 @@ def model_unavailable(err: str) -> bool:
 
 
 def humanize_kimi_deploy_error(err: str) -> str:
-    if model_unavailable(err):
+    text = err or ""
+    lowered = text.lower()
+    if model_unavailable(text):
         return (
             "This Azure subscription cannot deploy FW-Kimi-K3. Microsoft has not enabled "
             "Fireworks Kimi on it. Retry deploy after they grant access, or Clear leftover "
             "to delete the empty Azure stack and this card."
         )
-    return (err or "")[-800:]
+    if "first character of the password is" in lowered or (
+        "az login" in lowered and "skip-subscription-discovery" in lowered
+    ):
+        return "Azure rejected the stored identity login. Retry deploy."
+    return text[-800:]
 
 
 # ---------------------------------------------------------------------------
@@ -1206,7 +1221,8 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
         keys = az_json(
             ["az", "cognitiveservices", "account", "keys", "list", "-n", acct_name, "-g", rg, "-o", "json"],
             env=env,
-        )
+        ) or {}
+        api_key = keys.get("key1") or keys.get("Key1") or keys.get("key2") or keys.get("Key2")
         props = shown.get("properties") or {}
         endpoint = props.get("endpoint") or ""
         endpoints = props.get("endpoints") or {}
@@ -1226,7 +1242,7 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
             "name": name,
             "email": email,
             "azure_openai_endpoint": openai_endpoint or endpoint,
-            "api_key": (keys or {}).get("key1"),
+            "api_key": api_key,
             "deployment_name": dep["deployment_name"],
             "model": MODEL_NAME,
             "sku": SKU_NAME,
@@ -1285,6 +1301,109 @@ def apply_content_filter_one(acct: dict[str, Any]) -> dict[str, Any]:
             "deployment_name": attached.get("deployment_name"),
             "rai_policy_name": policy,
             "previous_rai_policy_name": previous,
+            "message": message,
+        }
+
+
+def scale_kimi_one(acct: dict[str, Any]) -> dict[str, Any]:
+    """Scale FW-Kimi-K3 to the current Fireworks quota max (TPM/RPM)."""
+    tenant = acct["AZURE_TENANT_ID"]
+    client = acct["AZURE_CLIENT_ID"]
+    secret = acct["AZURE_CLIENT_SECRET"]
+    sub = acct["AZURE_SUBSCRIPTION_ID"]
+    name = acct.get("name") or slugify(acct.get("account_holder") or client)
+    preferred_name = acct.get("account_name") or ""
+    preferred_rg = acct.get("resource_group") or ""
+
+    with tempfile.TemporaryDirectory(prefix=f"az-scale-{slugify(name)}-") as tmp:
+        env = isolated_env(Path(tmp))
+        current = sp_login(env, tenant, client, secret, sub)
+        target = find_kimi_target(env, preferred_name, preferred_rg)
+        if target is None:
+            return {
+                "ok": False,
+                "name": name,
+                "subscription_id": sub,
+                "subscription_name": current.get("name"),
+                "error": "No FW-Kimi-K3 deployment or kimi account found.",
+            }
+        acct_name, rg = target
+        shown = az_json(
+            ["az", "cognitiveservices", "account", "show", "-n", acct_name, "-g", rg, "-o", "json"],
+            env=env,
+        )
+        loc = (shown.get("location") or LOCATION).replace(" ", "").lower()
+        prev_cap = 0
+        try:
+            existing = az_json(
+                [
+                    "az",
+                    "cognitiveservices",
+                    "account",
+                    "deployment",
+                    "show",
+                    "-n",
+                    acct_name,
+                    "-g",
+                    rg,
+                    "--deployment-name",
+                    DEPLOYMENT_NAME,
+                    "-o",
+                    "json",
+                ],
+                env=env,
+                timeout=90,
+            )
+            prev_cap = int(((existing.get("sku") or {}).get("capacity")) or 0)
+        except AzError:
+            prev_cap = 0
+        dep = retry(
+            lambda: ensure_kimi_deployment(env, sub, acct_name, rg, loc),
+            attempts=6,
+            delay=12,
+            desc="scale FW-Kimi-K3 TPM/RPM",
+        )
+        props = shown.get("properties") or {}
+        endpoint = props.get("endpoint") or ""
+        endpoints = props.get("endpoints") or {}
+        openai_endpoint = (
+            endpoints.get("OpenAI Language Model Instance API")
+            or endpoints.get("Azure AI Model Inference API")
+            or endpoints.get("AI Foundry API")
+            or endpoint
+        )
+        openai_endpoint = (openai_endpoint or "").replace(
+            ".cognitiveservices.azure.com", ".openai.azure.com"
+        ).replace(".services.ai.azure.com", ".openai.azure.com")
+        policies = subscription_policies(env, sub)
+        quota_id = policies.get("quotaId")
+        prev_tpm = prev_cap * 1000
+        prev_rpm = prev_cap
+        changed = int(dep["capacity"]) != prev_cap
+        if changed:
+            message = (
+                f"Upgraded TPM/RPM from {prev_tpm}/{prev_rpm} to {dep['tpm']}/{dep['rpm']}."
+            )
+        else:
+            message = f"Already at max TPM/RPM ({dep['tpm']}/{dep['rpm']}) for this quota."
+        return {
+            "ok": True,
+            "name": name,
+            "email": acct.get("account_holder") or "",
+            "azure_openai_endpoint": openai_endpoint or endpoint,
+            "deployment_name": dep["deployment_name"],
+            "model": MODEL_NAME,
+            "sku": SKU_NAME,
+            "capacity": dep["capacity"],
+            "tpm": dep["tpm"],
+            "rpm": dep["rpm"],
+            "quota_limit": dep["quota_limit"],
+            "quota_id": quota_id,
+            "region": loc,
+            "resource_group": rg,
+            "account_name": acct_name,
+            "subscription_id": sub,
+            "subscription_name": current.get("name"),
             "message": message,
         }
 
@@ -1848,6 +1967,31 @@ def cmd_content_filter(args: argparse.Namespace) -> int:
     return 1 if errors else 0
 
 
+def cmd_scale_quota(args: argparse.Namespace) -> int:
+    accounts = load_accounts(Path(args.input))
+    workers = min(args.jobs, max(1, len(accounts)))
+    results: list[dict[str, Any]] = [None] * len(accounts)  # type: ignore
+    errors = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futs = {pool.submit(scale_kimi_one, acct): i for i, acct in enumerate(accounts)}
+        for fut in as_completed(futs):
+            i = futs[fut]
+            name = accounts[i].get("name") or accounts[i].get("account_holder") or str(i)
+            try:
+                results[i] = fut.result()
+                print(f"OK {name} {results[i].get('message')}", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                errors += 1
+                results[i] = {"ok": False, "name": name, "error": str(exc)[-1500:]}
+                print(f"FAIL {name}: {exc}", file=sys.stderr)
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({"results": results}, indent=2) + "\n")
+    print(json.dumps({"ok_count": len(accounts) - errors, "fail_count": errors, "wrote": str(out)}))
+    return 1 if errors else 0
+
+
 def cmd_deploy(args: argparse.Namespace) -> int:
     accounts = load_accounts(Path(args.input))
     workers = min(args.jobs, max(1, len(accounts)))
@@ -1974,6 +2118,12 @@ def build_parser() -> argparse.ArgumentParser:
     cf.add_argument("--out", required=True)
     cf.add_argument("--jobs", type=int, default=12)
     cf.set_defaults(func=cmd_content_filter)
+
+    sq = sub.add_parser("scale-quota", help="Scale FW-Kimi-K3 TPM/RPM up to the current Azure quota")
+    sq.add_argument("--input", required=True)
+    sq.add_argument("--out", required=True)
+    sq.add_argument("--jobs", type=int, default=12)
+    sq.set_defaults(func=cmd_scale_quota)
 
     ep = sub.add_parser("ensure-payg", help="Check current Owner login and upgrade/create PAYG if blocked")
     ep.set_defaults(func=cmd_ensure_payg)

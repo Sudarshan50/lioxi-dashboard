@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import AppLayout from "@/components/layout/AppLayout";
 import AccountsPage from "@/pages/AccountsPage";
 import AlertsPage from "@/pages/AlertsPage";
+import BanPage from "@/pages/BanPage";
 import DeployK3Page from "@/pages/DeployK3Page";
 import JoinPage from "@/pages/JoinPage";
 import LoginPage from "@/pages/LoginPage";
@@ -22,6 +23,7 @@ export default function App() {
           <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/deploy" element={<DeployK3Page />} />
           <Route path="/pending" element={<PendingPage />} />
+          <Route path="/ban" element={<BanPage />} />
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/alerts" element={<AlertsPage />} />
         </Route>

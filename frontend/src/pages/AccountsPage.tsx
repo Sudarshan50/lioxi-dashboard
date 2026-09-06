@@ -28,6 +28,8 @@ import {
   gatewayRank,
   portalSpendUsd,
 } from "@/lib/accountSort";
+import { grantTier, isGatewayEnabled } from "@/lib/grantTier";
+import { GrantBucket, GrantTierBits, summarizeAccounts } from "@/lib/grantSpend";
 import { amountPayableUsd } from "@/lib/payable";
 import { formatCurrency } from "@/lib/format";
 import { matchesOwner, ownerCounts, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
@@ -51,7 +53,8 @@ type AccountSort =
   | "location"
   | "created";
 
-type GatewayFilter = "all" | "o1" | "o2" | "both" | "disabled" | "none";
+type GatewayFilter = "all" | "enabled" | "o1" | "o2" | "both" | "disabled" | "none";
+type GrantFilter = "all" | "1k" | "10k";
 
 export default function AccountsPage() {
   const navigate = useNavigate();
@@ -68,7 +71,8 @@ export default function AccountsPage() {
   const [editingGroup, setEditingGroup] = useState<AccountGroup | null>(null);
   const [search, setSearch] = useState("");
   const [ownerFilter, setOwnerFilter] = useState<string | null>(null);
-  const [gatewayFilter, setGatewayFilter] = useState<GatewayFilter>("all");
+  const [gatewayFilter, setGatewayFilter] = useState<GatewayFilter>("enabled");
+  const [grantFilter, setGrantFilter] = useState<GrantFilter>("all");
   const [sort, setSort] = useState<AccountSort>("name");
   const [deletingGroupId, setDeletingGroupId] = useState<number | null>(null);
 
@@ -141,24 +145,45 @@ export default function AccountsPage() {
     const visible = (accounts ?? []).filter((account) => {
       if (!matchesOwner(account.owner_tag, ownerFilter)) return false;
       if (!matchesGatewayFilter(account, gatewayFilter)) return false;
+      if (grantFilter !== "all" && grantTier(account, usdInr) !== grantFilter) return false;
       return matchesAccountSearch(account, search, groupsByAccountId.get(account.id) ?? []);
     });
     return [...visible].sort((left, right) => compareAccounts(left, right, sort, usdInr));
-  }, [accounts, gatewayFilter, groupsByAccountId, ownerFilter, search, sort, usdInr]);
+  }, [accounts, gatewayFilter, grantFilter, groupsByAccountId, ownerFilter, search, sort, usdInr]);
 
-  const hasActiveFilters = Boolean(search.trim() || ownerFilter || gatewayFilter !== "all");
+  const hasActiveFilters = Boolean(
+    search.trim() || ownerFilter || gatewayFilter !== "enabled" || grantFilter !== "all"
+  );
 
   function resetFilters() {
     setSearch("");
     setOwnerFilter(null);
-    setGatewayFilter("all");
+    setGatewayFilter("enabled");
+    setGrantFilter("all");
   }
 
+  function selectGrantTier(tier: GrantFilter) {
+    if (grantFilter === tier) {
+      setGrantFilter("all");
+      return;
+    }
+    setGrantFilter(tier);
+    setGatewayFilter("enabled");
+  }
+
+  const accountById = useMemo(() => new Map((accounts ?? []).map((account) => [account.id, account])), [accounts]);
+
+  const scopedAccounts = useMemo(
+    () => (accounts ?? []).filter((account) => matchesGatewayFilter(account, gatewayFilter)),
+    [accounts, gatewayFilter]
+  );
+
+  const grantTotals = useMemo(() => summarizeAccounts(scopedAccounts, usdInr), [scopedAccounts, usdInr]);
+
   const ownerTotals = useMemo(() => {
-    const spend = filteredAccounts.reduce((sum, account) => sum + (account.new_api_cost_usd || 0), 0);
-    const payable = filteredAccounts.reduce((sum, account) => sum + amountPayableUsd(account.new_api_cost_usd), 0);
-    return { spend, payable, count: filteredAccounts.length };
-  }, [filteredAccounts]);
+    const ownerAccounts = scopedAccounts.filter((account) => matchesOwner(account.owner_tag, ownerFilter));
+    return summarizeAccounts(ownerAccounts, usdInr);
+  }, [ownerFilter, scopedAccounts, usdInr]);
 
   const accountsByTag = useMemo(() => {
     const groups = new Map<string, typeof filteredAccounts>();
@@ -197,6 +222,23 @@ export default function AccountsPage() {
         </div>
       </div>
 
+      {accounts && accounts.length > 0 && (
+        <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <GrantSpendCard
+            label="1k accounts"
+            bucket={grantTotals.oneK}
+            selected={grantFilter === "1k"}
+            onClick={() => selectGrantTier("1k")}
+          />
+          <GrantSpendCard
+            label="10k accounts"
+            bucket={grantTotals.tenK}
+            selected={grantFilter === "10k"}
+            onClick={() => selectGrantTier("10k")}
+          />
+        </section>
+      )}
+
       <section className="flex flex-col gap-3">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
           <h2 className="text-sm font-semibold text-gray-200">Account groups</h2>
@@ -209,39 +251,56 @@ export default function AccountsPage() {
           <Spinner />
         ) : groups && groups.length > 0 ? (
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-            {groups.map((group) => (
-              <Card key={group.id} className="flex flex-col gap-2">
-                <div className="flex items-start justify-between gap-2">
-                  <p className="font-medium text-gray-100">{group.name}</p>
-                  <div className="flex shrink-0 items-center gap-1">
-                    {group.auto && <Badge tone="info">auto</Badge>}
-                    <Badge tone="neutral">
-                      {group.accounts.length} account{group.accounts.length === 1 ? "" : "s"}
-                    </Badge>
+            {groups.map((group) => {
+              const stats = groupSpendStats(group, accountById, usdInr, gatewayFilter);
+              return (
+                <Card key={group.id} className="flex flex-col gap-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <p className="font-medium text-gray-100">{group.name}</p>
+                    <div className="flex shrink-0 items-center gap-1">
+                      {group.auto && <Badge tone="info">auto</Badge>}
+                      <Badge tone="neutral">
+                        {group.accounts.length} account{group.accounts.length === 1 ? "" : "s"}
+                      </Badge>
+                    </div>
                   </div>
-                </div>
-                <p className="truncate text-xs text-gray-500">
-                  {group.auto
-                    ? "Auto-filled from ~$1,000 Azure credit grants"
-                    : group.accounts.length > 0
-                      ? group.accounts.map((a) => a.name).join(", ")
-                      : "No accounts yet"}
-                </p>
-                <div className="mt-1 flex gap-2">
-                  <Button variant="secondary" className="px-2.5 py-1.5 text-xs" onClick={() => openEditGroup(group)}>
-                    <Pencil size={13} /> Edit
-                  </Button>
-                  <Button
-                    variant="danger"
-                    className="px-2.5 py-1.5"
-                    onClick={() => handleDeleteGroup(group)}
-                    isLoading={deletingGroupId === group.id}
-                  >
-                    <Trash2 size={13} />
-                  </Button>
-                </div>
-              </Card>
-            ))}
+                  <p className="truncate text-xs text-gray-500">
+                    {group.auto
+                      ? autoGroupHint(group.name)
+                      : group.accounts.length > 0
+                        ? group.accounts.map((a) => a.name).join(", ")
+                        : "No accounts yet"}
+                  </p>
+                  {(stats.pool > 0 || stats.spend > 0) && (
+                    <p className="text-xs text-gray-500">
+                      <span className="tabular-nums text-violet-300">{formatCurrency(stats.spend, "USD")}</span>
+                      / <span className="tabular-nums text-gray-200">{formatCurrency(stats.pool, "USD")}</span> pool
+                      {stats.count ? ` (${stats.count})` : ""}
+                      {!group.auto && (stats.oneK.activeCount > 0 || stats.tenK.activeCount > 0) ? (
+                        <span className="mt-0.5 block">
+                          <GrantTierBits label="1k" tone="emerald" bucket={stats.oneK} />
+                          {" · "}
+                          <GrantTierBits label="10k" tone="sky" bucket={stats.tenK} />
+                        </span>
+                      ) : null}
+                    </p>
+                  )}
+                  <div className="mt-1 flex gap-2">
+                    <Button variant="secondary" className="px-2.5 py-1.5 text-xs" onClick={() => openEditGroup(group)}>
+                      <Pencil size={13} /> Edit
+                    </Button>
+                    <Button
+                      variant="danger"
+                      className="px-2.5 py-1.5"
+                      onClick={() => handleDeleteGroup(group)}
+                      isLoading={deletingGroupId === group.id}
+                    >
+                      <Trash2 size={13} />
+                    </Button>
+                  </div>
+                </Card>
+              );
+            })}
           </div>
         ) : (
           <EmptyState
@@ -299,6 +358,7 @@ export default function AccountsPage() {
                 value={gatewayFilter}
                 onChange={(e) => setGatewayFilter(e.target.value as GatewayFilter)}
               >
+                <option value="enabled">Enabled only</option>
                 <option value="all">All gateways</option>
                 <option value="both">O1 + O2</option>
                 <option value="o1">On O1</option>
@@ -334,13 +394,20 @@ export default function AccountsPage() {
             />
 
             {ownerFilter && (
-              <p className="mt-3 text-xs text-gray-500">
-                Combined for {ownerFilter === UNTAGGED_OWNER ? "untagged" : ownerFilter}:{" "}
-                <span className="tabular-nums text-violet-300">{formatCurrency(ownerTotals.spend, "USD")}</span> spend ·{" "}
-                <span className="tabular-nums text-amber-200">{formatCurrency(ownerTotals.payable, "USD")}</span> payable ·{" "}
-                <span className="tabular-nums text-gray-300">{ownerTotals.count}</span> account
-                {ownerTotals.count === 1 ? "" : "s"}
-              </p>
+              <div className="mt-3 flex flex-col gap-1 text-xs text-gray-500">
+                <p>
+                  Combined for {ownerFilter === UNTAGGED_OWNER ? "untagged" : ownerFilter}:{" "}
+                  <span className="tabular-nums text-violet-300">{formatCurrency(ownerTotals.spend, "USD")}</span> spend ·{" "}
+                  <span className="tabular-nums text-amber-200">{formatCurrency(ownerTotals.payable, "USD")}</span> payable ·{" "}
+                  <span className="tabular-nums text-gray-300">{ownerTotals.count}</span> account
+                  {ownerTotals.count === 1 ? "" : "s"}
+                </p>
+                <p>
+                  <GrantTierBits label="1k" tone="emerald" bucket={ownerTotals.oneK} />
+                  {" · "}
+                  <GrantTierBits label="10k" tone="sky" bucket={ownerTotals.tenK} />
+                </p>
+              </div>
             )}
 
             {hasActiveFilters && (
@@ -359,16 +426,20 @@ export default function AccountsPage() {
           filteredAccounts.length > 0 ? (
             <div className="flex flex-col gap-6">
               {accountsByTag.map(([tag, rows]) => {
-                const spend = rows.reduce((sum, account) => sum + (account.new_api_cost_usd || 0), 0);
-                const payable = amountPayableUsd(spend);
+                const totals = summarizeAccounts(rows, usdInr);
                 return (
                   <div key={tag} className="flex flex-col gap-3">
                     <div className="flex flex-wrap items-baseline justify-between gap-2">
                       <h3 className="text-sm font-semibold text-gray-200">{tag}</h3>
-                      <p className="text-xs text-gray-500">
-                        <span className="tabular-nums text-violet-300">{formatCurrency(spend, "USD")}</span> spend ·{" "}
-                        <span className="tabular-nums text-amber-200">{formatCurrency(payable, "USD")}</span> payable ·{" "}
-                        {rows.length} account{rows.length === 1 ? "" : "s"}
+                      <p className="text-right text-xs text-gray-500">
+                        <span className="tabular-nums text-violet-300">{formatCurrency(totals.spend, "USD")}</span> spend ·{" "}
+                        <span className="tabular-nums text-amber-200">{formatCurrency(totals.payable, "USD")}</span> payable ·{" "}
+                        {totals.count} account{totals.count === 1 ? "" : "s"}
+                        <span className="mt-0.5 block">
+                          <GrantTierBits label="1k" tone="emerald" bucket={totals.oneK} />
+                          {" · "}
+                          <GrantTierBits label="10k" tone="sky" bucket={totals.tenK} />
+                        </span>
                       </p>
                     </div>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
@@ -454,11 +525,71 @@ function gatewayLabels(account: Account): Set<string> {
 function matchesGatewayFilter(account: Account, filter: GatewayFilter): boolean {
   const labels = gatewayLabels(account);
   if (filter === "all") return true;
+  if (filter === "enabled") return isGatewayEnabled(account);
   if (filter === "none") return labels.size === 0;
   if (filter === "both") return labels.has("O1") && labels.has("O2");
   if (filter === "o1") return labels.has("O1");
   if (filter === "o2") return labels.has("O2");
   return account.new_api_status != null && account.new_api_status !== 1;
+}
+
+function autoGroupHint(name: string): string {
+  const key = name.trim().toLowerCase();
+  if (key === "10k accounts") return "Auto-filled from ~$10,000 Azure credit grants";
+  if (key === "1k accounts") return "Auto-filled from ~$1,000 Azure credit grants";
+  return "Auto-filled from matching Azure credit grants";
+}
+
+function groupSpendStats(
+  group: AccountGroup,
+  accountById: Map<number, Account>,
+  usdInr: number,
+  gatewayFilter: GatewayFilter
+) {
+  const members = group.accounts
+    .map((member) => accountById.get(member.id))
+    .filter((account): account is Account => Boolean(account))
+    .filter((account) => matchesGatewayFilter(account, gatewayFilter));
+  return summarizeAccounts(members, usdInr);
+}
+
+function GrantSpendCard({
+  label,
+  bucket,
+  selected,
+  onClick,
+}: {
+  label: string;
+  bucket: GrantBucket;
+  selected: boolean;
+  onClick: () => void;
+}) {
+  const hasSplit = bucket.o1 > 0 || bucket.o2 > 0;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={selected}
+      className={
+        selected
+          ? "rounded-2xl border border-violet-400/40 bg-violet-500/10 bg-card-sheen p-4 text-left shadow-card transition-colors"
+          : "rounded-2xl border border-white/[0.06] bg-surface-raised/80 bg-card-sheen p-4 text-left shadow-card transition-colors hover:border-white/[0.12]"
+      }
+    >
+      <p className="text-[11px] font-medium uppercase tracking-wider text-gray-500">{label}</p>
+      <p className="mt-2 text-xl font-semibold tracking-tight text-gray-50 tabular-nums sm:text-2xl">
+        {formatCurrency(bucket.active, "USD")}
+        <span className="text-base font-medium text-gray-400">
+          / {formatCurrency(bucket.pool, "USD")} pool
+        </span>
+      </p>
+      <p className="mt-1 text-xs text-gray-500">
+        NewAPI spend / grant pool · {bucket.activeCount} account
+        {bucket.activeCount === 1 ? "" : "s"}
+        {hasSplit ? ` · O1 ${formatCurrency(bucket.o1, "USD")} + O2 ${formatCurrency(bucket.o2, "USD")}` : ""}
+      </p>
+    </button>
+  );
 }
 
 function compareAccounts(left: Account, right: Account, sort: AccountSort, usdInr: number): number {

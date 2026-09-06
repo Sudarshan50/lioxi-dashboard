@@ -182,6 +182,16 @@ def _unique_deployments(deployments: list[DeploymentInfo]) -> list[DeploymentInf
     return list(seen.values())
 
 
+def _created_at(item: dict) -> str | None:
+    system = item.get("systemData") or {}
+    raw = system.get("createdAt") or system.get("created_at")
+    if not raw:
+        properties = item.get("properties") or {}
+        raw = properties.get("dateCreated") or properties.get("createdAt")
+    text = str(raw or "").strip()
+    return text or None
+
+
 def _to_resource(item: dict) -> DiscoveredResource:
     properties = item.get("properties", {})
     resource_id = item["id"]
@@ -192,6 +202,7 @@ def _to_resource(item: dict) -> DiscoveredResource:
         kind=item.get("kind", ""),
         location=item.get("location", ""),
         endpoint=properties.get("endpoint", ""),
+        created_at=_created_at(item),
     )
 
 
@@ -205,6 +216,7 @@ def _to_deployment(item: dict) -> DeploymentInfo:
         model_version=model.get("version", ""),
         sku=sku.get("name", ""),
         capacity=sku.get("capacity", 0),
+        created_at=_created_at(item),
     )
 
 

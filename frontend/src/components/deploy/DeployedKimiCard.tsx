@@ -1,10 +1,11 @@
-import { Check, Copy, FileSpreadsheet, KeyRound, Play, Radio, RefreshCw, Pencil, Trash2 } from "lucide-react";
+import { ArrowUpCircle, Check, Copy, FileSpreadsheet, KeyRound, Play, Radio, RefreshCw, Pencil, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
-import { formatCurrency, formatTokens } from "@/lib/format";
+import { formatCurrency, formatDeployedAt, formatRelative, formatTokens } from "@/lib/format";
+import { quotaTierLabel } from "@/lib/tpmTier";
 import { KimiDeployResult, KimiTestResult } from "@/types";
 
 export default function DeployedKimiCard({
@@ -19,8 +20,9 @@ export default function DeployedKimiCard({
   renamingNewApi,
   syncingSheet,
   refreshing,
+  upgradingTpm,
   nextNewApiName,
-  defaultPriority = 13,
+  defaultPriority = 10,
   defaultWeight = 1,
   jsonPriority,
   jsonWeight,
@@ -32,6 +34,7 @@ export default function DeployedKimiCard({
   onSaveNewApi,
   onSyncSheet,
   onRefresh,
+  onUpgradeTpm,
 }: {
   item: KimiDeployResult;
   email?: string | null;
@@ -44,6 +47,7 @@ export default function DeployedKimiCard({
   renamingNewApi: boolean;
   syncingSheet: boolean;
   refreshing: boolean;
+  upgradingTpm: boolean;
   nextNewApiName?: string | null;
   defaultPriority?: number;
   defaultWeight?: number;
@@ -57,11 +61,15 @@ export default function DeployedKimiCard({
   onSaveNewApi: (opts: { name: string; priority: number; weight: number }) => void;
   onSyncSheet: () => void;
   onRefresh: () => void;
+  onUpgradeTpm: () => void;
 }) {
   const live = item.ok && !item.removed;
   const grant = formatGrant(item);
   const endpoint = openaiEndpoint(item.azure_openai_endpoint);
   const canAddNewApi = Boolean((live || item.account_name) && !item.removed && !item.pending && !item.new_api_present);
+  const canUpgradeTpm = Boolean(live && item.tpm_upgrade_available);
+  const canShowUpdate = Boolean(live && canUpgradeTpm);
+  const quotaTier = quotaTierLabel(item);
   const seedPriority = item.new_api_priority ?? jsonPriority ?? defaultPriority;
   const seedWeight = item.new_api_weight ?? jsonWeight ?? defaultWeight;
   const [draftName, setDraftName] = useState(item.new_api_name || "");
@@ -94,7 +102,7 @@ export default function DeployedKimiCard({
   const canRefresh = !item.removed && !deploying;
 
   return (
-    <Card className={`flex flex-col gap-0 !p-0 ${deploying ? "!border-accent/40 shadow-glow" : ""}`}>
+    <Card className={`flex flex-col gap-0 !p-0 ${deploying ? "!border-accent/40 shadow-glow" : canShowUpdate ? "!border-amber-400/35" : ""}`}>
       <div className="flex flex-col gap-4 p-4 sm:p-5">
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
@@ -103,6 +111,22 @@ export default function DeployedKimiCard({
               <Badge tone="info" className="max-w-[9rem] shrink-0 truncate" title="Name tag">
                 {item.owner_tag}
               </Badge>
+            )}
+            {quotaTier && live && (
+              <Badge tone="neutral" title="Azure Foundry quota tier for this subscription">
+                {quotaTier}
+              </Badge>
+            )}
+            {canShowUpdate && (
+              <button
+                type="button"
+                onClick={onUpgradeTpm}
+                disabled={busy}
+                title={upgradeHint(item)}
+                className="inline-flex"
+              >
+                <Badge tone="warning">(newUpdate)</Badge>
+              </button>
             )}
             {item.removed ? (
               <Badge tone="warning">deleted</Badge>
@@ -117,9 +141,14 @@ export default function DeployedKimiCard({
             ) : (
               <Badge tone="neutral">not deployed</Badge>
             )}
+            {live && item.deployed_at && (
+              <span className="text-xs text-gray-500" title={formatDeployedAt(item.deployed_at)}>
+                {formatRelative(item.deployed_at)}
+              </span>
+            )}
             <NewApiBadge item={item} />
           </div>
-          <p className="mt-1 truncate text-xs text-gray-500">{email || "No email"}</p>
+          <p className="mt-1 truncate text-xs text-gray-500">{displayEmail(email)}</p>
         </div>
 
         {item.pending && (
@@ -203,16 +232,44 @@ export default function DeployedKimiCard({
             </div>
             <Meta label="Foundry" value={item.account_name} />
             <Meta label="Subscription" value={item.subscription_name || item.subscription_id} />
+            <Meta
+              label="Deployed"
+              value={live && item.deployed_at ? formatDeployedAt(item.deployed_at) : live ? "—" : undefined}
+            />
             <div>
               <p className="text-[11px] uppercase tracking-wide text-gray-500">Credit grant</p>
               <p className="mt-0.5 text-sm tabular-nums text-gray-100">{grant.primary}</p>
               {grant.secondary && <p className="text-xs tabular-nums text-gray-500">{grant.secondary}</p>}
             </div>
             <div>
+              <p className="text-[11px] uppercase tracking-wide text-gray-500">Quota tier</p>
+              <p className="mt-0.5 text-sm text-gray-100">{live ? quotaTier || "—" : "—"}</p>
+            </div>
+            <div>
               <p className="text-[11px] uppercase tracking-wide text-gray-500">TPM / RPM</p>
-              <p className="mt-0.5 text-sm tabular-nums text-gray-100">
-                {live && item.tpm != null ? formatTokens(item.tpm) : "—"} / {live ? item.rpm ?? "—" : "—"}
-              </p>
+              {canUpgradeTpm ? (
+                <button
+                  type="button"
+                  onClick={onUpgradeTpm}
+                  disabled={busy}
+                  title={upgradeHint(item)}
+                  className="mt-0.5 text-left disabled:opacity-60"
+                >
+                  <p className="text-sm tabular-nums text-gray-100">
+                    {formatTokens(item.tpm ?? 0)} / {item.rpm ?? "—"}{" "}
+                    <span className="text-amber-300">(newUpdate)</span>
+                  </p>
+                  {item.tpm_available != null && (
+                    <p className="text-xs tabular-nums text-amber-200/80">
+                      Azure quota {formatTokens(item.tpm_available)} / {item.rpm_available ?? "—"}
+                    </p>
+                  )}
+                </button>
+              ) : (
+                <p className="mt-0.5 text-sm tabular-nums text-gray-100">
+                  {live && item.tpm != null ? formatTokens(item.tpm) : "—"} / {live ? item.rpm ?? "—" : "—"}
+                </p>
+              )}
             </div>
           </div>
         )}
@@ -265,6 +322,19 @@ export default function DeployedKimiCard({
             >
               {!syncingSheet && <FileSpreadsheet size={13} />}
               Sync to sheet
+            </Button>
+          )}
+          {canUpgradeTpm && (
+            <Button
+              variant="secondary"
+              className="px-3 py-1.5 text-xs"
+              onClick={onUpgradeTpm}
+              isLoading={upgradingTpm}
+              disabled={busy}
+              title={upgradeHint(item)}
+            >
+              {!upgradingTpm && <ArrowUpCircle size={13} />}
+              Upgrade TPM
             </Button>
           )}
           {showActions && (
@@ -355,6 +425,14 @@ function clampInt(raw: string, fallback: number, min: number, max: number) {
   return Math.min(max, Math.max(min, Math.trunc(parsed)));
 }
 
+function upgradeHint(item: KimiDeployResult) {
+  const currentTpm = item.tpm != null ? formatTokens(item.tpm) : "—";
+  const currentRpm = item.rpm ?? "—";
+  const nextTpm = item.tpm_available != null ? formatTokens(item.tpm_available) : "higher";
+  const nextRpm = item.rpm_available ?? "higher";
+  return `Azure quota allows ${nextTpm} TPM / ${nextRpm} RPM (currently ${currentTpm} / ${currentRpm}). Click to upgrade.`;
+}
+
 function Meta({ label, value, mono }: { label: string; value?: string | null; mono?: boolean }) {
   return (
     <div className="min-w-0">
@@ -369,6 +447,12 @@ function openaiEndpoint(url?: string | null) {
   return url
     .replace(".cognitiveservices.azure.com", ".openai.azure.com")
     .replace(".services.ai.azure.com", ".openai.azure.com");
+}
+
+function displayEmail(value?: string | null) {
+  const text = (value || "").trim();
+  if (text.includes("@") && !text.includes(" ")) return text;
+  return "—";
 }
 
 function formatGrant(item: KimiDeployResult) {

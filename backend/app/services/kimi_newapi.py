@@ -35,6 +35,7 @@ from app.services.new_api_service import (
     is_newapi_auth_failure,
     recompute_overall_status,
 )
+from app.services.deploy_defaults import DEFAULT_PRIORITY, DEFAULT_WEIGHT
 from app.services.openai_key_store import decrypt_foundry_key
 from app.services.owner_tag import resource_key
 
@@ -42,15 +43,15 @@ logger = logging.getLogger(__name__)
 
 KIMI_CHANNEL_PREFIX = "kimi-k3-500k-proxy-"
 KIMI_CHANNEL_RE = re.compile(r"^kimi-k3-500k-proxy-(\d+)$", re.I)
-KIMI_POOL_TAG = " kimi-k3-pool "
+# Exact O1 string. NewAPI tag mode does not trim, so a trailing space is a
+# second tag (second ID in the tag-mode list).
+KIMI_POOL_TAG = " kimi-k3-pool"
 KIMI_CHANNEL_GROUP = "default,azure-zr-highTPM"
 KIMI_CHANNEL_MODELS = "FW-Kimi-K3"
 KIMI_MODEL_MAPPING = ""
 KIMI_AZURE_API_VERSION = "2025-04-01-preview"
 KIMI_CHANNEL_TYPE = 3  # Azure
 KIMI_NEWAPI_GATEWAY = "O1"
-DEFAULT_PRIORITY = 13
-DEFAULT_WEIGHT = 1
 KIMI_SETTING = json.dumps(
     {
         "force_format": False,
@@ -121,22 +122,50 @@ def next_kimi_channel_name(channels: list[dict]) -> str:
     return f"{KIMI_CHANNEL_PREFIX}{next_kimi_index(channels)}"
 
 
+def _tag_key(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
 def pool_tag(channels: list[dict]) -> str:
     """Exact tag string used by existing kimi-k3-500k-proxy rows, including spaces.
 
     NewAPI tag mode is exact, so 'kimi-k3-pool' and ' kimi-k3-pool ' are different tags.
+    Prefer the live majority, then the canonical constant, then the shorter spelling.
     """
     counts: dict[str, int] = {}
     for channel in channels:
         if not KIMI_CHANNEL_RE.match(str(channel.get("name") or "")):
             continue
         tag = channel.get("tag")
-        if not isinstance(tag, str) or not tag.strip():
+        if not isinstance(tag, str) or not _is_pool_tag(tag):
             continue
         counts[tag] = counts.get(tag, 0) + 1
     if not counts:
         return KIMI_POOL_TAG
-    return max(counts.items(), key=lambda item: item[1])[0]
+
+    def rank(item: tuple[str, int]) -> tuple[int, int, int]:
+        tag, n = item
+        return (n, 1 if tag == KIMI_POOL_TAG else 0, -len(tag))
+
+    return max(counts.items(), key=rank)[0]
+
+
+def pool_tag_variants(channels: list[dict], canonical: str | None = None) -> list[str]:
+    """Exact tag strings that strip-equal the pool tag but are not the canonical one."""
+    wanted = canonical or pool_tag(channels)
+    variants: list[str] = []
+    seen: set[str] = set()
+    for channel in channels:
+        if not KIMI_CHANNEL_RE.match(str(channel.get("name") or "")):
+            continue
+        tag = channel.get("tag")
+        if not isinstance(tag, str) or not _is_pool_tag(tag) or tag == wanted:
+            continue
+        if tag in seen:
+            continue
+        seen.add(tag)
+        variants.append(tag)
+    return variants
 
 
 def clean_channel_name(value: str | None) -> str:
@@ -192,6 +221,17 @@ def _as_int(value) -> int | None:
         return None
 
 
+def foundry_key_from_account(account: dict[str, str] | None) -> str:
+    """In-memory Foundry key from a just-finished deploy. Never log the return value."""
+    if not account:
+        return ""
+    for key in ("api_key", "AZURE_OPENAI_KEY", "key1", "Key1", "key2", "Key2"):
+        value = str(account.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _clamp_int(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, value))
 
@@ -225,7 +265,7 @@ def public_channel(channel: dict) -> dict[str, Any]:
 
 
 def _is_pool_tag(value: str | None) -> bool:
-    return (value or "").strip().lower() == KIMI_POOL_TAG.strip().lower()
+    return _tag_key(value) == _tag_key(KIMI_POOL_TAG)
 
 
 def match_channel(channels: list[dict], hosts: set[str]) -> dict | None:
@@ -358,6 +398,7 @@ def _channel_create_body(
     base_url: str,
     priority: int,
     weight: int,
+    tag: str | None = None,
 ) -> dict[str, Any]:
     return {
         "mode": "single",
@@ -369,7 +410,7 @@ def _channel_create_body(
             "other": KIMI_AZURE_API_VERSION,
             "models": KIMI_CHANNEL_MODELS,
             "group": KIMI_CHANNEL_GROUP,
-            "tag": KIMI_POOL_TAG,
+            "tag": tag if tag is not None else KIMI_POOL_TAG,
             "model_mapping": KIMI_MODEL_MAPPING,
             "priority": priority,
             "weight": weight,
@@ -484,6 +525,9 @@ async def ensure_kimi_newapi_channels(
 
     async with _gateway_lock:
         channels = await list_kimi_pool_channels(force=True)
+        canonical_tag = pool_tag(channels)
+        channels = await _align_kimi_pool_tags(gateway, channels, canonical_tag)
+        canonical_tag = pool_tag(channels)
         next_index = next_kimi_index(channels)
         for index, result in enumerate(results):
             account = accounts[index] if index < len(accounts) else {}
@@ -511,6 +555,7 @@ async def ensure_kimi_newapi_channels(
                                 (existing.get("name") or "").strip(),
                                 priority=row_priority,
                                 weight=row_weight,
+                                tag=canonical_tag,
                             ),
                         )
                         invalidate_kimi_pool_cache()
@@ -548,6 +593,28 @@ async def ensure_kimi_newapi_channels(
                 base_url = openai_base_url(endpoint, resource_name)
                 api_key = await decrypt_foundry_key(session, subscription_id, resource_name)
                 if not api_key:
+                    api_key = foundry_key_from_account(account)
+                    if api_key:
+                        try:
+                            from app.services.openai_key_store import persist_foundry_api_keys
+
+                            await persist_foundry_api_keys(
+                                session,
+                                [
+                                    {
+                                        "api_key": api_key,
+                                        "subscription_id": subscription_id,
+                                        "account_name": resource_name,
+                                        "azure_openai_endpoint": endpoint,
+                                        "resource_group": account.get("resource_group") or result.resource_group,
+                                        "deployment_name": result.deployment_name or account.get("deployment_name"),
+                                        "person_associated": account.get("person_associated") or result.owner_tag,
+                                    }
+                                ],
+                            )
+                        except Exception:
+                            logger.exception("Could not store Foundry API key before NewAPI create for %s", resource_name)
+                if not api_key:
                     result.new_api_error = "No stored Foundry API key. Deploy or test the model first."
                     continue
                 custom = (account.get("new_api_name") or "").strip()
@@ -567,6 +634,7 @@ async def ensure_kimi_newapi_channels(
                             base_url=base_url,
                             priority=row_priority,
                             weight=row_weight,
+                            tag=canonical_tag,
                         ),
                     )
                     created = name
@@ -586,6 +654,7 @@ async def ensure_kimi_newapi_channels(
                                     base_url=base_url,
                                     priority=row_priority,
                                     weight=row_weight,
+                                    tag=canonical_tag,
                                 ),
                             )
                             created = name
@@ -617,7 +686,7 @@ async def ensure_kimi_newapi_channels(
                         "status": 1,
                         "priority": row_priority,
                         "weight": row_weight,
-                        "tag": KIMI_POOL_TAG,
+                        "tag": canonical_tag,
                         "base_url": base_url,
                     }
                 _apply_channel(result, channel, created=True)
@@ -636,6 +705,7 @@ def _channel_update_body(
     *,
     priority: int | None = None,
     weight: int | None = None,
+    tag: str | None = None,
 ) -> dict[str, Any]:
     """Name/routing update. Omit key so NewAPI keeps the existing key."""
     body: dict[str, Any] = {
@@ -646,7 +716,7 @@ def _channel_update_body(
         "other": channel.get("other") or KIMI_AZURE_API_VERSION,
         "models": channel.get("models") or KIMI_CHANNEL_MODELS,
         "group": channel.get("group") or KIMI_CHANNEL_GROUP,
-        "tag": KIMI_POOL_TAG,
+        "tag": tag if tag is not None else channel.get("tag") or KIMI_POOL_TAG,
         "model_mapping": channel.get("model_mapping") or KIMI_MODEL_MAPPING,
         "setting": channel.get("setting") or KIMI_SETTING,
         "settings": channel.get("settings") or KIMI_SETTINGS,
@@ -666,6 +736,40 @@ def _channel_update_body(
     if channel.get("auto_ban") is not None:
         body["auto_ban"] = channel.get("auto_ban")
     return body
+
+
+async def _put_tag_rename(gateway: Gateway, old_tag: str, new_tag: str) -> None:
+    if gateway.label != KIMI_NEWAPI_GATEWAY:
+        raise NewApiError("Kimi tags are only updated on O1.")
+    async with httpx.AsyncClient(timeout=30, proxy=gateway.proxy) as client:
+        response = await client.put(
+            f"{gateway.base_url}/api/channel/tag",
+            headers=_headers(gateway),
+            json={"tag": old_tag, "new_tag": new_tag},
+        )
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        if is_newapi_auth_failure(response.status_code, text=response.text[:200]):
+            raise NewApiAuthError("O1", response.status_code, response.text[:200]) from exc
+        raise NewApiError(f"O1 tag rename returned non-JSON ({response.status_code})") from exc
+    _raise_for_channel_write(response, payload if isinstance(payload, dict) else {}, "tag rename")
+
+
+async def _align_kimi_pool_tags(gateway: Gateway, channels: list[dict], canonical: str) -> list[dict]:
+    """Collapse whitespace variants onto one tag so tag mode shows a single pool ID."""
+    variants = pool_tag_variants(channels, canonical)
+    if not variants:
+        return channels
+    for old in variants:
+        try:
+            await _put_tag_rename(gateway, old, canonical)
+            logger.info("Merged NewAPI tag %r into %r", old, canonical)
+        except Exception:
+            logger.warning("Could not merge NewAPI tag %r into %r", old, canonical, exc_info=True)
+            return channels
+    invalidate_kimi_pool_cache()
+    return await list_kimi_pool_channels(force=True)
 
 
 async def _put_channel(gateway: Gateway, body: dict[str, Any]) -> None:
@@ -720,6 +824,9 @@ async def rename_kimi_newapi_channel(
     async with _gateway_lock:
         try:
             channels = await list_kimi_pool_channels(force=True)
+            canonical_tag = pool_tag(channels)
+            channels = await _align_kimi_pool_tags(gateway, channels, canonical_tag)
+            canonical_tag = pool_tag(channels)
             channel = None
             if channel_id is not None:
                 channel = next((item for item in channels if _as_int(item.get("id")) == channel_id), None)
@@ -756,6 +863,7 @@ async def rename_kimi_newapi_channel(
                     target_name,
                     priority=target_priority,
                     weight=target_weight,
+                    tag=canonical_tag,
                 ),
             )
             invalidate_kimi_pool_cache()

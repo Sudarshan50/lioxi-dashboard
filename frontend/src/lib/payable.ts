@@ -1,5 +1,5 @@
 export const PAYABLE_RATE = 0.12;
-export const BROKERAGE_RATE_1K = 1 / 3;
+export const BROKERAGE_RATE_1K = 1 / 6;
 export const BROKERAGE_RATE_10K = 1 / 12;
 
 export function amountPayableUsd(spendUsd: number | null | undefined): number {
@@ -10,20 +10,14 @@ export function payablePercentLabel(): string {
   return `${Math.round(PAYABLE_RATE * 100)}%`;
 }
 
-/** 1k-class grants: 33.3% of payable. 10k-class grants: 8.3% of payable. */
 export function brokerageRate(grantUsd: number | null | undefined): number {
   const grant = Math.max(Number(grantUsd) || 0, 0);
   if (grant <= 0) return 0;
   return Math.round(Math.log10(grant)) <= 3 ? BROKERAGE_RATE_1K : BROKERAGE_RATE_10K;
 }
 
-export function brokerageUsd(
-  grantUsd: number | null | undefined,
-  payableUsd: number | null | undefined
-): number {
-  const payable = Math.max(Number(payableUsd) || 0, 0);
-  if (payable <= 0) return 0;
-  return Math.round(payable * brokerageRate(grantUsd) * 100) / 100;
+export function brokerageUsd(grantUsd: number | null | undefined): number {
+  return Math.round(amountPayableUsd(grantUsd) * brokerageRate(grantUsd) * 100) / 100;
 }
 
 function csvCell(value: string | number): string {
