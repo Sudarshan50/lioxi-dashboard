@@ -10,9 +10,9 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-HOST="${PROD_SSH_HOST:-10.223.68.120}"
-USER="${PROD_SSH_USER:-cre}"
-WSL_PROJECT="${PROD_WSL_PROJECT:-/home/psl_3/mass_monitoring}"
+HOST="${PROD_SSH_HOST:-}"
+USER="${PROD_SSH_USER:-}"
+WSL_PROJECT="${PROD_WSL_PROJECT:-}"
 PASS="${PROD_SSH_PASSWORD:-}"
 PGUSER="${POSTGRES_USER:-portal}"
 PGDB="${POSTGRES_DB:-llm_portal}"
@@ -41,6 +41,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 [[ "$CMD" == "pull" || "$CMD" == "push" ]] || { usage; exit 1; }
+[[ -n "$HOST" && -n "$USER" && -n "$WSL_PROJECT" ]] || { echo "Set PROD_SSH_HOST, PROD_SSH_USER, and PROD_WSL_PROJECT in .env" >&2; exit 1; }
 [[ -n "$PASS" ]] || { echo "Set PROD_SSH_PASSWORD in .env" >&2; exit 1; }
 command -v sshpass >/dev/null || { echo "install sshpass" >&2; exit 1; }
 docker compose ps db --status running >/dev/null 2>&1 || { echo "docker compose up -d db" >&2; exit 1; }

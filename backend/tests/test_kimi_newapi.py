@@ -88,14 +88,14 @@ class FoundryKeyFallback(unittest.TestCase):
             accounts,
             [
                 {
-                    "account_name": "snig-10k-2",
-                    "azure_openai_endpoint": "https://snig-10k-2.openai.azure.com",
+                    "account_name": "example-resource",
+                    "azure_openai_endpoint": "https://example-resource.openai.azure.com",
                     "resource_group": "rg",
                     "api_key": "foundry-key",
                     "subscription_id": "sub",
                 }
             ],
         )
-        self.assertEqual(accounts[0]["account_name"], "snig-10k-2")
+        self.assertEqual(accounts[0]["account_name"], "example-resource")
         self.assertEqual(accounts[0]["api_key"], "foundry-key")
-        self.assertEqual(accounts[0]["azure_openai_endpoint"], "https://snig-10k-2.openai.azure.com")
+        self.assertEqual(accounts[0]["azure_openai_endpoint"], "https://example-resource.openai.azure.com")

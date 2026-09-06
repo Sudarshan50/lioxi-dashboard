@@ -26,7 +26,7 @@ WORK_TENANT = "11111111-1111-1111-1111-111111111111"
 
 class JoinLoginDecisions(unittest.TestCase):
     def test_personal_gmail_and_outlook(self):
-        self.assertTrue(is_personal_microsoft_account("gaurav@gmail.com"))
+        self.assertTrue(is_personal_microsoft_account("someone@gmail.com"))
         self.assertTrue(is_personal_microsoft_account("user@outlook.com"))
         self.assertTrue(is_personal_microsoft_account("user@hotmail.com"))
 

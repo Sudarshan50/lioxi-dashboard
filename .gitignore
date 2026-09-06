@@ -35,7 +35,12 @@ imp_data.csv
 az-submit/
 
 # Google service-account key (Sheets inventory)
+google-sheets.json
 secrets/
+
+# One-off PAT / setup drop files. Never commit these.
+delete_after_git_setup_done.txt
+**/delete_after_git_setup_done.txt
 
 # Python
 __pycache__/

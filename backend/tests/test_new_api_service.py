@@ -105,13 +105,13 @@ class KeepLastKnownPortal(unittest.TestCase):
 
 class HostAndPages(unittest.TestCase):
     def test_host_key_joins_openai_and_cognitiveservices(self):
-        self.assertEqual(_host_key("https://kimisakhre04.openai.azure.com"), "kimisakhre04")
+        self.assertEqual(_host_key("https://example-resource.openai.azure.com"), "example-resource")
         self.assertEqual(
-            _host_key("https://kimisakhre04.cognitiveservices.azure.com/"),
-            "kimisakhre04",
+            _host_key("https://example-resource.cognitiveservices.azure.com/"),
+            "example-resource",
         )
-        account = SimpleNamespace(resource_name="kimisakhre04", endpoint="https://other.openai.azure.com")
-        self.assertEqual(_account_key(account), "kimisakhre04")
+        account = SimpleNamespace(resource_name="example-resource", endpoint="https://other.openai.azure.com")
+        self.assertEqual(_account_key(account), "example-resource")
 
     def test_merge_page_skips_duplicate_ids(self):
         by_id: dict[int, dict] = {}

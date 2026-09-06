@@ -103,7 +103,7 @@ class ApproveNewApiRequired(unittest.IsolatedAsyncioTestCase):
             new_api_present=False,
             new_api_error="No stored Foundry API key. Deploy or test the model first.",
             error=None,
-            account_name="snig-10k-2",
+            account_name="example-resource",
             azure_openai_endpoint=None,
             resource_group=None,
             deployment_name="FW-Kimi-K3",
@@ -129,14 +129,14 @@ class ApproveNewApiRequired(unittest.IsolatedAsyncioTestCase):
 class K3DeployNotice(unittest.TestCase):
     def test_auto_approve_copy(self):
         self.assertEqual(
-            format_k3_deployed_notice("Snig", "snig-10k-2", "auto-approve"),
-            "<b>K3 deployed</b>\nSnig · <code>snig-10k-2</code>\nAuthorized: auto-approve",
+            format_k3_deployed_notice("Alex", "example-resource", "auto-approve"),
+            "<b>K3 deployed</b>\nAlex · <code>example-resource</code>\nAuthorized: auto-approve",
         )
 
     def test_admin_copy(self):
         self.assertEqual(
-            format_k3_deployed_notice("Gaurav", "gaurav-1k-1", "admin"),
-            "<b>K3 deployed</b>\nGaurav · <code>gaurav-1k-1</code>\nAuthorized: admin",
+            format_k3_deployed_notice("Sam", "example-account", "admin"),
+            "<b>K3 deployed</b>\nSam · <code>example-account</code>\nAuthorized: admin",
         )
 
     def test_escapes_html(self):
