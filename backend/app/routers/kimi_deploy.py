@@ -10,6 +10,7 @@ from app.database import get_db
 from app.dependencies import get_current_admin
 from app.schemas.kimi_deploy import (
     KimiBootstrapRequest,
+    KimiCapacitySummary,
     KimiContentFilterResponse,
     KimiCreditsRequest,
     KimiCreditsResponse,
@@ -61,6 +62,13 @@ router = APIRouter(prefix="/api/kimi-deploy", tags=["kimi-deploy"], dependencies
 @router.get("/status", response_model=KimiDeployStatus)
 async def get_status() -> KimiDeployStatus:
     return deploy_status()
+
+
+@router.get("/capacity", response_model=KimiCapacitySummary)
+async def capacity() -> KimiCapacitySummary:
+    from app.services.kimi_capacity import active_newapi_capacity
+
+    return KimiCapacitySummary(**await active_newapi_capacity())
 
 
 @router.get("/defaults", response_model=KimiDeployDefaults)

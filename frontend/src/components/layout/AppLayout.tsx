@@ -31,7 +31,7 @@ export default function AppLayout() {
           >
             <Menu size={20} />
           </button>
-          <p className="text-sm font-semibold text-gray-50">Usage Portal</p>
+          <p className="text-sm font-semibold text-gray-50">Lioxi</p>
         </header>
         <main className="min-w-0 flex-1 overflow-y-auto px-4 py-6 sm:px-6 lg:px-10 lg:py-8">
           <div className="mx-auto w-full max-w-7xl animate-fade-up">

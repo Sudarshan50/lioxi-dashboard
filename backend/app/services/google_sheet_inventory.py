@@ -15,6 +15,7 @@ import logging
 import re
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,9 @@ _HEADER_ALIASES = {
 
 _lock = threading.Lock()
 _ipv4_patched = False
+_WS_CACHE_TTL = 90.0
+_ws_cache: dict[str, Any] = {"key": "", "ws": None, "until": 0.0}
+_WRITE_CHUNK = 200
 
 
 def _force_ipv4() -> None:
@@ -81,6 +85,56 @@ def format_compact(value: float | int | None) -> str:
     return str(number)
 
 
+def parse_compact(value: str | None) -> int | None:
+    text = (value or "").strip().lower().replace(",", "").replace(" ", "")
+    if not text:
+        return None
+    try:
+        if text.endswith("m"):
+            return int(float(text[:-1]) * 1_000_000)
+        if text.endswith("k"):
+            return int(float(text[:-1]) * 1_000)
+        return int(float(text))
+    except ValueError:
+        return None
+
+
+_tpm_cache: dict[str, Any] = {"until": 0.0, "data": {}}
+
+
+def _clear_tpm_cache() -> None:
+    _tpm_cache.update(until=0.0, data={})
+
+
+def tpm_by_host() -> dict[str, int]:
+    if not configured():
+        return {}
+    now = time.monotonic()
+    cached = _tpm_cache.get("data") or {}
+    if now < float(_tpm_cache.get("until") or 0):
+        return cached
+    try:
+        with _lock:
+            worksheet = _call(_open_worksheet)
+            existing = _call(worksheet.get_all_values)
+        mapping = _column_map(existing[0] if existing else [])
+        end_idx = mapping.get("Endpoint")
+        tpm_idx = mapping.get("TPM")
+        if end_idx is None or tpm_idx is None:
+            return cached
+        out: dict[str, int] = {}
+        for row in existing[1:]:
+            host = resource_key(row[end_idx] if end_idx < len(row) else "")
+            tokens = parse_compact(row[tpm_idx] if tpm_idx < len(row) else "")
+            if host and tokens:
+                out[host] = tokens
+        _tpm_cache.update(until=now + _WS_CACHE_TTL, data=out)
+        return out
+    except Exception:
+        logger.exception("Could not read sheet TPM")
+        return cached
+
+
 def _canonical_endpoint(value: str | None) -> str:
     raw = (value or "").strip()
     if not raw:
@@ -88,6 +142,38 @@ def _canonical_endpoint(value: str | None) -> str:
     if "://" not in raw:
         raw = "https://" + raw
     return raw.rstrip("/") + "/"
+
+
+def _a1_col(index: int) -> str:
+    n = index + 1
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "429" in text or "quota exceeded" in text or "rate limit" in text:
+        return True
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status == 429
+
+
+def _call(fn, *args, **kwargs):
+    delay = 2.0
+    for attempt in range(6):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            if attempt == 5 or not _is_rate_limit(exc):
+                raise
+            logger.warning("Google Sheets rate limited; retrying in %.0fs", delay)
+            time.sleep(delay)
+            delay = min(delay * 2, 45)
+            if fn is _open_worksheet:
+                _ws_cache.update(key="", ws=None, until=0.0)
 
 
 def configured() -> bool:
@@ -118,18 +204,24 @@ def _open_worksheet():
     import gspread
     from google.oauth2.service_account import Credentials
 
-    _force_ipv4()
     settings = get_settings()
+    tab = (settings.google_sheets_tab or "Sheet1").strip() or "Sheet1"
+    cache_key = f"{settings.google_sheets_spreadsheet_id.strip()}:{tab}"
+    now = time.monotonic()
+    if _ws_cache["ws"] is not None and _ws_cache["key"] == cache_key and now < _ws_cache["until"]:
+        return _ws_cache["ws"]
+    _force_ipv4()
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(_credentials_info(), scopes=scopes)
     client = gspread.authorize(creds)
     book = client.open_by_key(settings.google_sheets_spreadsheet_id.strip())
-    tab = (settings.google_sheets_tab or "Sheet1").strip() or "Sheet1"
     try:
-        return book.worksheet(tab)
+        worksheet = book.worksheet(tab)
     except gspread.exceptions.WorksheetNotFound as exc:
         names = ", ".join(ws.title for ws in book.worksheets()) or "(none)"
         raise SheetSyncError(f'Tab "{tab}" was not found. Available: {names}') from exc
+    _ws_cache.update(key=cache_key, ws=worksheet, until=now + _WS_CACHE_TTL)
+    return worksheet
 
 
 def _column_map(header_row: list[str]) -> dict[str, int]:
@@ -160,9 +252,7 @@ def _cell(row: list[str], mapping: dict[str, int], name: str) -> str:
     return (row[index] or "").strip()
 
 
-def _ensure_headers(worksheet) -> dict[str, int]:
-    rows = worksheet.get_all_values()
-    header_row = rows[0] if rows else []
+def _ensure_headers(header_row: list[str]) -> dict[str, int]:
     mapping = _column_map(header_row)
     missing = [name for name in REQUIRED_HEADERS if name not in mapping]
     if missing:
@@ -213,6 +303,66 @@ def _inventory_row(result: KimiDeployResult) -> dict[str, str] | None:
     }
 
 
+def _plan_writes(
+    mapping: dict[str, int],
+    data_rows: list[list[str]],
+    pending: list[dict[str, str]],
+) -> tuple[list[tuple[int, list[str]]], list[list[str]]]:
+    by_host: dict[str, int] = {}
+    max_sno = 0
+    sno_idx = mapping.get("Sno", 0)
+    end_idx = mapping.get("Endpoint", 2)
+    for offset, row in enumerate(data_rows):
+        sno = _parse_sno(row[sno_idx] if sno_idx < len(row) else "")
+        max_sno = max(max_sno, sno)
+        host = resource_key(row[end_idx] if end_idx < len(row) else "")
+        if host and host not in by_host:
+            by_host[host] = offset
+    writes: list[tuple[int, list[str]]] = []
+    appends: list[list[str]] = []
+    for payload in pending:
+        host = resource_key(payload["Endpoint"])
+        if host in by_host:
+            offset = by_host[host]
+            current = list(data_rows[offset])
+            width = max(mapping.values()) + 1
+            if len(current) < width:
+                current.extend([""] * (width - len(current)))
+            sno = _cell(current, mapping, "Sno") or str(offset + 1)
+            merged = {
+                "Sno": sno,
+                "Person": payload.get("Person") or _cell(current, mapping, "Person"),
+                "Email": payload["Email"] or _cell(current, mapping, "Email"),
+                "Endpoint": payload["Endpoint"] or _cell(current, mapping, "Endpoint"),
+                "TPM": payload["TPM"] or _cell(current, mapping, "TPM"),
+                "Proxy_Name": payload["Proxy_Name"] or _cell(current, mapping, "Proxy_Name"),
+                "Pool": payload["Pool"] or _cell(current, mapping, "Pool"),
+            }
+            if "API_Key" in mapping and not _cell(current, mapping, "API_Key"):
+                merged["API_Key"] = "-"
+            next_row = _row_values(mapping, merged, current)
+            if next_row != current:
+                writes.append((offset + 2, next_row))
+        else:
+            max_sno += 1
+            if not payload["TPM"]:
+                payload = {**payload, "TPM": "500k"}
+            extra = {"Sno": str(max_sno)}
+            if "API_Key" in mapping:
+                extra["API_Key"] = "-"
+            appends.append(_row_values(mapping, {**payload, **extra}))
+    return writes, appends
+
+
+def _flush_updates(worksheet, writes: list[tuple[int, list[str]]]) -> None:
+    for start in range(0, len(writes), _WRITE_CHUNK):
+        payload = []
+        for row_number, values in writes[start : start + _WRITE_CHUNK]:
+            end_col = _a1_col(len(values) - 1)
+            payload.append({"range": f"A{row_number}:{end_col}{row_number}", "values": [values]})
+        _call(worksheet.batch_update, payload, value_input_option="RAW")
+
+
 def _upsert_rows(results: list[KimiDeployResult]) -> int:
     pending_by_host: dict[str, dict[str, str]] = {}
     for item in results:
@@ -228,57 +378,15 @@ def _upsert_rows(results: list[KimiDeployResult]) -> int:
     pending = list(pending_by_host.values())
     if not pending:
         return 0
+    _clear_tpm_cache()
     with _lock:
-        worksheet = _open_worksheet()
-        mapping = _ensure_headers(worksheet)
-        existing = worksheet.get_all_values()
-        data_rows = existing[1:] if existing else []
-        by_host: dict[str, int] = {}
-        max_sno = 0
-        for offset, row in enumerate(data_rows):
-            sno_idx = mapping.get("Sno", 0)
-            end_idx = mapping.get("Endpoint", 2)
-            sno = _parse_sno(row[sno_idx] if sno_idx < len(row) else "")
-            max_sno = max(max_sno, sno)
-            host = resource_key(row[end_idx] if end_idx < len(row) else "")
-            if host and host not in by_host:
-                by_host[host] = offset
-        writes: list[tuple[int, list[str]]] = []
-        appends: list[list[str]] = []
-        for payload in pending:
-            host = resource_key(payload["Endpoint"])
-            if host in by_host:
-                offset = by_host[host]
-                current = list(data_rows[offset])
-                width = max(mapping.values()) + 1
-                if len(current) < width:
-                    current.extend([""] * (width - len(current)))
-                sno = _cell(current, mapping, "Sno") or str(offset + 1)
-                merged = {
-                    "Sno": sno,
-                    "Person": payload.get("Person") or _cell(current, mapping, "Person"),
-                    "Email": payload["Email"] or _cell(current, mapping, "Email"),
-                    "Endpoint": payload["Endpoint"] or _cell(current, mapping, "Endpoint"),
-                    "TPM": payload["TPM"] or _cell(current, mapping, "TPM"),
-                    "Proxy_Name": payload["Proxy_Name"] or _cell(current, mapping, "Proxy_Name"),
-                    "Pool": payload["Pool"] or _cell(current, mapping, "Pool"),
-                }
-                if "API_Key" in mapping and not _cell(current, mapping, "API_Key"):
-                    merged["API_Key"] = "-"
-                writes.append((offset + 2, _row_values(mapping, merged, current)))
-            else:
-                max_sno += 1
-                if not payload["TPM"]:
-                    payload = {**payload, "TPM": "500k"}
-                extra = {"Sno": str(max_sno)}
-                if "API_Key" in mapping:
-                    extra["API_Key"] = "-"
-                appends.append(_row_values(mapping, {**payload, **extra}))
-        for row_number, values in writes:
-            end_col = chr(ord("A") + len(values) - 1)
-            worksheet.update(f"A{row_number}:{end_col}{row_number}", [values], value_input_option="RAW")
+        worksheet = _call(_open_worksheet)
+        existing = _call(worksheet.get_all_values)
+        mapping = _ensure_headers(existing[0] if existing else [])
+        writes, appends = _plan_writes(mapping, existing[1:] if existing else [], pending)
+        _flush_updates(worksheet, writes)
         if appends:
-            worksheet.append_rows(appends, value_input_option="RAW")
+            _call(worksheet.append_rows, appends, value_input_option="RAW")
         return len(writes) + len(appends)
 
 

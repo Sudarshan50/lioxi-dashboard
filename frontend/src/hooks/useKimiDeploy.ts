@@ -1,7 +1,7 @@
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/lib/apiClient";
-import { KimiContentFilterResponse, KimiDeleteResponse, KimiDeployDefaults, KimiDeployJob, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiDropStoredResponse, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
+import { KimiCapacitySummary, KimiContentFilterResponse, KimiDeleteResponse, KimiDeployDefaults, KimiDeployJob, KimiDeployResponse, KimiDeployResult, KimiDeployStatus, KimiDropStoredResponse, KimiNewApiAuth, KimiNewApiPool, KimiRegenerateResponse, KimiSheetStatus, KimiSheetSyncResponse, KimiStoredResponse, KimiTestResponse } from "@/types";
 
 const DEPLOY_TIMEOUT_MS = 45 * 60 * 1000;
 const KEYS_TIMEOUT_MS = 15 * 60 * 1000;
@@ -53,6 +53,7 @@ export function invalidateAfterDeploy(queryClient: ReturnType<typeof useQueryCli
   void queryClient.invalidateQueries({ queryKey: ["kimi-newapi-auth"] });
   void queryClient.invalidateQueries({ queryKey: ["kimi-stored-accounts"] });
   void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
+  void queryClient.invalidateQueries({ queryKey: ["kimi-capacity"] });
 }
 
 export function useKimiDeployJob() {
@@ -115,7 +116,18 @@ export function useKimiAddNewApi() {
       void queryClient.invalidateQueries({ queryKey: ["accounts"] });
       void queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
       void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-capacity"] });
     },
+  });
+}
+
+export function useKimiCapacity(enabled: boolean) {
+  return useQuery({
+    queryKey: ["kimi-capacity"],
+    queryFn: async () => (await apiClient.get<KimiCapacitySummary>("/api/kimi-deploy/capacity")).data,
+    enabled,
+    staleTime: 5 * 60_000,
+    gcTime: 30 * 60_000,
   });
 }
 
@@ -135,6 +147,7 @@ export function useKimiRenameNewApi() {
       void queryClient.invalidateQueries({ queryKey: ["accounts"] });
       void queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
       void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-capacity"] });
     },
   });
 }
@@ -208,6 +221,7 @@ export function useKimiScaleQuota() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
       void queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-capacity"] });
     },
   });
 }
@@ -256,6 +270,7 @@ export function useKimiRefreshInventory() {
         });
       });
       void queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
+      void queryClient.invalidateQueries({ queryKey: ["kimi-capacity"] });
     },
   });
 }

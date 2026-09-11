@@ -32,11 +32,9 @@ export default function LoginPage() {
     <div className="app-aurora flex min-h-screen items-center justify-center bg-surface px-4">
       <Card className="w-full max-w-sm animate-fade-up">
         <div className="mb-6 text-center">
-          <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-gradient text-white shadow-glow-sm">
-            <span className="text-lg font-bold">U</span>
-          </div>
-          <h1 className="gradient-title text-xl font-semibold">Usage Portal</h1>
-          <p className="mt-1 text-sm text-gray-500">Sign in to manage accounts and view usage</p>
+          <img src="/lioxi-icon.png" alt="" className="mx-auto mb-4 h-12 w-12 rounded-2xl shadow-glow-sm" />
+          <h1 className="gradient-title text-xl font-semibold">Lioxi</h1>
+          <p className="mt-1 text-sm text-gray-500">Sign in to the command center</p>
         </div>
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           <Input label="Username" value={username} onChange={(e) => setUsername(e.target.value)} autoFocus required />

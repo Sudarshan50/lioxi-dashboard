@@ -8,6 +8,7 @@ import DeployK3Page from "@/pages/DeployK3Page";
 import JoinPage from "@/pages/JoinPage";
 import LoginPage from "@/pages/LoginPage";
 import ModelsPage from "@/pages/ModelsPage";
+import NotificationsPage from "@/pages/NotificationsPage";
 import OverviewPage from "@/pages/OverviewPage";
 import PendingPage from "@/pages/PendingPage";
 import ProtectedRoute from "@/routes/ProtectedRoute";
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="/ban" element={<BanPage />} />
           <Route path="/models" element={<ModelsPage />} />
           <Route path="/alerts" element={<AlertsPage />} />
+          <Route path="/notifications" element={<NotificationsPage />} />
         </Route>
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />

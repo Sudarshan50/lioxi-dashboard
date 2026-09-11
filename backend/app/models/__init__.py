@@ -6,6 +6,7 @@ from app.models.azure_openai_key import AzureOpenaiKey
 from app.models.azure_service_principal import AzureServicePrincipal
 from app.models.join_enrollee import JoinEnrollee
 from app.models.sp_submit_request import SpSubmitRequest
+from app.models.sync_notification import SyncNotification
 from app.models.cost_snapshot import CostSnapshot
 from app.models.model_catalog import MonitoredModel
 from app.models.provider_account import ProviderAccount
@@ -20,6 +21,7 @@ __all__ = [
     "AzureServicePrincipal",
     "JoinEnrollee",
     "SpSubmitRequest",
+    "SyncNotification",
     "AccountGroup",
     "AccountGroupMember",
     "RegisteredModel",

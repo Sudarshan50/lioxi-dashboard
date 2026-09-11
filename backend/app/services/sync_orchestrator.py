@@ -50,10 +50,14 @@ class SyncOrchestrator:
 
             results = await asyncio.gather(*[_bounded(account.id) for account in accounts])
             failed = [result for result in results if result.get("status") == "error"]
+            from app.services.quota_autoscale import run_auto_quota_upgrades
+
+            quota = await run_auto_quota_upgrades()
             return {
                 "status": "completed" if not failed else "partial",
                 "synced": len(results) - len(failed),
                 "failed": [{"id": result["id"], "name": result["name"], "error": result.get("error")} for result in failed],
+                "quota": quota,
             }
 
     async def sync_new_api_safe(self) -> dict:

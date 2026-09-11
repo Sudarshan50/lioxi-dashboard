@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, ShieldBan, X } from "lucide-react";
+import { Bell, BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, ShieldBan, X } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
@@ -17,6 +17,7 @@ const navItems = [
   { to: "/ban", label: "Ban", icon: ShieldBan },
   { to: "/models", label: "Models", icon: Cpu },
   { to: "/alerts", label: "Alerts", icon: BellRing },
+  { to: "/notifications", label: "Notifications", icon: Bell },
 ];
 
 interface SidebarProps {
@@ -47,12 +48,10 @@ export default function Sidebar({ isOpen, onClose }: SidebarProps) {
       >
         <div className="mb-8 flex items-center justify-between px-2">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-accent-gradient text-white shadow-glow-sm">
-              <Cpu size={18} />
-            </div>
+            <img src="/lioxi-icon.png" alt="" className="h-9 w-9 rounded-xl shadow-glow-sm" />
             <div>
-              <p className="text-sm font-semibold leading-tight text-gray-50">Usage Portal</p>
-              <p className="text-[11px] leading-tight text-gray-500">Azure OpenAI monitoring</p>
+              <p className="text-sm font-semibold leading-tight text-gray-50">Lioxi</p>
+              <p className="text-[11px] leading-tight text-gray-500">Command center</p>
             </div>
           </div>
           <button onClick={onClose} className="rounded-md p-1 text-gray-400 hover:bg-surface-border hover:text-gray-100 lg:hidden">

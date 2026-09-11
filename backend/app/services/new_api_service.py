@@ -449,6 +449,15 @@ async def _set_gateway_status_locked(
 
     recompute_overall_status(account)
     await session.commit()
+    if "O1" in flipped and account.new_api_status_o1 == status:
+        host = _account_key(account)
+        if host:
+            from app.services.kimi_capacity import set_host_live
+            from app.services.kimi_newapi import invalidate_kimi_pool_cache, is_kimi_channel_name
+
+            if is_kimi_channel_name(account.new_api_name) or status != 1:
+                await set_host_live(host, status == 1)
+            invalidate_kimi_pool_cache()
     return {"status": "ok" if not errors else "partial", "flipped": flipped, "errors": errors}
 
 
@@ -493,6 +502,7 @@ async def _sync_new_api_locked(session: AsyncSession) -> dict:
                 continue
             matched.setdefault(account.id, []).append((gateway.label, channel))
 
+    old_o1 = {account.id: account.new_api_status_o1 for account in accounts}
     on_both = 0
     for account in accounts:
         labelled = matched.get(account.id, [])
@@ -532,6 +542,26 @@ async def _sync_new_api_locked(session: AsyncSession) -> dict:
             on_both += 1
 
     await session.commit()
+    from app.services.kimi_capacity import set_host_live
+    from app.services.kimi_newapi import invalidate_kimi_pool_cache, is_kimi_channel_name
+
+    flipped = False
+    for account in accounts:
+        before = old_o1.get(account.id)
+        after = account.new_api_status_o1
+        if before == after:
+            continue
+        host = _account_key(account)
+        if not host or not is_kimi_channel_name(account.new_api_name):
+            continue
+        if after == 1 and before != 1:
+            await set_host_live(host, True)
+            flipped = True
+        elif before == 1 and after != 1:
+            await set_host_live(host, False)
+            flipped = True
+    if flipped:
+        invalidate_kimi_pool_cache()
     logger.info(
         "NewAPI sync: %d channels, %d accounts matched (%d on both portals), fetched=%s unmatched=%s errors=%s",
         total_channels,

@@ -17,3 +17,9 @@ class AdminRepository:
         await self._session.commit()
         await self._session.refresh(admin)
         return admin
+
+    async def update_password(self, admin: AdminAccount, password_hash: str) -> AdminAccount:
+        admin.password_hash = password_hash
+        await self._session.commit()
+        await self._session.refresh(admin)
+        return admin

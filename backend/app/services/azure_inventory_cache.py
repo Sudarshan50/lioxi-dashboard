@@ -29,6 +29,9 @@ def _blob_key(subscription_id: str, resource_name: str) -> str:
     return f"kimi:azure:inventory:{subscription_id.strip().lower()}:{resource_name.strip().lower()}"
 
 
+_QUOTA_HASH = "kimi:quota:by_host"
+
+
 def _looks_like_json(raw: str) -> bool:
     text = (raw or "").lstrip()
     return text.startswith("{") or text.startswith("[")
@@ -162,9 +165,52 @@ async def get_cached_azure_inventory(
     return result
 
 
+async def remember_host_quota(host: str, tpm: int, rpm: int) -> None:
+    key = (host or "").strip().lower()
+    if not key or tpm <= 0:
+        return
+    await remember_host_quotas({key: (int(tpm), int(rpm))})
+
+
+async def remember_host_quotas(pairs: dict[str, tuple[int, int]]) -> None:
+    mapping = {host: f"{tpm}:{rpm}" for host, (tpm, rpm) in pairs.items() if host and tpm > 0}
+    if not mapping:
+        return
+    client = _client_or_none()
+    if client is None:
+        return
+    try:
+        await client.hset(_QUOTA_HASH, mapping=mapping)
+    except RedisError as exc:
+        _warn(exc)
+
+
+async def remembered_host_quotas() -> dict[str, tuple[int, int]]:
+    client = _client_or_none()
+    if client is None:
+        return {}
+    try:
+        raw = await client.hgetall(_QUOTA_HASH)
+    except RedisError as exc:
+        _warn(exc)
+        return {}
+    out: dict[str, tuple[int, int]] = {}
+    for host, value in (raw or {}).items():
+        try:
+            tpm_s, rpm_s = str(value).split(":", 1)
+            tpm, rpm = int(tpm_s), int(rpm_s)
+        except (TypeError, ValueError):
+            continue
+        if tpm > 0:
+            out[str(host).lower()] = (tpm, rpm)
+    return out
+
+
 async def store_azure_inventory(result: KimiDeployResult) -> None:
     sub = (result.subscription_id or "").strip()
     resource = (result.account_name or "").strip()
+    if result.ok and not result.error and resource and result.tpm:
+        await remember_host_quota(resource.lower(), int(result.tpm), int(result.rpm or 0))
     if not sub or not resource or not result.ok or result.error or not result.credits_available:
         return
     if result.quota_limit is None:
