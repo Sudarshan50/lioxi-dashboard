@@ -7,6 +7,7 @@ from app.repositories.account_group_repository import AccountGroupRepository
 from app.repositories.account_repository import AccountRepository
 from app.repositories.model_repository import ModelRepository
 from app.repositories.usage_repository import UsageRepository
+from app.services.join_group import normalize_group
 from app.services.owner_tag import UNTAGGED
 
 _PAYABLE_RATE = 0.12
@@ -76,9 +77,10 @@ class DashboardService:
         group_id: int | None = None,
         gateway: str | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> dict:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner, join_group)
         overview = await self._usage_repository.get_overview(start, end, account_ids, model_id)
         hourly = await self._usage_repository.get_timeseries(start, end, account_ids, model_id)
         overview.update(
@@ -130,9 +132,10 @@ class DashboardService:
         group_id: int | None = None,
         gateway: str | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner, join_group)
         return await self._usage_repository.get_timeseries(start, end, account_ids, model_id)
 
     async def get_timeseries_by_account(
@@ -143,9 +146,10 @@ class DashboardService:
         group_id: int | None = None,
         gateway: str | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner, join_group)
         return await self._usage_repository.get_timeseries_by_account(start, end, account_ids, model_id)
 
     async def get_breakdown_by_account(
@@ -156,9 +160,10 @@ class DashboardService:
         group_id: int | None = None,
         gateway: str | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner, join_group)
         items = await self._usage_repository.get_breakdown_by_account(start, end, model_id, account_ids)
         minutes = max((end - start).total_seconds() / 60, 60)
         billed = await self._usage_repository.get_actual_cost_by_account(start, end, account_ids)
@@ -198,18 +203,24 @@ class DashboardService:
         model_id: int | None = None,
         gateway: str | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner, join_group)
         items = await self._usage_repository.get_breakdown_by_model(start, end, account_ids, model_id)
         _mark_estimated_usd(items)
         return items
 
     async def get_breakdown_by_monitored_model(
-        self, range_key: str, account_id: int | None, group_id: int | None = None, owner: str | None = None
+        self,
+        range_key: str,
+        account_id: int | None,
+        group_id: int | None = None,
+        owner: str | None = None,
+        join_group: str | None = None,
     ) -> list[dict]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, owner=owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, owner=owner, join_group=join_group)
         items = await self._usage_repository.get_breakdown_by_monitored_model(start, end, account_ids)
         _mark_estimated_usd(items)
         for item in items:
@@ -225,9 +236,10 @@ class DashboardService:
         model_id: int | None = None,
         group_id: int | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> tuple[str, bytes]:
         start, end = self._resolve_range(range_key)
-        account_ids = await self._resolve_account_ids(account_id, group_id, owner=owner)
+        account_ids = await self._resolve_account_ids(account_id, group_id, owner=owner, join_group=join_group)
         deployment_rows = await self._usage_repository.get_export_rows(start, end, account_ids, model_id)
         accounts = [
             account
@@ -391,18 +403,26 @@ class DashboardService:
         group_id: int | None,
         gateway: str | None = None,
         owner: str | None = None,
+        join_group: str | None = None,
     ) -> list[int] | None:
         """A group filter takes precedence over a single-account filter since
         picking a group implies "every account in it", which a lone account_id
-        can't express. Owner and gateway filters intersect with that scope.
+        can't express. Owner, gateway and join-group filters intersect with
+        that scope.
         """
         ids: list[int] | None = None
         if group_id is not None:
             ids = await self._account_group_repository.member_account_ids(group_id)
         elif account_id is not None:
             ids = [account_id]
-        if owner or gateway:
+        if owner or gateway or join_group:
             accounts = await self._account_repository.list_all()
+            if join_group:
+                wanted = normalize_group(join_group)
+                join_ids = {
+                    a.id for a in accounts if normalize_group(getattr(a, "group_tag", None)) == wanted
+                }
+                ids = [i for i in ids if i in join_ids] if ids is not None else sorted(join_ids)
             if owner:
                 if owner == UNTAGGED:
                     owner_ids = {a.id for a in accounts if not (a.owner_tag or "").strip()}

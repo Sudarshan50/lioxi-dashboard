@@ -97,11 +97,11 @@ export default function OverviewPage() {
     if (value !== ALL) setAccountFilter(ALL);
   }
 
-  const overview = useDashboardOverview({ range, accountId, modelId, groupId, owner });
-  const timeseries = useDashboardTimeseries({ range, accountId, modelId, groupId, owner });
-  const tpmByAccount = useTimeseriesByAccount({ range, accountId, modelId, groupId, owner });
-  const byAccount = useBreakdownByAccount(range, modelId, accountId, groupId, undefined, owner);
-  const byModel = useBreakdownByModel(range, accountId, groupId, modelId, undefined, owner);
+  const overview = useDashboardOverview({ range, accountId, modelId, groupId, owner, joinGroup });
+  const timeseries = useDashboardTimeseries({ range, accountId, modelId, groupId, owner, joinGroup });
+  const tpmByAccount = useTimeseriesByAccount({ range, accountId, modelId, groupId, owner, joinGroup });
+  const byAccount = useBreakdownByAccount(range, modelId, accountId, groupId, undefined, owner, joinGroup);
+  const byModel = useBreakdownByModel(range, accountId, groupId, modelId, undefined, owner, joinGroup);
   const byAccountRows = useMemo(() => {
     const rows = byAccount.data ?? [];
     if (accountId || !accounts) return rows;
@@ -190,7 +190,8 @@ export default function OverviewPage() {
       : "From registered token prices · USD";
   const estimateChartLabel = estimateCurrency === "INR" ? "₹" : "USD";
 
-  const activeFilterCount = (accountId ? 1 : 0) + (modelId ? 1 : 0) + (groupId ? 1 : 0) + (owner ? 1 : 0);
+  const activeFilterCount =
+    (accountId ? 1 : 0) + (modelId ? 1 : 0) + (groupId ? 1 : 0) + (owner ? 1 : 0) + (joinGroup ? 1 : 0);
   const selectedAccount = (accounts ?? []).find((account) => account.id === accountId);
   const selectedModel = (models ?? []).find((model) => model.registered_model_id === modelId);
   const ownerLabel = owner === UNTAGGED_OWNER ? "Untagged" : owner;
@@ -405,6 +406,7 @@ export default function OverviewPage() {
               setModelFilter(ALL);
               setGroupFilter(ALL);
               setOwnerFilter(ALL);
+              setJoinGroupFilter(ALL);
             }}
             className="mt-3 text-xs font-medium text-accent hover:text-accent-hover"
           >

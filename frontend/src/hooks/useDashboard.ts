@@ -10,6 +10,7 @@ interface Filters {
   groupId?: number | null;
   gateway?: string | null;
   owner?: string | null;
+  joinGroup?: string | null;
 }
 
 function toParams(filters: Filters) {
@@ -20,6 +21,7 @@ function toParams(filters: Filters) {
     group_id: filters.groupId,
     gateway: filters.gateway || undefined,
     owner: filters.owner || undefined,
+    join_group: filters.joinGroup || undefined,
   };
 }
 
@@ -56,10 +58,11 @@ export function useBreakdownByAccount(
   accountId?: number | null,
   groupId?: number | null,
   gateway?: string | null,
-  owner?: string | null
+  owner?: string | null,
+  joinGroup?: string | null
 ) {
   return useQuery({
-    queryKey: ["dashboard", "by-account", range, modelId, accountId, groupId, gateway, owner],
+    queryKey: ["dashboard", "by-account", range, modelId, accountId, groupId, gateway, owner, joinGroup],
     queryFn: async () =>
       (
         await apiClient.get<BreakdownItem[]>("/api/dashboard/by-account", {
@@ -70,6 +73,7 @@ export function useBreakdownByAccount(
             group_id: groupId,
             gateway: gateway || undefined,
             owner: owner || undefined,
+            join_group: joinGroup || undefined,
           },
         })
       ).data,
@@ -82,10 +86,11 @@ export function useBreakdownByModel(
   groupId?: number | null,
   modelId?: number | null,
   gateway?: string | null,
-  owner?: string | null
+  owner?: string | null,
+  joinGroup?: string | null
 ) {
   return useQuery({
-    queryKey: ["dashboard", "by-model", range, accountId, groupId, modelId, gateway, owner],
+    queryKey: ["dashboard", "by-model", range, accountId, groupId, modelId, gateway, owner, joinGroup],
     queryFn: async () =>
       (
         await apiClient.get<BreakdownItem[]>("/api/dashboard/by-model", {
@@ -96,6 +101,7 @@ export function useBreakdownByModel(
             model_id: modelId,
             gateway: gateway || undefined,
             owner: owner || undefined,
+            join_group: joinGroup || undefined,
           },
         })
       ).data,
