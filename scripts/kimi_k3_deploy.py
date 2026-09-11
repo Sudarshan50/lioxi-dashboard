@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import random
+import re
 import signal
 import string
 import subprocess
@@ -49,6 +50,12 @@ KIND = "AIServices"
 ACCOUNT_SKU = "S0"
 QUOTA_NAME = "AIServices.DataZoneStandard.Fireworks"
 DEPLOYMENT_NAME = "FW-Kimi-K3"
+# Stack suffix per Join group. It marks the resource group / account as one
+# of ours, and every reuse and delete guard keys off it, so both spellings
+# must stay recognised forever once used.
+STACK_SUFFIX_SB = "kimi"
+STACK_SUFFIX_VCS = "proxy"
+STACK_SUFFIXES = (STACK_SUFFIX_SB, STACK_SUFFIX_VCS)
 API_VERSION = "2023-05-01"
 DEPLOY_API_VERSION = "2024-10-01"
 FIREWORKS_FEATURE = "Fireworks.EnableDeploy"
@@ -875,7 +882,9 @@ def account_ready(env: dict[str, str], name: str, rg: str) -> tuple[bool, str]:
     return state.lower() == "succeeded", state
 
 
-def pick_or_create_account(env: dict[str, str], slug: str, sub: str) -> tuple[str, str, dict[str, Any]]:
+def pick_or_create_account(
+    env: dict[str, str], slug: str, sub: str, suffix: str = STACK_SUFFIX_SB
+) -> tuple[str, str, dict[str, Any]]:
     accounts = az_json(["az", "cognitiveservices", "account", "list", "-o", "json"], env=env) or []
     kimi_accounts: list[dict[str, Any]] = []
     for item in accounts:
@@ -898,8 +907,8 @@ def pick_or_create_account(env: dict[str, str], slug: str, sub: str) -> tuple[st
         rg = rid.split("/")[rid.split("/").index("resourceGroups") + 1]
         return chosen["name"], rg, chosen
 
-    rg = f"rg-{slug}-kimi"
-    acct = f"{slug}-kimi-{rand_suffix()}"
+    rg = f"rg-{slug}-{suffix}"
+    acct = f"{slug}-{suffix}-{rand_suffix()}"
     ok, err = az_ok(["az", "group", "create", "-n", rg, "-l", LOCATION, "-o", "none"], env=env)
     if not ok and "already exists" not in err.lower():
         raise AzError(f"resource group create failed: {err}")
@@ -946,11 +955,11 @@ def pick_or_create_account(env: dict[str, str], slug: str, sub: str) -> tuple[st
             "-g",
             rg,
             "--project-name",
-            f"{slug}-kimi",
+            f"{slug}-{suffix}",
             "--location",
             LOCATION,
             "--display-name",
-            f"{slug}-kimi",
+            f"{slug}-{suffix}",
             "-o",
             "none",
         ],
@@ -1160,6 +1169,7 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
     name = acct.get("name") or slugify(acct.get("account_holder") or client)
     fallback_email = acct.get("account_holder") or ""
     slug = slugify(name)
+    suffix = stack_suffix(acct.get("group_tag"))
 
     with tempfile.TemporaryDirectory(prefix=f"az-{slug}-") as tmp:
         env = isolated_env(Path(tmp))
@@ -1198,7 +1208,7 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
             )
 
         def _create():
-            return pick_or_create_account(env, slug, sub)
+            return pick_or_create_account(env, slug, sub, suffix)
 
         acct_name, rg, shown = retry(_create, attempts=8, delay=10, desc="create/find AIServices")
         shown = az_json(
@@ -1408,10 +1418,33 @@ def scale_kimi_one(acct: dict[str, Any]) -> dict[str, Any]:
         }
 
 
+def stack_suffix(group_tag: str | None) -> str:
+    """Resource-name suffix for a Join group. Anything unknown is SB."""
+    return STACK_SUFFIX_VCS if str(group_tag or "").strip().lower() == "vcs" else STACK_SUFFIX_SB
+
+
 def looks_like_kimi_stack(acct_name: str, rg: str) -> bool:
-    name = (acct_name or "").lower()
-    group = (rg or "").lower()
-    return "-kimi-" in name and group.startswith("rg-") and group.endswith("-kimi")
+    """True only for a stack this script created, in either group.
+
+    This gates purge_kimi_stack, which deletes the whole resource group, so it
+    matches the exact created shape -- rg-<slug>-<suffix> holding
+    <slug>-<suffix>-<rand6> -- and nothing else. A substring marker would be
+    unsafe: "-proxy-" is ordinary Azure vocabulary, so an unrelated
+    acme-proxy-gw in rg-acme-proxy would come within reach of the delete.
+
+    Mirrors looks_like_managed_stack() in app/services/join_group.py; this
+    copy exists because the script also runs standalone.
+    """
+    name = (acct_name or "").strip().lower()
+    group = (rg or "").strip().lower()
+    for suffix in STACK_SUFFIXES:
+        tail = f"-{suffix}"
+        if not (group.startswith("rg-") and group.endswith(tail) and len(group) > 3 + len(tail)):
+            continue
+        slug = group[3 : -len(tail)]
+        if re.fullmatch(rf"{re.escape(slug)}{tail}-[a-z0-9]{{6}}", name):
+            return True
+    return False
 
 
 def purge_kimi_stack(env: dict[str, str], acct_name: str, rg: str) -> list[str]:

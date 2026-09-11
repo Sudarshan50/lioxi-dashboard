@@ -5,6 +5,7 @@ from app.core.crypto import SecretBox, get_secret_box
 from app.models.azure_service_principal import AzureServicePrincipal
 from app.models.provider_account import ProviderAccount
 from app.models.sp_submit_request import SpSubmitRequest
+from app.services.join_group import looks_like_managed_stack
 from app.services.owner_tag import person_from_payload
 
 
@@ -152,9 +153,12 @@ async def hydrate_service_principals(
 
 
 def _is_dedicated_kimi_stack(resource_group: str | None, resource_name: str | None) -> bool:
-    rg = (resource_group or "").strip().lower()
-    rn = (resource_name or "").strip().lower()
-    return (rg.startswith("rg-") and rg.endswith("-kimi")) or "-kimi-" in rn
+    """A stack this portal deployed, in either group.
+
+    Strict on purpose: a match grants elevated access and puts the account on
+    Deploy K3, where undeploy can reach it.
+    """
+    return looks_like_managed_stack(resource_name, resource_group)
 
 
 async def sync_elevated_from_dedicated_kimi(session: AsyncSession) -> None:
