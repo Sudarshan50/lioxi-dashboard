@@ -35,9 +35,14 @@ from app.services.az_cli_session import (
     scrub_az_text,
 )
 from app.services.deploy_defaults import resolve_routing
-from app.services.join_group import group_label, join_account_name, normalize_group
+from app.services.join_enrollee_service import (
+    EnrolleeError,
+    ensure_enrollee_for_submit,
+    list_join_picker_names,
+    validate_enrollee_for_submit,
+)
+from app.services.join_group import join_account_name, normalize_group
 from app.services.kimi_deploy_service import load_deploy_module
-from app.services.owner_tag import parse_owner_tag
 from app.services.service_principal_store import persist_service_principals
 
 logger = logging.getLogger(__name__)
@@ -68,10 +73,21 @@ SP_NAME = "usage-and-credits-monitor"
 # Arbitrary constant; only has to be stable and unique among our advisory locks.
 NAME_ALLOCATION_LOCK = 8_724_193_055_110_001
 _NAME_CONSTRAINT = "uq_sp_submit_name"
+_ENROLLEE_CONSTRAINT = "uq_join_enrollee_name_group"
+
+
+def _constraint_in_error(exc: IntegrityError, name: str) -> bool:
+    return name in str(getattr(exc, "orig", exc))
 
 
 def _is_duplicate_name_error(exc: IntegrityError) -> bool:
-    return _NAME_CONSTRAINT in str(getattr(exc, "orig", exc))
+    return _constraint_in_error(exc, _NAME_CONSTRAINT)
+
+
+def _is_duplicate_enrollee_error(exc: IntegrityError) -> bool:
+    return _constraint_in_error(exc, _ENROLLEE_CONSTRAINT)
+
+
 CREATING_SP_MAX_AGE = timedelta(minutes=25)
 APPROVING_MAX_AGE = timedelta(minutes=45)
 LOGIN_TASK_GRACE = timedelta(seconds=45)
@@ -399,8 +415,6 @@ async def _discard_failed_for_subscription(
 
 
 async def list_owner_names(db: AsyncSession, group: str | None = None) -> list[str]:
-    from app.services.join_enrollee_service import list_join_picker_names
-
     return await list_join_picker_names(db, group)
 
 
@@ -731,16 +745,9 @@ async def commit_session(
 
     group = normalize_group(group_tag)
     try:
-        person = parse_owner_tag(person_associated)
-    except ValueError as exc:
+        await validate_enrollee_for_submit(db, person_associated, group)
+    except EnrolleeError as exc:
         raise SubmitError(str(exc)) from exc
-    if not person:
-        raise SubmitError("Pick a name from the dropdown.")
-    # Only names enrolled in the submitted group are accepted, so a VCS
-    # submission can never claim an SB-only name and vice versa.
-    allowed = set(await list_owner_names(db, group))
-    if person not in allowed:
-        raise SubmitError(f"Pick a name from the {group_label(group)} dropdown.")
 
     wanted = subscription_id.strip().lower()
     snap = public_snapshot(row)
@@ -771,6 +778,12 @@ async def commit_session(
         raise SubmitError(DUPLICATE_SUB_MESSAGE)
     await _discard_failed_for_subscription(db, match.subscription_id, exclude_id=row.id, inherit_into=row)
 
+    try:
+        enrollee = await ensure_enrollee_for_submit(db, person_associated, group)
+    except EnrolleeError as exc:
+        raise SubmitError(str(exc)) from exc
+    person = enrollee.name
+
     mod = load_deploy_module()
     slug = mod.slugify(person)
     label = "".join(person.split())
@@ -795,6 +808,8 @@ async def commit_session(
             raise SubmitError(
                 "That account name was just taken. Submit again to get the next one."
             ) from exc
+        if _is_duplicate_enrollee_error(exc):
+            raise SubmitError("That name was just added. Submit again.") from exc
         raise SubmitError(DUPLICATE_SUB_MESSAGE) from exc
 
     async def emit(event: dict[str, Any]) -> None:
@@ -960,20 +975,37 @@ async def _provision_sp(
     oid = await az.sp_object_id(app_id)
     if stored is None and oid:
         await az.add_sp_as_app_owner(app_id, oid)
-    await emit({"type": "phase", "phase": "roles", "message": "Assigning Azure roles…"})
     mod = load_deploy_module()
     roles: list[str] = list(getattr(mod, "ALL_ROLES", []))
     admin_roles = set(getattr(mod, "ADMIN_ROLES", _DEFAULT_ADMIN_ROLES))
     if "Contributor" in roles:
         roles = ["Contributor"] + [item for item in roles if item != "Contributor"]
+    tenant = str(row.tenant_id or "")
+    assigns_billing = bool(oid and tenant)
+    total_grants = len(roles) + (1 if assigns_billing else 0)
+
+    async def emit_roles(message: str, done: int, role: str | None = None) -> None:
+        event: dict[str, Any] = {
+            "type": "phase",
+            "phase": "roles",
+            "message": message,
+            "done": done,
+            "total": total_grants,
+        }
+        if role is not None:
+            event["role"] = role
+        await emit(event)
+
+    await emit_roles("Assigning Azure roles…", 0)
     failed_by_role: dict[str, str] = {}
-    for role in roles:
+    for index, role in enumerate(roles):
         if session_aborted(row.session_id):
             raise asyncio.CancelledError
-        await emit({"type": "phase", "phase": "roles", "message": f"Assigning {role}…"})
+        await emit_roles(f"Assigning {role}…", index, role)
         ok, err = await az.assign_role(app_id, role, sub, object_id=oid, timeout=90 if role == "Contributor" else 45)
         if not ok:
             failed_by_role[role] = err or "assignment failed"
+        await emit_roles(f"Assigning {role}…", index + 1, role)
 
     admin_failed = [f"{role}: {err}" for role, err in failed_by_role.items() if role in admin_roles]
     if admin_failed:
@@ -982,12 +1014,12 @@ async def _provision_sp(
         )
 
     billing_err = None
-    tenant = str(row.tenant_id or "")
-    if oid and tenant:
-        await emit({"type": "phase", "phase": "billing", "message": "Assigning billing reader…"})
+    if assigns_billing:
+        await emit_roles("Assigning billing reader…", len(roles))
         ok, err = await az.assign_billing_reader(oid, tenant)
         if not ok:
             billing_err = err
+        await emit_roles("Assigning billing reader…", total_grants)
 
     await _ensure_still_creating(db, row)
     row.billing_error = billing_err

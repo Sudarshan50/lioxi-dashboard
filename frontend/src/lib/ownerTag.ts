@@ -1,5 +1,6 @@
 export const UNTAGGED_OWNER = "__none__";
 export const UNTAGGED_LABEL = "Untagged";
+export const OWNER_TAG_MAX = 64;
 
 export function joinPickerName(value: string | null | undefined): string | null {
   return canonicalOwner(value ?? "") || null;

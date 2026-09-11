@@ -19,6 +19,17 @@ export function isVcs(value: string | null | undefined): boolean {
   return normalizeGroup(value) === GROUP_VCS;
 }
 
+export function retainJoinPerson(
+  current: string,
+  allowed: readonly string[],
+  group: string | null | undefined
+): string {
+  if (!current) return current;
+  const needle = current.toLowerCase();
+  if (allowed.some((name) => name.toLowerCase() === needle)) return current;
+  return isVcs(group) ? current : "";
+}
+
 export function groupLabel(value: string | null | undefined): string {
   return LABELS[normalizeGroup(value)];
 }

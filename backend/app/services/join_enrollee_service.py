@@ -12,7 +12,7 @@ from app.models.azure_service_principal import AzureServicePrincipal
 from app.models.join_enrollee import JoinEnrollee
 from app.models.provider_account import ProviderAccount
 from app.models.sp_submit_request import SpSubmitRequest
-from app.services.join_group import GROUP_SB, GROUP_VCS, GROUPS, group_label, normalize_group
+from app.services.join_group import GROUP_SB, GROUP_VCS, GROUPS, group_label, is_vcs, normalize_group
 from app.services.owner_tag import join_picker_name, parse_owner_tag
 
 logger = logging.getLogger(__name__)
@@ -128,8 +128,11 @@ async def list_enrollees(session: AsyncSession, group: str | None = None) -> lis
 
 
 async def list_join_picker_names(session: AsyncSession, group: str | None = GROUP_SB) -> list[str]:
-    """Unbanned names enrolled in this group. The Join dropdown offers exactly
-    these, and a submission is rejected unless the picked name is one of them."""
+    """Unbanned names enrolled in this group.
+
+    SB Join must pick one of these. VCS Join offers them in the picker and
+    also accepts a new name, which becomes an enrollee on submit.
+    """
     await ensure_enrollees_seeded(session)
     rows = await session.execute(
         select(JoinEnrollee.name).where(
@@ -145,18 +148,86 @@ async def list_join_picker_names(session: AsyncSession, group: str | None = GROU
     return sorted(names, key=lambda item: item.lower())
 
 
+async def get_enrollee(session: AsyncSession, name: str, group: str | None = GROUP_SB) -> JoinEnrollee | None:
+    return (
+        await session.execute(
+            select(JoinEnrollee).where(
+                func.lower(JoinEnrollee.name) == name.lower(),
+                JoinEnrollee.group_tag == normalize_group(group),
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def _flush_new_enrollee(session: AsyncSession, row: JoinEnrollee) -> None:
+    if not session.in_transaction():
+        await session.begin()
+    async with session.begin_nested():
+        session.add(row)
+        await session.flush()
+
+
+async def _resolve_submit_name(
+    session: AsyncSession, raw_name: str, group: str
+) -> tuple[str, JoinEnrollee | None]:
+    label = group_label(group)
+    if not (raw_name or "").strip():
+        if is_vcs(group):
+            raise EnrolleeError("Enter a name, or pick one from the list.")
+        raise EnrolleeError(f"Pick a name from the {label} dropdown.")
+    name = normalize_enrollee_name(raw_name)
+    existing = await get_enrollee(session, name, group)
+    if existing is not None:
+        if existing.banned:
+            raise EnrolleeError(f"{name} is banned from {label}.")
+        return name, existing
+    if not is_vcs(group):
+        raise EnrolleeError(f"Pick a name from the {label} dropdown.")
+    return name, None
+
+
+async def validate_enrollee_for_submit(
+    session: AsyncSession, raw_name: str, group: str | None = GROUP_SB
+) -> str:
+    """Canonical owner tag for a Join submit, without writing anything.
+
+    Lets a submit reject a blank, banned, or non-SB name before it takes any
+    action that an exception cannot undo.
+    """
+    name, _ = await _resolve_submit_name(session, raw_name, normalize_group(group))
+    return name
+
+
+async def ensure_enrollee_for_submit(
+    session: AsyncSession, raw_name: str, group: str | None = GROUP_SB
+) -> JoinEnrollee:
+    """Return the enrollee for a Join submit, creating a VCS row when the name is new.
+
+    The insert is flushed in a savepoint so a unique race does not abort the
+    caller's transaction. Banned names are never recreated.
+    """
+    tag = normalize_group(group)
+    name, existing = await _resolve_submit_name(session, raw_name, tag)
+    if existing is not None:
+        return existing
+    row = JoinEnrollee(name=name, group_tag=tag, banned=False)
+    try:
+        await _flush_new_enrollee(session, row)
+    except IntegrityError as exc:
+        raced = await get_enrollee(session, name, tag)
+        if raced is None:
+            raise EnrolleeError(f"Could not add {name} to {group_label(tag)}.") from exc
+        if raced.banned:
+            raise EnrolleeError(f"{name} is banned from {group_label(tag)}.") from exc
+        return raced
+    return row
+
+
 async def create_enrollee(session: AsyncSession, raw_name: str, group: str | None = GROUP_SB) -> JoinEnrollee:
     name = normalize_enrollee_name(raw_name)
     tag = normalize_group(group)
     label = group_label(tag)
-    existing = (
-        await session.execute(
-            select(JoinEnrollee).where(
-                func.lower(JoinEnrollee.name) == name.lower(),
-                JoinEnrollee.group_tag == tag,
-            )
-        )
-    ).scalar_one_or_none()
+    existing = await get_enrollee(session, name, tag)
     if existing is not None:
         raise EnrolleeError(f"{name} is already on the {label} list.")
     row = JoinEnrollee(name=name, group_tag=tag, banned=False)

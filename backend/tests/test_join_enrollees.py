@@ -2,7 +2,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from app.services.join_enrollee_service import EnrolleeError, normalize_auto_approve, normalize_enrollee_name
+from app.services.join_enrollee_service import (
+    EnrolleeError,
+    ensure_enrollee_for_submit,
+    normalize_auto_approve,
+    normalize_enrollee_name,
+)
+from app.services.join_group import GROUP_SB, GROUP_VCS
 from app.services.submit_service import _ensure_approve_newapi, _row_can_auto_retry
 from app.services.telegram_service import format_k3_deployed_notice
 
@@ -17,6 +23,18 @@ class JoinEnrolleeNames(unittest.TestCase):
             normalize_enrollee_name("")
         with self.assertRaises(EnrolleeError):
             normalize_enrollee_name("   ")
+
+
+class SubmitEnrolleeEmptyName(unittest.IsolatedAsyncioTestCase):
+    async def test_sb_requires_dropdown(self):
+        with self.assertRaises(EnrolleeError) as ctx:
+            await ensure_enrollee_for_submit(None, "  ", GROUP_SB)
+        self.assertIn("SB dropdown", str(ctx.exception))
+
+    async def test_vcs_allows_typed_name_prompt(self):
+        with self.assertRaises(EnrolleeError) as ctx:
+            await ensure_enrollee_for_submit(None, "", GROUP_VCS)
+        self.assertIn("Enter a name", str(ctx.exception))
 
 
 class JoinAutoApproveSetting(unittest.TestCase):

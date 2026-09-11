@@ -1,11 +1,12 @@
-import { Check, Copy, KeyRound } from "lucide-react";
+import { Check, ChevronLeft, Copy, KeyRound } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 
+import JoinNameField from "@/components/join/JoinNameField";
+import JoinProgress, { JoinProgressValue } from "@/components/join/JoinProgress";
 import JoinTerminal, { JoinTermLine } from "@/components/join/JoinTerminal";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Input from "@/components/ui/Input";
-import Spinner from "@/components/ui/Spinner";
 import {
   GROUP_SB,
   GROUP_VCS,
@@ -14,6 +15,7 @@ import {
   isVcs,
   joinAccountName,
   normalizeGroup,
+  retainJoinPerson,
 } from "@/lib/joinGroup";
 import { joinPickerName } from "@/lib/ownerTag";
 import { toastDismiss, toastError } from "@/lib/toast";
@@ -145,6 +147,7 @@ export default function JoinPage() {
   const [namesTick, setNamesTick] = useState(0);
   const [doneMessage, setDoneMessage] = useState("Submitted. An admin will deploy Kimi K3.");
   const [phaseMessage, setPhaseMessage] = useState("Working…");
+  const [roleProgress, setRoleProgress] = useState<JoinProgressValue | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [signinHint, setSigninHint] = useState<string | null>(null);
@@ -184,10 +187,7 @@ export default function JoinPage() {
           .map((name) => joinPickerName(name))
           .filter((name): name is string => Boolean(name));
         setNames(allowed);
-        // A name from the other group's list is not valid here.
-        setPerson((current) =>
-          allowed.some((name) => name.toLowerCase() === current.toLowerCase()) ? current : ""
-        );
+        setPerson((current) => retainJoinPerson(current, allowed, group));
         setNamesError(null);
       })
       .catch((exc) => {
@@ -198,9 +198,8 @@ export default function JoinPage() {
           setStep("gate");
           return;
         }
-        // Drop the old group's names, or they stay selectable under the new toggle.
         setNames([]);
-        setPerson("");
+        setPerson((current) => retainJoinPerson(current, [], group));
         setNamesError(message);
       })
       .finally(() => {
@@ -385,6 +384,14 @@ export default function JoinPage() {
     }
     if (kind === "phase") {
       setPhaseMessage(String(event.message || "Working…"));
+      const total = Number(event.total);
+      const done = Number(event.done);
+      if (Number.isFinite(total) && total > 0 && Number.isFinite(done)) {
+        setRoleProgress((prev) => {
+          if (!prev || prev.total !== total || done === 0 || done >= prev.done) return { done, total };
+          return prev;
+        });
+      }
       setStep("working");
       return;
     }
@@ -412,6 +419,7 @@ export default function JoinPage() {
     setSessionId(null);
     setSnapshot(null);
     setTermLines([]);
+    setRoleProgress(null);
   }
 
   async function handleUnlock(event: FormEvent) {
@@ -502,11 +510,21 @@ export default function JoinPage() {
     setStep("name");
   }
 
+  function backToSubscription() {
+    if (busy || step !== "name") return;
+    setError(null);
+    setStep("subscription");
+  }
+
   async function handleCommit(event: FormEvent) {
     event.preventDefault();
     if (!sessionId) return;
     const tag = joinPickerName(person);
-    if (!tag || !names.some((name) => name.toLowerCase() === tag.toLowerCase())) {
+    if (!tag) {
+      setError(isVcs(group) ? "Enter a name, or pick one from the list." : "Pick a name from the dropdown.");
+      return;
+    }
+    if (!isVcs(group) && !names.some((name) => name.toLowerCase() === tag.toLowerCase())) {
       setError("Pick a name from the dropdown.");
       return;
     }
@@ -518,6 +536,7 @@ export default function JoinPage() {
     setBusy(true);
     setStep("working");
     setPhaseMessage("Creating monitor identity…");
+    setRoleProgress(null);
     try {
       await commitSubmitSession(
         sessionId,
@@ -698,61 +717,19 @@ export default function JoinPage() {
                 Subscription <span className="text-gray-300">{subscriptionLabel(selected)}</span>
               </p>
             )}
-            <label className="flex min-w-0 w-full flex-col gap-1.5">
-              <span className="text-xs font-medium text-gray-400">Your name</span>
-              {namesLoading && names.length === 0 ? (
-                <div className="flex items-center gap-2 rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm text-gray-400">
-                  <Spinner className="h-4 w-4" />
-                  Loading names…
-                </div>
-              ) : names.length === 0 && namesError ? (
-                <div className="flex flex-col gap-2">
-                  <p className="rounded-lg border border-red-500/25 bg-red-500/10 px-3 py-2 text-sm text-red-200">
-                    {namesError}
-                  </p>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    onClick={() => {
-                      setNamesLoading(true);
-                      setNamesError(null);
-                      setNamesTick((n) => n + 1);
-                    }}
-                    className="w-full"
-                  >
-                    Retry
-                  </Button>
-                </div>
-              ) : (
-                <select
-                  id="join-name"
-                  value={person}
-                  onChange={(event) => setPerson(event.target.value)}
-                  required
-                  disabled={names.length === 0}
-                  className="w-full rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent disabled:opacity-60"
-                >
-                  <option value="">
-                    {names.length ? "Select from the dropdown…" : `No ${groupLabel(group)} names available`}
-                  </option>
-                  {names.map((name) => (
-                    <option key={name} value={name}>
-                      {name}
-                    </option>
-                  ))}
-                </select>
-              )}
-              {names.length > 0 ? (
-                <p className="text-xs text-gray-500">Use the dropdown. Custom names are not allowed.</p>
-              ) : (
-                !namesLoading &&
-                !namesError && (
-                  <p className="text-xs text-gray-500">
-                    No names are enrolled for {groupLabel(group)}. Ask an admin to add yours.
-                  </p>
-                )
-              )}
-            </label>
+            <JoinNameField
+              group={group}
+              names={names}
+              namesLoading={namesLoading}
+              namesError={namesError}
+              value={person}
+              onChange={setPerson}
+              onRetry={() => {
+                setNamesLoading(true);
+                setNamesError(null);
+                setNamesTick((n) => n + 1);
+              }}
+            />
             <div className="flex min-w-0 w-full flex-col gap-1.5">
               <span className="text-xs font-medium text-gray-400">Group</span>
               <div
@@ -779,19 +756,30 @@ export default function JoinPage() {
               </div>
               <p className="text-xs text-gray-500">{groupHint}</p>
             </div>
-            <Button
-              type="submit"
-              isLoading={busy}
-              disabled={!person || names.length === 0 || namesLoading || Boolean(namesError)}
-              className="w-full"
-            >
-              Submit for deploy
-            </Button>
+            <div className="flex flex-col gap-2">
+              <Button
+                type="submit"
+                isLoading={busy}
+                disabled={
+                  isVcs(group)
+                    ? !joinPickerName(person)
+                    : !person || names.length === 0 || namesLoading || Boolean(namesError)
+                }
+                className="w-full"
+              >
+                Submit for deploy
+              </Button>
+              <Button type="button" variant="secondary" onClick={backToSubscription} disabled={busy} className="w-full">
+                <ChevronLeft size={16} />
+                Back to subscription
+              </Button>
+            </div>
           </form>
         )}
         {step === "working" && (
           <div className="flex flex-col gap-3">
             <p className="text-center text-xs text-gray-400">{phaseMessage}</p>
+            {roleProgress && <JoinProgress label="Azure permissions" value={roleProgress} />}
             <JoinTerminal lines={termLines} waiting />
             <Button type="button" variant="secondary" onClick={() => void handleCancelSignIn()} className="w-full">
               Cancel
