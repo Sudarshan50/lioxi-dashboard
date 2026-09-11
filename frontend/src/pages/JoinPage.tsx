@@ -198,6 +198,9 @@ export default function JoinPage() {
           setStep("gate");
           return;
         }
+        // Drop the old group's names, or they stay selectable under the new toggle.
+        setNames([]);
+        setPerson("");
         setNamesError(message);
       })
       .finally(() => {

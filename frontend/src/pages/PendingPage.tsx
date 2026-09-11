@@ -10,7 +10,7 @@ import Card from "@/components/ui/Card";
 import EmptyState from "@/components/ui/EmptyState";
 import Spinner from "@/components/ui/Spinner";
 import PendingGrantsModal from "@/components/pending/PendingGrantsModal";
-import { JoinGroup, groupCounts, matchesGroup } from "@/lib/joinGroup";
+import { GROUP_SB, GROUP_VCS, JoinGroup, groupCounts, groupLabel, matchesGroup } from "@/lib/joinGroup";
 import { invalidateAfterDeploy, useKimiDeployDefaults, useSaveKimiDeployDefaults } from "@/hooks/useKimiDeploy";
 import apiClient from "@/lib/apiClient";
 import { useBanSettings } from "@/hooks/useBan";
@@ -275,6 +275,11 @@ export default function PendingPage() {
     }
   }
 
+  // Either group can be auto-approving; the banner named only SB before.
+  const autoApproveOn = [
+    ...(ban.data?.auto_approve ? [GROUP_SB] : []),
+    ...(ban.data?.auto_approve_vcs ? [GROUP_VCS] : []),
+  ];
   const allRows = list.data?.requests ?? [];
   const groupStats = useMemo(() => groupCounts(allRows), [allRows]);
   const rows = useMemo(
@@ -319,9 +324,9 @@ export default function PendingPage() {
           leftover deletes the empty Azure stack so they can /join again.
         </p>
       </div>
-      {ban.data?.auto_approve && (
+      {autoApproveOn.length > 0 && (
         <p className="rounded-xl border border-emerald-500/25 bg-emerald-500/[0.07] px-4 py-3 text-sm text-emerald-100">
-          Auto-approve is on.
+          Auto-approve is on for {autoApproveOn.map(groupLabel).join(" and ")}.
         </p>
       )}
       <Card className="flex flex-wrap items-end gap-3">

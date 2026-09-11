@@ -11,6 +11,7 @@ export interface AzureCredentialParseResult {
   missing: (keyof AzureCredentialFields)[];
   error?: string;
   ownerTag?: string;
+  groupTag?: string;
 }
 
 const FIELD_ALIASES: Record<keyof AzureCredentialFields, string[]> = {
@@ -212,7 +213,8 @@ function credentialsFromSources(sources: Record<string, unknown>[]): AzureCreden
     }
     return "";
   })();
-  return { values, filled, missing, ownerTag: ownerTag || undefined };
+  const groupTag = firstString(Object.assign({}, ...sources), ["group_tag", "groupTag", "group", "join_group"]);
+  return { values, filled, missing, ownerTag: ownerTag || undefined, groupTag: groupTag || undefined };
 }
 
 const NAME_ALIASES = ["account_name", "accountName", "ACCOUNT_NAME", "name", "account"];

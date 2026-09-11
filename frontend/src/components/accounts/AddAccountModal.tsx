@@ -13,7 +13,7 @@ import ManualResourceFields, {
   parseCreditGrant,
 } from "@/components/accounts/ManualResourceFields";
 import GroupTagField from "@/components/accounts/GroupTagField";
-import { GROUP_SB, JoinGroup } from "@/lib/joinGroup";
+import { GROUP_SB, JoinGroup, normalizeGroup } from "@/lib/joinGroup";
 import OwnerTagField from "@/components/accounts/OwnerTagField";
 import Button from "@/components/ui/Button";
 import Input from "@/components/ui/Input";
@@ -88,6 +88,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
     setManualModels([newManualModelRow()]);
     setDiscoveredCreditsLimit("");
     setOwnerTag("");
+    setGroupTag(GROUP_SB);
     setError(null);
     setDidSave(false);
     onClose();
@@ -114,6 +115,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
     if (result.values.clientSecret) setClientSecret(result.values.clientSecret);
     if (result.values.subscriptionId) setSubscriptionId(result.values.subscriptionId);
     if (result.ownerTag) setOwnerTag(result.ownerTag);
+    if (result.groupTag) setGroupTag(normalizeGroup(result.groupTag));
     setJsonHintTone("success");
     setJsonHint(describeParsedCredentials(result));
     setError(null);
