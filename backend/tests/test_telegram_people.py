@@ -126,12 +126,17 @@ class PeopleUsage(unittest.TestCase):
             telegram_admin_id_set={"111"},
             telegram_owner_id_set={"111"},
             telegram_chat_id="-100",
+            telegram_vcs_chat_id="-200",
         )
         with patch("app.services.telegram_bot.get_settings", return_value=settings):
             dm = {"type": "private", "id": 333}
             admin_dm = {"type": "private", "id": 111}
             group = {"type": "supergroup", "id": -100}
             other_group = {"type": "supergroup", "id": -999}
+            vcs_group = {"type": "supergroup", "id": -200}
+            # The second group chat is open for /live on the same terms.
+            self.assertTrue(_command_allowed(vcs_group, "333", "/live"))
+            self.assertFalse(_command_allowed(vcs_group, "333", "/people"))
             self.assertFalse(_command_allowed(dm, "333", "/live"))
             self.assertTrue(_command_allowed(admin_dm, "111", "/live"))
             self.assertTrue(_command_allowed(admin_dm, "111", "/people"))
@@ -197,6 +202,7 @@ class ProcessUpdate(unittest.IsolatedAsyncioTestCase):
             telegram_admin_id_set={"111"},
             telegram_owner_id_set={"111"},
             telegram_chat_id="-100",
+            telegram_vcs_chat_id="-200",
         )
         update = {
             "update_id": 1,
@@ -292,6 +298,7 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
         values = {
             "telegram_bot_token": "token",
             "telegram_chat_id": "-100",
+            "telegram_vcs_chat_id": "-200",
             "telegram_admin_id_set": {"111", "222"},
             "telegram_owner_id_set": {"111"},
         }
@@ -299,9 +306,9 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(**values)
 
     def tearDown(self):
-        telegram_service._clear_job = {}
-        telegram_service._clear_task = None
-        telegram_service._group_high_water = 0
+        telegram_service._clear_jobs.clear()
+        telegram_service._clear_tasks.clear()
+        telegram_service._group_high_water.clear()
 
     async def test_clear_chat_does_not_send_and_sweeps_every_id(self):
         with patch("app.services.telegram_service.send_message", new_callable=AsyncMock) as send:
@@ -354,7 +361,7 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
                 with patch("app.services.telegram_service.clear_chat", new_callable=AsyncMock, return_value=finished) as clear:
                     snap = await start_clear_group_chat()
                     self.assertTrue(snap["running"])
-                    await telegram_service._clear_task
+                    await telegram_service._clear_tasks["sb"]
         send.assert_not_called()
         clear.assert_awaited_once()
         self.assertEqual(clear.await_args.args[0], "-100")
@@ -364,7 +371,7 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done["attempted"], 80)
 
     async def test_send_still_posts_while_clear_runs(self):
-        telegram_service._clear_job = {"running": True}
+        telegram_service._clear_jobs["sb"] = {"running": True}
 
         class FakeClient:
             async def __aenter__(self):
@@ -387,8 +394,8 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.telegram_service._load_high_water", new_callable=AsyncMock, return_value=0):
             with patch("app.services.telegram_service._probe_one", new_callable=AsyncMock, side_effect=probe) as probed:
-                telegram_service._group_high_water = 0
-                tip = await telegram_service._discover_tip(None, -100)
+                telegram_service._group_high_water["sb"] = 0
+                tip = await telegram_service._discover_tip(None, -100, "sb")
         self.assertGreaterEqual(tip, 80)
         self.assertLess(probed.await_count, 400)
 
@@ -398,8 +405,8 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
 
         with patch("app.services.telegram_service._load_high_water", new_callable=AsyncMock, return_value=80):
             with patch("app.services.telegram_service._probe_one", new_callable=AsyncMock, side_effect=probe) as probed:
-                telegram_service._group_high_water = 80
-                tip = await telegram_service._discover_tip(None, -100)
+                telegram_service._group_high_water["sb"] = 80
+                tip = await telegram_service._discover_tip(None, -100, "sb")
         self.assertEqual(tip, 80)
         self.assertLess(probed.await_count, 30)
 
@@ -421,7 +428,7 @@ class ClearMemberChats(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(TelegramError):
                     await start_clear_group_chat()
                 release.set()
-                await telegram_service._clear_task
+                await telegram_service._clear_tasks["sb"]
         self.assertFalse(clear_group_snapshot()["running"])
 
 
@@ -447,3 +454,15 @@ class WebhookUrl(unittest.TestCase):
             self.assertFalse(webhook_secret_ok("nope"))
             self.assertFalse(webhook_secret_ok(""))
             self.assertFalse(webhook_secret_ok(None))
+
+    def test_certificate_upload_uses_pem_filename(self):
+        from app.services.telegram_bot import _WEBHOOK_CERT_UPLOAD_NAME, webhook_certificate_file
+
+        self.assertEqual(_WEBHOOK_CERT_UPLOAD_NAME, "PUBLIC.pem")
+        with patch("app.services.telegram_bot._WEBHOOK_CERT") as cert_path:
+            cert_path.is_file.return_value = True
+            cert_path.read_bytes.return_value = b"-----BEGIN CERTIFICATE-----\n"
+            name, data, content_type = webhook_certificate_file()
+        self.assertEqual(name, "PUBLIC.pem")
+        self.assertTrue(data.startswith(b"-----BEGIN CERTIFICATE-----"))
+        self.assertEqual(content_type, "application/x-pem-file")

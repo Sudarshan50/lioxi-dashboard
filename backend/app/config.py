@@ -37,6 +37,8 @@ class Settings(BaseSettings):
 
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    # Second group chat, scoped to VCS accounts. Blank disables it.
+    telegram_vcs_chat_id: str | None = None
     telegram_admin_ids: str = ""
     telegram_owner_id: str = ""
     telegram_webhook_url: str | None = None

@@ -1,6 +1,7 @@
 """Interactive Telegram bot commands (webhook).
 
-Group chat: /live, /help, /start for everyone.
+Group chats: /live, /help, /start for everyone. Each group sees only its own
+Join group (SB or VCS); an admin private chat sees both.
 Private chat: admin commands for TELEGRAM_ADMIN_IDS only.
 """
 
@@ -19,6 +20,7 @@ from app.database import SessionLocal
 from app.repositories.account_repository import AccountRepository
 from app.services import telegram_service
 from app.services.alert_service import consumed_percent, credit_grant_usd, get_alert_config
+from app.services.join_group import GROUP_SB, GROUP_VCS, normalize_group
 from app.services.new_api_service import NewApiError, set_gateway_status
 
 logger = logging.getLogger(__name__)
@@ -83,11 +85,35 @@ def _chat_allowed(chat: dict | None, sender: str) -> bool:
     )
 
 
-def _group_open(chat: dict | None) -> bool:
-    settings = get_settings()
-    group_id = str(settings.telegram_chat_id or "").strip()
+def group_scope(chat: dict | None, sb_id: str, vcs_id: str) -> str | None:
+    """Which Join group a chat may see, or None if it is not an open group.
+
+    Each group chat sees exactly one scope. That is the whole safeguard: a
+    member of the SB group can never reach VCS figures, and vice versa, no
+    matter which command or button they use.
+    """
     info = chat or {}
-    return str(info.get("type") or "") in ("group", "supergroup") and str(info.get("id") or "") == group_id
+    if str(info.get("type") or "") not in ("group", "supergroup"):
+        return None
+    chat_id = str(info.get("id") or "")
+    if sb_id and chat_id == sb_id:
+        return GROUP_SB
+    if vcs_id and chat_id == vcs_id:
+        return GROUP_VCS
+    return None
+
+
+def _group_scope(chat: dict | None) -> str | None:
+    settings = get_settings()
+    return group_scope(
+        chat,
+        str(settings.telegram_chat_id or "").strip(),
+        str(settings.telegram_vcs_chat_id or "").strip(),
+    )
+
+
+def _group_open(chat: dict | None) -> bool:
+    return _group_scope(chat) is not None
 
 
 def _cancel_self_destruct(chat_id: str | int | None, message_id: int | None) -> None:
@@ -98,17 +124,26 @@ def _cancel_self_destruct(chat_id: str | int | None, message_id: int | None) -> 
         task.cancel()
 
 
-def cancel_all_self_destructs() -> int:
-    pending = list(_pending_deletes.items())
-    _pending_deletes.clear()
-    for _key, task in pending:
+def cancel_all_self_destructs(chat_id: str | int | None = None) -> int:
+    """Cancel pending auto-deletes, for one chat or for every chat.
+
+    A clear job must only drop its own chat's timers; cancelling globally
+    would leave another group's /live card sitting in its chat forever.
+    """
+    wanted = None if chat_id is None else str(chat_id)
+    pending = [
+        (key, task)
+        for key, task in _pending_deletes.items()
+        if wanted is None or key[0] == wanted
+    ]
+    for key, task in pending:
+        _pending_deletes.pop(key, None)
         task.cancel()
     return len(pending)
 
 
-async def start_clear_group_chat() -> dict:
-    cancel_all_self_destructs()
-    return await telegram_service.start_clear_group_chat()
+async def start_clear_group_chat(group: str | None = None) -> dict:
+    return await telegram_service.start_clear_group_chat(group)
 
 
 def _message_ids(*message_ids: int | None | list[int | None] | tuple[int | None, ...]) -> list[int]:
@@ -224,8 +259,24 @@ def _people_groups(accounts) -> list[tuple[str, list]]:
     return sorted(items, key=sort_key)
 
 
-def _live_groups(accounts) -> list[tuple[str, list]]:
-    return _people_groups([account for account in accounts if _is_live(account)])
+def _in_scope(account, scope: str | None) -> bool:
+    """scope None means every group, used only for an admin private chat."""
+    if scope is None:
+        return True
+    return normalize_group(getattr(account, "group_tag", None)) == scope
+
+
+def _live_groups(accounts, scope: str | None = GROUP_SB) -> list[tuple[str, list]]:
+    """Live channels for one Join group.
+
+    /live is public in its group chat, so it is scoped to that chat's group.
+    Out-of-scope accounts are never listed, matched by name, or reachable
+    through the picker buttons — the command and its callback both resolve
+    names through here, with the scope taken from the chat.
+    """
+    return _people_groups(
+        [account for account in accounts if _is_live(account) and _in_scope(account, scope)]
+    )
 
 
 def _person_token(tag: str) -> str:
@@ -372,10 +423,12 @@ async def _cmd_people(query: str) -> tuple[str, dict | None]:
     return "Whose report?", _people_keyboard(groups)
 
 
-async def _cmd_live(query: str, source_message_id: int | None = None) -> tuple[str, dict | None]:
+async def _cmd_live(
+    query: str, source_message_id: int | None = None, scope: str | None = GROUP_SB
+) -> tuple[str, dict | None]:
     async with SessionLocal() as session:
         accounts = await AccountRepository(session).list_all()
-    groups = _live_groups(accounts)
+    groups = _live_groups(accounts, scope)
     if not groups:
         return f"No live channels to show right now.{_live_ttl_note()}", None
 
@@ -541,7 +594,11 @@ async def _cmd_toggle_picker(enable: bool) -> tuple[str, dict | None]:
 
 
 async def _handle_command(
-    text: str, *, public: bool = False, source_message_id: int | None = None
+    text: str,
+    *,
+    public: bool = False,
+    source_message_id: int | None = None,
+    scope: str | None = GROUP_SB,
 ) -> tuple[str, dict | None]:
     parts = text.strip().split(maxsplit=1)
     command = parts[0].split("@")[0].lower()
@@ -549,7 +606,7 @@ async def _handle_command(
     if command in ("/help", "/start"):
         return (_PUBLIC_HELP if public else _HELP), None
     if command == "/live":
-        return await _cmd_live(argument, source_message_id=source_message_id)
+        return await _cmd_live(argument, source_message_id=source_message_id, scope=scope)
     if public:
         return _PUBLIC_HELP, None
     if command == "/people":
@@ -618,7 +675,7 @@ async def _process_callback(callback: dict) -> None:
         try:
             async with SessionLocal() as session:
                 accounts = await AccountRepository(session).list_all()
-            found = _group_by_token(_live_groups(accounts), raw_id)
+            found = _group_by_token(_live_groups(accounts, _group_scope(message.get("chat") or {})), raw_id)
             text = (
                 _live_card(*found)
                 if found
@@ -732,10 +789,12 @@ async def _process_update(update: dict) -> None:
             )
             return
         source_id = message.get("message_id")
+        # An admin private chat sees every group; a group chat sees only its own.
         reply, keyboard = await _handle_command(
             text,
             public=not _chat_allowed(chat, sender),
             source_message_id=source_id,
+            scope=_group_scope(chat),
         )
         messages = _split_telegram(reply) if isinstance(reply, str) else [reply]
         ephemeral = command == "/live"
@@ -757,6 +816,14 @@ async def _process_update(update: dict) -> None:
 
 WEBHOOK_PATH = "/api/telegram/webhook"
 _WEBHOOK_CERT = Path("/run/secrets/telegram-webhook.crt")
+# Telegram only keeps a self-signed cert when the upload looks like a .pem file.
+_WEBHOOK_CERT_UPLOAD_NAME = "PUBLIC.pem"
+
+
+def webhook_certificate_file() -> tuple[str, bytes, str] | None:
+    if not _WEBHOOK_CERT.is_file():
+        return None
+    return (_WEBHOOK_CERT_UPLOAD_NAME, _WEBHOOK_CERT.read_bytes(), "application/x-pem-file")
 
 
 def webhook_secret() -> str:
@@ -803,9 +870,10 @@ async def setup_telegram_webhook() -> None:
         "allowed_updates": ["message", "callback_query"],
         "drop_pending_updates": False,
     }
+    cert = webhook_certificate_file()
     try:
         async with httpx.AsyncClient(timeout=20) as client:
-            if _WEBHOOK_CERT.is_file():
+            if cert:
                 response = await client.post(
                     f"https://api.telegram.org/bot{settings.telegram_bot_token}/setWebhook",
                     data={
@@ -814,20 +882,30 @@ async def setup_telegram_webhook() -> None:
                         "allowed_updates": '["message","callback_query"]',
                         "drop_pending_updates": "false",
                     },
-                    files={"certificate": (_WEBHOOK_CERT.name, _WEBHOOK_CERT.read_bytes(), "application/x-pem-file")},
+                    files={"certificate": cert},
                 )
             else:
                 response = await client.post(
                     f"https://api.telegram.org/bot{settings.telegram_bot_token}/setWebhook",
                     json=body,
                 )
-        data = response.json() if response.content else {}
-        if response.status_code != 200 or not data.get("ok"):
-            desc = str(data.get("description") or response.text or "setWebhook failed")
-            _poll_state["running"] = False
-            _poll_state["last_error"] = desc[:180]
-            logger.warning("Telegram setWebhook failed: %s", _poll_state["last_error"])
-            return
+            data = response.json() if response.content else {}
+            if response.status_code != 200 or not data.get("ok"):
+                desc = str(data.get("description") or response.text or "setWebhook failed")
+                _poll_state["running"] = False
+                _poll_state["last_error"] = desc[:180]
+                logger.warning("Telegram setWebhook failed: %s", _poll_state["last_error"])
+                return
+            if cert:
+                info = await client.get(
+                    f"https://api.telegram.org/bot{settings.telegram_bot_token}/getWebhookInfo"
+                )
+                stored = (info.json() if info.content else {}).get("result") or {}
+                if not stored.get("has_custom_certificate"):
+                    _poll_state["running"] = False
+                    _poll_state["last_error"] = "setWebhook did not store the self-signed certificate"
+                    logger.warning("Telegram setWebhook omitted the custom certificate")
+                    return
         _poll_state["running"] = True
         _poll_state["last_error"] = None
         _poll_state["last_ok_at"] = datetime.now(timezone.utc).isoformat()

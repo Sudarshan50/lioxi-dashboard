@@ -8,17 +8,25 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.config import get_settings
+from app.services.join_group import GROUP_SB, GROUP_VCS, GROUPS, group_label, normalize_group
 
 logger = logging.getLogger(__name__)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 DELETE_BATCH_SIZE = 100
-HIGH_WATER_KEY = "telegram_group_last_message_id"
+# SB keeps the original key so its stored high-water mark survives the split.
+HIGH_WATER_KEYS = {
+    GROUP_SB: "telegram_group_last_message_id",
+    GROUP_VCS: "telegram_group_last_message_id_vcs",
+}
 TIP_SEARCH_CEILING = 2_000_000
 _clear_guard = asyncio.Lock()
-_clear_job: dict = {}
-_clear_task: asyncio.Task | None = None
-_group_high_water = 0
+# Clear jobs, tasks and message-id high-water marks are all per group: the two
+# chats have unrelated message-id sequences, so sharing any of this would make
+# one group's wipe probe the other group's ids.
+_clear_jobs: dict[str, dict] = {}
+_clear_tasks: dict[str, asyncio.Task] = {}
+_group_high_water: dict[str, int] = {}
 _notice_tasks: set[asyncio.Task] = set()
 
 
@@ -34,9 +42,23 @@ class TelegramError(RuntimeError):
     pass
 
 
-def is_configured() -> bool:
+def group_chat_id(group: str | None = None) -> str:
+    """Chat id for a Join group. SB is the default and the historical group."""
     settings = get_settings()
-    return bool(settings.telegram_bot_token and settings.telegram_chat_id)
+    if normalize_group(group) == GROUP_VCS:
+        return str(settings.telegram_vcs_chat_id or "").strip()
+    return str(settings.telegram_chat_id or "").strip()
+
+
+def group_chat_ids() -> dict[str, str]:
+    return {g: group_chat_id(g) for g in GROUPS if group_chat_id(g)}
+
+
+def is_configured(group: str | None = None) -> bool:
+    """True when this group has somewhere to send. Never falls back to the
+    other group's chat: a missing VCS chat id means VCS stays silent, it does
+    not leak into the SB group."""
+    return bool(get_settings().telegram_bot_token and group_chat_id(group))
 
 
 def format_k3_deployed_notice(person: str, account: str, authorized_by: str) -> str:
@@ -46,39 +68,56 @@ def format_k3_deployed_notice(person: str, account: str, authorized_by: str) -> 
     return f"<b>K3 deployed</b>\n{who} · <code>{name}</code>\nAuthorized: {auth}"
 
 
-def schedule_k3_deployed_notice(person: str, account: str, authorized_by: str) -> None:
-    task = asyncio.create_task(_notify_k3_deployed(person, account, authorized_by))
+def schedule_k3_deployed_notice(
+    person: str, account: str, authorized_by: str, group: str | None = None
+) -> None:
+    task = asyncio.create_task(_notify_k3_deployed(person, account, authorized_by, group))
     _notice_tasks.add(task)
     task.add_done_callback(_notice_tasks.discard)
 
 
-async def _notify_k3_deployed(person: str, account: str, authorized_by: str) -> None:
-    if not is_configured():
+async def _notify_k3_deployed(
+    person: str, account: str, authorized_by: str, group: str | None = None
+) -> None:
+    if not is_configured(group):
         return
     try:
-        await send_message(format_k3_deployed_notice(person, account, authorized_by))
+        await send_message(format_k3_deployed_notice(person, account, authorized_by), group=group)
     except Exception:
         logger.exception("Telegram K3 deploy notice failed person=%s account=%s", person, account)
 
 
 def _is_group_chat(chat_id: str | int | None) -> bool:
-    settings = get_settings()
-    group_id = str(settings.telegram_chat_id or "").strip()
-    return bool(group_id and chat_id is not None and str(chat_id) == group_id)
+    if chat_id is None:
+        return False
+    return str(chat_id) in set(group_chat_ids().values())
+
+
+def group_for_chat(chat_id: str | int | None) -> str | None:
+    """Which Join group a chat id belongs to, or None if it is not a group chat."""
+    if chat_id is None:
+        return None
+    wanted = str(chat_id)
+    for group, configured in group_chat_ids().items():
+        if configured == wanted:
+            return group
+    return None
 
 
 def note_group_message_id(chat_id: str | int | None, *message_ids: int | None) -> None:
-    global _group_high_water
-    if not _is_group_chat(chat_id):
+    group = group_for_chat(chat_id)
+    if group is None:
         return
     for raw in message_ids:
         if raw is None:
             continue
-        _group_high_water = max(_group_high_water, int(raw))
+        _group_high_water[group] = max(_group_high_water.get(group, 0), int(raw))
 
 
-def group_clear_running() -> bool:
-    return bool(_clear_job.get("running"))
+def group_clear_running(group: str | None = None) -> bool:
+    """True while that group's chat is being wiped, so alerts hold off."""
+    job = _clear_jobs.get(normalize_group(group)) or {}
+    return bool(job.get("running"))
 
 
 async def send_message(
@@ -86,11 +125,16 @@ async def send_message(
     chat_id: str | int | None = None,
     reply_markup: dict | None = None,
     message_thread_id: int | None = None,
+    group: str | None = None,
 ) -> int | None:
+    """Send to an explicit chat, else to the chat for `group` (SB by default)."""
     settings = get_settings()
-    target = chat_id or settings.telegram_chat_id
+    target = chat_id or group_chat_id(group)
     if not settings.telegram_bot_token or not target:
-        raise TelegramError("Telegram is not configured (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)")
+        raise TelegramError(
+            "Telegram is not configured for "
+            f"{group_label(group)} (set TELEGRAM_BOT_TOKEN and the group's chat id)"
+        )
     payload: dict = {
         "chat_id": target,
         "text": text,
@@ -255,33 +299,34 @@ def _id_batches_newest_first(newest_id: int, batch_size: int = DELETE_BATCH_SIZE
     return batches
 
 
-async def _load_high_water() -> int:
-    global _group_high_water
+async def _load_high_water(group: str) -> int:
     from app.database import SessionLocal
     from app.models.app_setting import AppSetting
 
     async with SessionLocal() as session:
-        row = await session.get(AppSetting, HIGH_WATER_KEY)
+        row = await session.get(AppSetting, HIGH_WATER_KEYS[group])
     if row is not None:
         try:
-            _group_high_water = max(_group_high_water, int(row.value))
+            _group_high_water[group] = max(_group_high_water.get(group, 0), int(row.value))
         except (TypeError, ValueError):
             pass
-    return _group_high_water
+    return _group_high_water.get(group, 0)
 
 
-async def _save_high_water() -> None:
-    if _group_high_water <= 0:
+async def _save_high_water(group: str) -> None:
+    mark = _group_high_water.get(group, 0)
+    if mark <= 0:
         return
     from app.database import SessionLocal
     from app.models.app_setting import AppSetting
 
+    key = HIGH_WATER_KEYS[group]
     async with SessionLocal() as session:
-        row = await session.get(AppSetting, HIGH_WATER_KEY)
+        row = await session.get(AppSetting, key)
         if row is None:
-            session.add(AppSetting(key=HIGH_WATER_KEY, value=str(_group_high_water)))
-        elif int(row.value or 0) < _group_high_water:
-            row.value = str(_group_high_water)
+            session.add(AppSetting(key=key, value=str(mark)))
+        elif int(row.value or 0) < mark:
+            row.value = str(mark)
         await session.commit()
 
 
@@ -302,18 +347,18 @@ async def _window_exists(session: httpx.AsyncClient, chat_id: str | int, mid: in
     return best
 
 
-async def _discover_tip(session: httpx.AsyncClient, chat_id: str | int) -> int:
+async def _discover_tip(session: httpx.AsyncClient, chat_id: str | int, group: str) -> int:
     """Use the last known group message id. Binary-search only when none is stored."""
-    await _load_high_water()
-    tip = _group_high_water
-    _touch_clear_job(phase="finding", attempted=0, total=0)
+    await _load_high_water(group)
+    tip = _group_high_water.get(group, 0)
+    _touch_clear_job(group, phase="finding", attempted=0, total=0)
     probes = 0
     if tip < 1:
         low, high = 1, TIP_SEARCH_CEILING
         while low <= high:
             mid = (low + high) // 2
             probes += 1
-            _touch_clear_job(attempted=probes, phase="finding")
+            _touch_clear_job(group, attempted=probes, phase="finding")
             found = await _window_exists(session, chat_id, mid)
             if found:
                 tip = max(tip, found)
@@ -326,27 +371,34 @@ async def _discover_tip(session: httpx.AsyncClient, chat_id: str | int) -> int:
             tip = tip + extra
         elif extra >= 15:
             break
-    _touch_clear_job(attempted=probes, phase="finding")
+    _touch_clear_job(group, attempted=probes, phase="finding")
     note_group_message_id(chat_id, tip)
     return tip
 
 
-async def clear_chat(chat_id: str | int, *, kind: str = "group", newest_id: int | None = None) -> dict:
+async def clear_chat(
+    chat_id: str | int,
+    *,
+    kind: str = "group",
+    newest_id: int | None = None,
+    group: str | None = None,
+) -> dict:
     """Delete every message ID from 1 through the latest. Does not post anything."""
+    scope = normalize_group(group)
     async with httpx.AsyncClient(timeout=20) as client:
-        tip = int(newest_id) if newest_id else await _discover_tip(client, chat_id)
+        tip = int(newest_id) if newest_id else await _discover_tip(client, chat_id, scope)
         if tip < 1:
             raise TelegramError("No group messages are known yet, so a silent full clear cannot start.")
         note_group_message_id(chat_id, tip)
         attempted = 0
         failed_batches = 0
-        _touch_clear_job(newest_id=tip, total=tip, attempted=0, failed_batches=0, phase="deleting")
+        _touch_clear_job(scope, newest_id=tip, total=tip, attempted=0, failed_batches=0, phase="deleting")
         for ids in _id_batches_newest_first(tip):
             attempted += len(ids)
             if not await delete_messages(chat_id, ids, client=client):
                 failed_batches += 1
-            _touch_clear_job(attempted=attempted, failed_batches=failed_batches)
-    await _save_high_water()
+            _touch_clear_job(scope, attempted=attempted, failed_batches=failed_batches)
+    await _save_high_water(scope)
     return {
         "chat_id": str(chat_id),
         "kind": kind,
@@ -357,9 +409,10 @@ async def clear_chat(chat_id: str | int, *, kind: str = "group", newest_id: int 
     }
 
 
-def clear_group_snapshot() -> dict:
-    job = _clear_job or {}
+def clear_group_snapshot(group: str | None = None) -> dict:
+    job = _clear_jobs.get(normalize_group(group)) or {}
     return {
+        "group": normalize_group(group),
         "running": bool(job.get("running")),
         "phase": job.get("phase") or ("deleting" if job.get("total") else "finding"),
         "newest_id": job.get("newest_id"),
@@ -371,23 +424,29 @@ def clear_group_snapshot() -> dict:
     }
 
 
-def _touch_clear_job(**fields) -> None:
-    if _clear_job:
-        _clear_job.update(fields)
+def _touch_clear_job(group: str, **fields) -> None:
+    job = _clear_jobs.get(group)
+    if job:
+        job.update(fields)
 
 
-async def start_clear_group_chat() -> dict:
-    """Start a full wipe of the linked group. Returns immediately; poll the snapshot."""
-    global _clear_job, _clear_task
+async def start_clear_group_chat(group: str | None = None) -> dict:
+    """Wipe one group's chat. Returns immediately; poll the snapshot.
+
+    Each group has its own job, so clearing VCS never touches SB's progress
+    and the two can run independently.
+    """
+    scope = normalize_group(group)
     settings = get_settings()
     if not settings.telegram_bot_token:
         raise TelegramError("Telegram is not configured (set TELEGRAM_BOT_TOKEN)")
-    if not settings.telegram_chat_id:
-        raise TelegramError("No Telegram group is linked (set TELEGRAM_CHAT_ID)")
+    chat_id = group_chat_id(scope)
+    if not chat_id:
+        raise TelegramError(f"No Telegram group is linked for {group_label(scope)}.")
     async with _clear_guard:
-        if _clear_job.get("running"):
-            raise TelegramError("A group clear is already running.")
-        _clear_job = {
+        if (_clear_jobs.get(scope) or {}).get("running"):
+            raise TelegramError(f"A {group_label(scope)} group clear is already running.")
+        _clear_jobs[scope] = {
             "running": True,
             "phase": "finding",
             "newest_id": None,
@@ -397,37 +456,38 @@ async def start_clear_group_chat() -> dict:
             "ok": None,
             "error": None,
         }
-        _clear_task = asyncio.create_task(_run_clear_group_chat(str(settings.telegram_chat_id)))
-    return clear_group_snapshot()
+        _clear_tasks[scope] = asyncio.create_task(_run_clear_group_chat(chat_id, scope))
+    return clear_group_snapshot(scope)
 
 
-async def cancel_clear_group_chat() -> dict:
-    task = _clear_task
+async def cancel_clear_group_chat(group: str | None = None) -> dict:
+    scope = normalize_group(group)
+    task = _clear_tasks.get(scope)
     if task is not None and not task.done():
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
-    _touch_clear_job(running=False, ok=False, error="Cancelled", phase="cancelled")
-    return clear_group_snapshot()
+    _touch_clear_job(scope, running=False, ok=False, error="Cancelled", phase="cancelled")
+    return clear_group_snapshot(scope)
 
 
-async def _run_clear_group_chat(chat_id: str) -> None:
+async def _run_clear_group_chat(chat_id: str, group: str) -> None:
     try:
         from app.services.telegram_bot import cancel_all_self_destructs
 
-        cancel_all_self_destructs()
-        result = await clear_chat(chat_id, kind="group")
-        _touch_clear_job(ok=result["ok"], newest_id=result["newest_id"], attempted=result["attempted"], failed_batches=result["failed_batches"], error=None, phase="done")
+        cancel_all_self_destructs(chat_id)
+        result = await clear_chat(chat_id, kind="group", group=group)
+        _touch_clear_job(group, ok=result["ok"], newest_id=result["newest_id"], attempted=result["attempted"], failed_batches=result["failed_batches"], error=None, phase="done")
     except asyncio.CancelledError:
-        _touch_clear_job(ok=False, error="Cancelled", phase="cancelled")
+        _touch_clear_job(group, ok=False, error="Cancelled", phase="cancelled")
         raise
     except Exception as exc:
-        logger.exception("Full group chat clear failed")
-        _touch_clear_job(ok=False, error=str(exc)[:400], phase="error")
+        logger.exception("Full group chat clear failed for %s", group)
+        _touch_clear_job(group, ok=False, error=str(exc)[:400], phase="error")
     finally:
-        _touch_clear_job(running=False)
+        _touch_clear_job(group, running=False)
 
 
 async def answer_callback_query(callback_query_id: str) -> None:

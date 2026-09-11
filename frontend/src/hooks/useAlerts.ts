@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import apiClient from "@/lib/apiClient";
+import { JoinGroup } from "@/lib/joinGroup";
 import { AlertConfig, AlertStateItem, AlertStatus, ClearGroupChatStatus } from "@/types";
 
 export function useAlertStatus() {
@@ -34,23 +35,30 @@ export function useAlertState() {
   });
 }
 
+export type SendTarget = "sb" | "vcs" | "both";
+
+type SendResult = { status: string; sent: string[]; errors: Record<string, string> };
+
 export function useSendTestAlert() {
   return useMutation({
-    mutationFn: async () => (await apiClient.post<{ status: string }>("/api/alerts/test")).data,
+    mutationFn: async (target: SendTarget = "sb") =>
+      (await apiClient.post<SendResult>(`/api/alerts/test?target=${target}`)).data,
   });
 }
 
 export function useSendGroupMessage() {
   return useMutation({
-    mutationFn: async (text: string) =>
-      (await apiClient.post<{ status: string }>("/api/alerts/message", { text })).data,
+    mutationFn: async ({ text, target }: { text: string; target: SendTarget }) =>
+      (await apiClient.post<SendResult>("/api/alerts/message", { text, target })).data,
   });
 }
 
-export function useClearGroupChatStatus() {
+// Clear jobs are per group, so the cache key carries the group.
+export function useClearGroupChatStatus(group: JoinGroup) {
   return useQuery({
-    queryKey: ["alerts", "clear-chats"],
-    queryFn: async () => (await apiClient.get<ClearGroupChatStatus>("/api/alerts/clear-chats")).data,
+    queryKey: ["alerts", "clear-chats", group],
+    queryFn: async () =>
+      (await apiClient.get<ClearGroupChatStatus>(`/api/alerts/clear-chats?group=${group}`)).data,
     refetchInterval: (query) => (query.state.data?.running ? 1000 : false),
   });
 }
@@ -58,10 +66,11 @@ export function useClearGroupChatStatus() {
 export function useStartClearGroupChat() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async () => (await apiClient.post<ClearGroupChatStatus>("/api/alerts/clear-chats")).data,
-    onSuccess: (data) => {
-      queryClient.setQueryData(["alerts", "clear-chats"], data);
-      queryClient.invalidateQueries({ queryKey: ["alerts", "clear-chats"] });
+    mutationFn: async (group: JoinGroup) =>
+      (await apiClient.post<ClearGroupChatStatus>(`/api/alerts/clear-chats?group=${group}`)).data,
+    onSuccess: (data, group) => {
+      queryClient.setQueryData(["alerts", "clear-chats", group], data);
+      queryClient.invalidateQueries({ queryKey: ["alerts", "clear-chats", group] });
     },
   });
 }
@@ -69,10 +78,11 @@ export function useStartClearGroupChat() {
 export function useCancelClearGroupChat() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: async () => (await apiClient.delete<ClearGroupChatStatus>("/api/alerts/clear-chats")).data,
-    onSuccess: (data) => {
-      queryClient.setQueryData(["alerts", "clear-chats"], data);
-      queryClient.invalidateQueries({ queryKey: ["alerts", "clear-chats"] });
+    mutationFn: async (group: JoinGroup) =>
+      (await apiClient.delete<ClearGroupChatStatus>(`/api/alerts/clear-chats?group=${group}`)).data,
+    onSuccess: (data, group) => {
+      queryClient.setQueryData(["alerts", "clear-chats", group], data);
+      queryClient.invalidateQueries({ queryKey: ["alerts", "clear-chats", group] });
     },
   });
 }

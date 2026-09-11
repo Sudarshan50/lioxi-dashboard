@@ -1,6 +1,6 @@
 import html
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +16,7 @@ from app.services.alert_service import (
     set_payable_settled,
 )
 from app.services.account_service import AccountNotFoundError
+from app.services.join_group import GROUP_SB, GROUPS, normalize_group
 from app.services.sync_scheduler import apply_azure_sync_interval, apply_sync_interval
 from app.services.telegram_bot import poller_snapshot, start_clear_group_chat
 from app.services.telegram_service import (
@@ -43,11 +44,13 @@ async def get_status(db: AsyncSession = Depends(get_db)):
     settings = get_settings()
     config = await get_alert_config(db)
     return {
-        "telegram_configured": is_configured(),
+        "telegram_configured": any(is_configured(group) for group in GROUPS),
         "chat_id_set": bool(settings.telegram_chat_id),
+        "chat_ids_set": {group: is_configured(group) for group in GROUPS},
         "admin_count": len(settings.telegram_admin_id_set),
         "alerts_enabled": config["enabled"],
         "clear_chats": clear_group_snapshot(),
+        "clear_chats_by_group": {group: clear_group_snapshot(group) for group in GROUPS},
         "bot_poller": poller_snapshot(),
     }
 
@@ -105,6 +108,40 @@ async def update_at_cap_manual(
 
 class GroupMessagePayload(BaseModel):
     text: str = Field(min_length=1, max_length=3900)
+    # "sb", "vcs" or "both". Defaults to SB, the historical destination.
+    target: str = Field(default=GROUP_SB, max_length=8)
+
+
+def _targets(raw: str | None) -> list[str]:
+    """Explicit fan-out list. 'both' is the only way to reach two chats.
+
+    An unrecognised target is rejected rather than defaulted: silently falling
+    back to SB would deliver a message to a group the admin did not choose.
+    """
+    wanted = (raw or "").strip().lower()
+    if wanted == "both":
+        return list(GROUPS)
+    if wanted not in GROUPS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown target {raw!r}. Use {', '.join(GROUPS)} or both.",
+        )
+    return [wanted]
+
+
+async def _send_to_targets(text: str, raw_target: str | None) -> dict:
+    groups = _targets(raw_target)
+    sent: list[str] = []
+    errors: dict[str, str] = {}
+    for group in groups:
+        try:
+            await send_message(text, group=group)
+            sent.append(group)
+        except TelegramError as exc:
+            errors[group] = str(exc)
+    if not sent:
+        raise HTTPException(status_code=400, detail="; ".join(errors.values()) or "Send failed.")
+    return {"status": "sent", "sent": sent, "errors": errors}
 
 
 @router.post("/message")
@@ -112,33 +149,32 @@ async def send_group_message(payload: GroupMessagePayload):
     text = payload.text.strip()
     if not text:
         raise HTTPException(status_code=400, detail="Message is empty.")
-    try:
-        await send_message(html.escape(text))
-    except TelegramError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "sent"}
+    return await _send_to_targets(html.escape(text), payload.target)
 
 
 @router.get("/clear-chats")
-async def read_clear_group_chat():
-    return clear_group_snapshot()
+async def read_clear_group_chat(group: str = Query(default=GROUP_SB, max_length=8)):
+    return clear_group_snapshot(group)
 
 
 @router.post("/clear-chats")
-async def start_clear_group():
+async def start_clear_group(group: str = Query(default=GROUP_SB, max_length=8)):
     try:
-        return await start_clear_group_chat()
+        return await start_clear_group_chat(group)
     except TelegramError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.delete("/clear-chats")
-async def stop_clear_group():
-    return await cancel_clear_group_chat()
+async def stop_clear_group(group: str = Query(default=GROUP_SB, max_length=8)):
+    return await cancel_clear_group_chat(group)
 
 
 @router.post("/test")
-async def send_test_alert(db: AsyncSession = Depends(get_db)):
+async def send_test_alert(
+    db: AsyncSession = Depends(get_db),
+    target: str = Query(default=GROUP_SB, max_length=8),
+):
     config = await get_alert_config(db)
     levels = " and ".join(f"<b>{t}%</b>" for t in config["thresholds"])
     buffer = config.get("overspend_buffer_usd", 250)
@@ -148,11 +184,7 @@ async def send_test_alert(db: AsyncSession = Depends(get_db)):
         f"NewAPI spend hits {levels} of its Azure credit grant. Channels are\n"
         f"<b>auto-disabled</b> when NewAPI spend reaches grant + ${buffer:,.0f}."
     )
-    try:
-        await send_message(sample)
-    except TelegramError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"status": "sent"}
+    return await _send_to_targets(sample, target)
 
 
 @router.post("/check")

@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.config import get_settings
 from app.models.app_setting import AppSetting
 from app.repositories.account_repository import AccountRepository
+from app.services.join_group import GROUPS, normalize_group
 from app.services import telegram_service
 from app.services.account_service import AccountNotFoundError
 logger = logging.getLogger(__name__)
@@ -266,13 +267,20 @@ def _format_exhausted_alert(
     return f"⛔ <b>Spend hit the stop point</b>\n\n{_account_card(account)}\n\n{action}"
 
 
-async def _send_spaced(text: str, sent_so_far: int) -> None:
-    # Telegram allows ~20 messages/min per group; space out bursts.
+async def _send_spaced(text: str, sent_so_far: int, group: str | None = None) -> bool:
+    """Send one alert, pacing bursts. False means nothing was sent.
+
+    Telegram allows ~20 messages/min per chat, and the count is per group
+    because each chat has its own limit. A running clear suppresses the send;
+    the caller must not then record the alert as delivered, or the account's
+    alert level advances and the warning is never re-sent.
+    """
     if sent_so_far:
         await asyncio.sleep(4)
-    if telegram_service.group_clear_running():
-        return
-    await telegram_service.send_message(text)
+    if telegram_service.group_clear_running(group):
+        return False
+    await telegram_service.send_message(text, group=group)
+    return True
 
 
 async def alert_state(session: AsyncSession) -> list[dict]:
@@ -368,17 +376,24 @@ async def check_new_api_credit_alerts(session: AsyncSession) -> dict:
     from app.services.new_api_service import gateway_still_live, set_gateway_status
 
     config = await get_alert_config(session)
-    notify = telegram_service.is_configured() and bool(config["enabled"])
+    alerts_on = bool(config["enabled"])
+    # Per group: a group with no chat id configured simply stays silent. Its
+    # alerts are never redirected to the other group's chat.
+    notify_group = {
+        group: alerts_on and telegram_service.is_configured(group) for group in GROUPS
+    }
     thresholds: list[int] = config["thresholds"]
     rearm_margin: float = config["rearm_margin"]
     buffer: float = float(config["overspend_buffer_usd"])
 
     accounts = await AccountRepository(session).list_all()
-    sent = 0
+    sent_by_group: dict[str, int] = {group: 0 for group in GROUPS}
     auto_disabled: list[str] = []
     for account in accounts:
         if account.new_api_gateway is None:
             continue
+        group = normalize_group(getattr(account, "group_tag", None))
+        notify = notify_group[group]
         previous = min(account.new_api_alert_level or 0, EXHAUSTED_LEVEL)
         live = gateway_still_live(account)
 
@@ -408,12 +423,14 @@ async def check_new_api_credit_alerts(session: AsyncSession) -> dict:
             )
             if should_announce:
                 try:
-                    await _send_spaced(
+                    delivered = await _send_spaced(
                         _format_exhausted_alert(account, flipped, flip_error, still_live, buffer),
-                        sent,
+                        sent_by_group[group],
+                        group,
                     )
-                    sent += 1
-                    account.new_api_alert_level = EXHAUSTED_LEVEL
+                    if delivered:
+                        sent_by_group[group] += 1
+                        account.new_api_alert_level = EXHAUSTED_LEVEL
                 except Exception:
                     logger.warning("Telegram exhausted alert failed for %s", account.name, exc_info=True)
             elif not still_live and previous < EXHAUSTED_LEVEL:
@@ -437,20 +454,30 @@ async def check_new_api_credit_alerts(session: AsyncSession) -> dict:
 
         if level > previous:
             try:
-                await _send_spaced(_format_threshold_alert(account, level, percent), sent)
-                sent += 1
-                account.new_api_alert_level = level
+                if await _send_spaced(
+                    _format_threshold_alert(account, level, percent), sent_by_group[group], group
+                ):
+                    sent_by_group[group] += 1
+                    account.new_api_alert_level = level
             except Exception:
                 logger.warning("Telegram alert failed for %s", account.name, exc_info=True)
         elif level < previous and percent < previous - rearm_margin:
             account.new_api_alert_level = level
 
     await session.commit()
+    sent = sum(sent_by_group.values())
     if sent or auto_disabled:
-        logger.info("Credit alerts sent: %d, auto-disabled: %s", sent, auto_disabled or "none")
-    summary = {"sent": sent, "auto_disabled": auto_disabled}
-    if not telegram_service.is_configured():
-        summary["skipped"] = "telegram not configured (auto-disable still ran)"
-    elif not config["enabled"]:
-        summary["skipped"] = "alerts paused (auto-disable still ran)"
+        logger.info(
+            "Credit alerts sent: %d (%s), auto-disabled: %s",
+            sent,
+            ", ".join(f"{g}={n}" for g, n in sent_by_group.items()),
+            auto_disabled or "none",
+        )
+    summary = {"sent": sent, "sent_by_group": sent_by_group, "auto_disabled": auto_disabled}
+    if not any(notify_group.values()):
+        summary["skipped"] = (
+            "alerts paused (auto-disable still ran)"
+            if alerts_on
+            else "telegram not configured (auto-disable still ran)"
+        )
     return summary

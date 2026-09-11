@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Badge from "@/components/ui/Badge";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
+import GroupBadge from "@/components/ui/GroupBadge";
 import Input from "@/components/ui/Input";
 import Modal from "@/components/ui/Modal";
 import Select from "@/components/ui/Select";
@@ -20,6 +21,7 @@ import {
   useSaveAlertConfig,
   useSendGroupMessage,
   useSendTestAlert,
+  SendTarget,
   useSetAtCapManual,
   useSetPayableSettled,
   useStartClearGroupChat,
@@ -27,6 +29,7 @@ import {
 import { formatCurrency, formatRelative } from "@/lib/format";
 import { amountPayableUsd, brokerageUsd, downloadPayableCsv, payablePercentLabel } from "@/lib/payable";
 import { matchesOwner, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
+import { GROUP_SB, JOIN_GROUPS, JoinGroup, groupLabel, matchesGroup, resolveGroup } from "@/lib/joinGroup";
 import { toastDismiss, toastError, toastSuccess } from "@/lib/toast";
 
 type AlertSort =
@@ -135,6 +138,7 @@ function matchesAlertSearch(item: AlertStateItem, rawQuery: string): boolean {
       item.deployed_at ? formatRelative(item.deployed_at) : "",
       item.new_api_name,
       item.owner_tag,
+      groupLabel(resolveGroup(null, item.new_api_name)),
       item.endpoint,
       item.gateway,
       item.exhausted ? "at cap" : "",
@@ -152,11 +156,14 @@ export default function AlertsPage() {
   const config = useAlertConfig();
   const state = useAlertState();
   const saveConfig = useSaveAlertConfig();
+  // Where admin-triggered messages go, and which chat the clear tool targets.
+  const [sendTarget, setSendTarget] = useState<SendTarget>(GROUP_SB);
+  const [clearGroup, setClearGroup] = useState<JoinGroup>(GROUP_SB);
   const sendTest = useSendTestAlert();
   const sendGroup = useSendGroupMessage();
   const clearChats = useStartClearGroupChat();
   const cancelClear = useCancelClearGroupChat();
-  const clearStatus = useClearGroupChatStatus();
+  const clearStatus = useClearGroupChatStatus(clearGroup);
   const runCheck = useRunAlertCheck();
   const setPayableSettled = useSetPayableSettled();
   const setAtCapManual = useSetAtCapManual();
@@ -170,6 +177,7 @@ export default function AlertsPage() {
   const [alertSort, setAlertSort] = useState<AlertSort>("percent");
   const [search, setSearch] = useState("");
   const [ownerFilter, setOwnerFilter] = useState("all");
+  const [joinGroupFilter, setJoinGroupFilter] = useState("all");
   const [newThreshold, setNewThreshold] = useState("");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -269,8 +277,8 @@ export default function AlertsPage() {
     setMessage(null);
     setError(null);
     try {
-      await sendTest.mutateAsync();
-      setMessage("Test message sent to the Telegram group.");
+      const result = await sendTest.mutateAsync(sendTarget);
+      setMessage(`Test message sent to ${result.sent.map(groupLabel).join(" and ")}.`);
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? "Could not send the test message.");
     }
@@ -299,7 +307,7 @@ export default function AlertsPage() {
     setMessage(null);
     setError(null);
     try {
-      await clearChats.mutateAsync();
+      await clearChats.mutateAsync(clearGroup);
       setClearChatsOpen(false);
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? "Could not start the group chat clear.");
@@ -315,22 +323,26 @@ export default function AlertsPage() {
       return;
     }
     try {
-      await sendGroup.mutateAsync(text);
+      const result = await sendGroup.mutateAsync({ text, target: sendTarget });
       setGroupNote("");
-      setMessage("Message sent to the Telegram group.");
+      setMessage(`Message sent to ${result.sent.map(groupLabel).join(" and ")}.`);
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? "Could not send the message.");
     }
   }
 
   const owner = ownerFilter === "all" ? null : ownerFilter;
+  const joinGroup = joinGroupFilter === "all" ? null : (joinGroupFilter as JoinGroup);
   const ownerOptions = useMemo(() => uniqueOwners(state.data ?? []), [state.data]);
   const visibleAlertState = useMemo(
     () =>
       (state.data ?? []).filter(
-        (item) => matchesOwner(item.owner_tag, owner) && matchesAlertSearch(item, search)
+        (item) =>
+          matchesOwner(item.owner_tag, owner) &&
+          matchesGroup({ new_api_name: item.new_api_name }, joinGroup) &&
+          matchesAlertSearch(item, search)
       ),
-    [owner, search, state.data]
+    [joinGroup, owner, search, state.data]
   );
   const sortedAlertState = useMemo(
     () => sortAlertState(visibleAlertState, alertSort),
@@ -584,6 +596,23 @@ export default function AlertsPage() {
             <label htmlFor="group-note" className="text-xs font-medium text-gray-400">
               Message to group
             </label>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs font-medium text-gray-400">Send to</span>
+              {(["sb", "vcs", "both"] as SendTarget[]).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => setSendTarget(option)}
+                  className={`rounded-full border px-3 py-1 text-xs font-medium transition-colors ${
+                    sendTarget === option
+                      ? "border-accent/40 bg-accent/15 text-accent"
+                      : "border-white/[0.08] text-gray-400 hover:border-white/[0.16] hover:text-gray-200"
+                  }`}
+                >
+                  {option === "both" ? "Both" : groupLabel(option)}
+                </button>
+              ))}
+            </div>
             <textarea
               id="group-note"
               value={groupNote}
@@ -594,7 +623,9 @@ export default function AlertsPage() {
               className="w-full min-w-0 resize-y rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm leading-relaxed text-gray-100 outline-none transition-colors placeholder:text-gray-600 focus:border-accent"
             />
             <div className="flex items-center justify-between gap-2">
-              <p className="text-xs text-gray-500">Sent as plain text to the linked group.</p>
+              <p className="text-xs text-gray-500">
+                Sent as plain text to {sendTarget === "both" ? "both groups" : `the ${groupLabel(sendTarget)} group`}.
+              </p>
               <span className="shrink-0 text-xs tabular-nums text-gray-600">
                 {groupNote.trim().length}/3900
               </span>
@@ -614,6 +645,19 @@ export default function AlertsPage() {
             <Button variant="secondary" onClick={handleRunCheck} isLoading={runCheck.isPending}>
               <Play size={15} /> Run check now
             </Button>
+            <select
+              value={clearGroup}
+              onChange={(event) => setClearGroup(event.target.value as JoinGroup)}
+              disabled={clearingGroup}
+              aria-label="Group to clear"
+              className="rounded-lg border border-surface-border bg-surface px-2.5 py-2 text-xs text-gray-100 outline-none focus:border-accent disabled:opacity-60"
+            >
+              {JOIN_GROUPS.map((option) => (
+                <option key={option} value={option}>
+                  Clear: {groupLabel(option)}
+                </option>
+              ))}
+            </select>
             <Button
               variant="danger"
               onClick={() => setClearChatsOpen(true)}
@@ -625,7 +669,7 @@ export default function AlertsPage() {
                 ? clearJob?.phase === "finding" || !clearJob?.total
                   ? "Finding messages…"
                   : `Clearing ${clearJob.attempted.toLocaleString()}/${clearJob.total.toLocaleString()}`
-                : "Clear group chat"}
+                : `Clear ${groupLabel(clearGroup)} chat`}
             </Button>
             {clearingGroup && (
               <Button
@@ -633,7 +677,7 @@ export default function AlertsPage() {
                 onClick={async () => {
                   setError(null);
                   try {
-                    await cancelClear.mutateAsync();
+                    await cancelClear.mutateAsync(clearGroup);
                     setMessage("Group clear cancelled.");
                   } catch (err: any) {
                     setError(err?.response?.data?.detail ?? "Could not cancel the group clear.");
@@ -691,6 +735,21 @@ export default function AlertsPage() {
                     </button>
                   )}
                 </div>
+              </div>
+              <div className="w-full sm:w-36">
+                <Select
+                  id="alert-join-group"
+                  label="Join group"
+                  value={joinGroupFilter}
+                  onChange={(e) => setJoinGroupFilter(e.target.value)}
+                >
+                  <option value="all">All</option>
+                  {JOIN_GROUPS.map((option) => (
+                    <option key={option} value={option}>
+                      {groupLabel(option)}
+                    </option>
+                  ))}
+                </Select>
               </div>
               <div className="w-full sm:w-44">
                 <Select id="alert-owner" label="Tag" value={ownerFilter} onChange={(e) => setOwnerFilter(e.target.value)}>
@@ -845,6 +904,7 @@ export default function AlertsPage() {
                               </span>
                             )}
                             {item.owner_tag && <StatusPill tone="violet">{item.owner_tag}</StatusPill>}
+                            <GroupBadge channel={item.new_api_name} />
                             {item.gateway && !item.gateway_enabled && <StatusPill tone="amber">disabled</StatusPill>}
                             {!item.gateway && <StatusPill tone="amber" title="No NewAPI channel matched">no NewAPI</StatusPill>}
                             {item.alert_level >= 100 && item.exhausted && item.exhausted_reason === "overspent" && (
