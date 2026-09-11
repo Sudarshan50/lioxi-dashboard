@@ -148,6 +148,20 @@ async def _ensure_group_tag_indexes(conn) -> None:
 
 
 async def _ensure_submit_indexes(conn) -> None:
+    """Create the unique live-subscription index, once.
+
+    Everything here used to re-run on every boot: the DELETE destroyed rows at
+    each restart, and the drop/recreate rebuilt the index under an ACCESS
+    EXCLUSIVE lock held for the whole of init. Both only ever mattered while
+    the index was missing, so skip them once it exists.
+    """
+    exists = (
+        await conn.execute(
+            text("SELECT 1 FROM pg_indexes WHERE indexname = 'uq_sp_submit_live_subscription'")
+        )
+    ).scalar()
+    if exists:
+        return
     # Drop extras so the unique live-subscription index can be created.
     await conn.execute(
         text(
@@ -163,7 +177,6 @@ async def _ensure_submit_indexes(conn) -> None:
             """
         )
     )
-    await conn.execute(text("DROP INDEX IF EXISTS uq_sp_submit_live_subscription"))
     await conn.execute(
         text(
             """
@@ -177,12 +190,28 @@ async def _ensure_submit_indexes(conn) -> None:
     )
 
 
+ELEVATED_BACKFILL_KEY = "sp_elevated_access_backfilled"
+
+
 async def _ensure_sp_elevated_access(conn) -> None:
+    """Backfill elevated_access for pre-existing deploys, once.
+
+    This re-ran on every boot and only ever sets TRUE, so an access grant an
+    admin had deliberately revoked came back at the next restart. It is a
+    one-time backfill of legacy rows, so record that it ran.
+    """
     await conn.execute(
         text(
             "ALTER TABLE azure_service_principals ADD COLUMN IF NOT EXISTS elevated_access BOOLEAN NOT NULL DEFAULT FALSE"
         )
     )
+    done = (
+        await conn.execute(
+            text("SELECT 1 FROM app_settings WHERE key = :key"), {"key": ELEVATED_BACKFILL_KEY}
+        )
+    ).scalar()
+    if done:
+        return
     await conn.execute(
         text(
             """
@@ -205,6 +234,12 @@ async def _ensure_sp_elevated_access(conn) -> None:
                )
             """
         )
+    )
+    await conn.execute(
+        text(
+            "INSERT INTO app_settings (key, value) VALUES (:key, '1') ON CONFLICT (key) DO NOTHING"
+        ),
+        {"key": ELEVATED_BACKFILL_KEY},
     )
 
 
