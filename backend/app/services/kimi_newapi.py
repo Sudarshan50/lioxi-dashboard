@@ -42,7 +42,13 @@ from app.services.new_api_service import (
 )
 from app.services.deploy_defaults import DEFAULT_PRIORITY, DEFAULT_WEIGHT
 from app.services.openai_key_store import decrypt_foundry_key
-from app.services.join_group import GROUP_SB, GROUP_VCS, GROUPS, normalize_group
+from app.services.join_group import (
+    GROUP_SB,
+    GROUP_VCS,
+    GROUPS,
+    normalize_group,
+    resolve_group_for_resource,
+)
 from app.services.owner_tag import resource_key
 
 logger = logging.getLogger(__name__)
@@ -385,19 +391,9 @@ async def _group_for_account(
     """Group from the deploy payload, else the one the portal account was
     onboarded under. A re-deploy or a NewAPI retry that carries no group must
     not move a VCS resource into the SB name series."""
-    stated = (account.get("group_tag") or "").strip()
-    if stated:
-        return normalize_group(stated)
-    if session is None or not subscription_id or not resource_name:
-        return GROUP_SB
-    try:
-        portal = await AccountRepository(session).get_by_subscription_and_resource(
-            subscription_id, resource_name
-        )
-    except Exception:  # noqa: BLE001 - naming must never block a deploy
-        logger.warning("Could not read the portal group for %s", resource_name, exc_info=True)
-        return GROUP_SB
-    return normalize_group(getattr(portal, "group_tag", None) if portal else None)
+    return await resolve_group_for_resource(
+        session, account.get("group_tag"), subscription_id, resource_name
+    )
 
 
 async def _hosts_for(_session: AsyncSession | None, result: KimiDeployResult, account: dict[str, str] | None) -> set[str]:

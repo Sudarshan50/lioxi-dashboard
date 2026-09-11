@@ -16,7 +16,10 @@ portal account name (slugified), never from the owner tag.
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 GROUP_SB = "sb"
 GROUP_VCS = "vcs"
@@ -73,6 +76,38 @@ def looks_like_managed_stack(resource_name: str | None, resource_group: str | No
         if re.fullmatch(rf"{re.escape(slug)}{tail}-[a-z0-9]{{6}}", name):
             return True
     return False
+
+
+async def resolve_group_for_resource(
+    session,
+    stated: str | None,
+    subscription_id: str,
+    resource_name: str = "",
+) -> str:
+    """Group a deploy belongs to: the payload's, else the portal account's.
+
+    Falls back to the subscription alone when the resource name does not match,
+    because a purge-and-redeploy mints a new random suffix and would otherwise
+    look like an unknown resource and silently drop the account back to SB.
+    Never raises: a naming lookup must not fail a deploy.
+    """
+    if (stated or "").strip():
+        return normalize_group(stated)
+    if session is None or not (subscription_id or "").strip():
+        return DEFAULT_GROUP
+    from app.repositories.account_repository import AccountRepository
+
+    try:
+        rows = await AccountRepository(session).list_by_subscription(subscription_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not read the portal group for %s", subscription_id, exc_info=True)
+        return DEFAULT_GROUP
+    if not rows:
+        return DEFAULT_GROUP
+    wanted = (resource_name or "").strip().lower()
+    exact = next((row for row in rows if (row.resource_name or "").strip().lower() == wanted), None)
+    match = exact or rows[0]
+    return normalize_group(getattr(match, "group_tag", None))
 
 
 def compact_person(name: str | None) -> str:

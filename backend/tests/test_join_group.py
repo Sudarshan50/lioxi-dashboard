@@ -155,40 +155,72 @@ class UniqueNameTests(unittest.TestCase):
 
 
 class GroupFallbackTests(unittest.TestCase):
-    """A NewAPI retry with no group in the payload must keep the account's own."""
+    """A deploy that carries no group must keep the account's own."""
 
-    def _resolve(self, account, portal):
-        from app.services import kimi_newapi
+    def _resolve(self, stated, rows, resource="jd-kimi-ab12cd"):
+        import app.repositories.account_repository as repo_module
 
         class _Repo:
             def __init__(self, _session):
                 pass
 
-            async def get_by_subscription_and_resource(self, _sub, _name):
-                return portal
+            async def list_by_subscription(self, _sub):
+                return list(rows)
 
-        with patch.object(kimi_newapi, "AccountRepository", _Repo):
+        with patch.object(repo_module, "AccountRepository", _Repo):
+            from app.services.join_group import resolve_group_for_resource
+
             return asyncio.run(
-                kimi_newapi._group_for_account(object(), account, "sub-1", "jd-kimi-ab12cd")
+                resolve_group_for_resource(object(), stated, "sub-1", resource)
             )
 
     def test_payload_group_wins(self):
-        portal = SimpleNamespace(group_tag=GROUP_SB)
-        self.assertEqual(self._resolve({"group_tag": "vcs"}, portal), GROUP_VCS)
+        rows = [SimpleNamespace(resource_name="jd-kimi-ab12cd", group_tag=GROUP_SB)]
+        self.assertEqual(self._resolve("vcs", rows), GROUP_VCS)
 
     def test_falls_back_to_the_portal_account(self):
-        portal = SimpleNamespace(group_tag=GROUP_VCS)
-        self.assertEqual(self._resolve({}, portal), GROUP_VCS)
+        rows = [SimpleNamespace(resource_name="jd-proxy-ab12cd", group_tag=GROUP_VCS)]
+        self.assertEqual(self._resolve(None, rows, "jd-proxy-ab12cd"), GROUP_VCS)
 
-    def test_unknown_account_is_sb(self):
-        self.assertEqual(self._resolve({}, None), GROUP_SB)
+    def test_subscription_fallback_survives_a_new_random_suffix(self):
+        # After a purge and redeploy the rand6 changes, so the exact resource
+        # name no longer matches; the subscription still identifies the owner.
+        rows = [SimpleNamespace(resource_name="jd-proxy-OLDSUF", group_tag=GROUP_VCS)]
+        self.assertEqual(self._resolve(None, rows, "jd-proxy-newsuf"), GROUP_VCS)
+
+    def test_exact_resource_match_wins_over_a_sibling(self):
+        rows = [
+            SimpleNamespace(resource_name="other-kimi-111111", group_tag=GROUP_SB),
+            SimpleNamespace(resource_name="jd-proxy-ab12cd", group_tag=GROUP_VCS),
+        ]
+        self.assertEqual(self._resolve(None, rows, "jd-proxy-ab12cd"), GROUP_VCS)
+
+    def test_unknown_subscription_is_sb(self):
+        self.assertEqual(self._resolve(None, []), GROUP_SB)
 
     def test_no_session_is_sb(self):
-        from app.services import kimi_newapi
+        from app.services.join_group import resolve_group_for_resource
 
         self.assertEqual(
-            asyncio.run(kimi_newapi._group_for_account(None, {}, "sub-1", "res")), GROUP_SB
+            asyncio.run(resolve_group_for_resource(None, None, "sub-1", "res")), GROUP_SB
         )
+
+    def test_a_repository_error_never_fails_the_deploy(self):
+        import app.repositories.account_repository as repo_module
+
+        class _Boom:
+            def __init__(self, _session):
+                pass
+
+            async def list_by_subscription(self, _sub):
+                raise RuntimeError("db down")
+
+        with patch.object(repo_module, "AccountRepository", _Boom):
+            from app.services.join_group import resolve_group_for_resource
+
+            self.assertEqual(
+                asyncio.run(resolve_group_for_resource(object(), None, "sub-1", "r")), GROUP_SB
+            )
 
 
 if __name__ == "__main__":

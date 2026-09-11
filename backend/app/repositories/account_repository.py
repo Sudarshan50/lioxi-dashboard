@@ -33,6 +33,14 @@ class AccountRepository:
         )
         return result.scalars().first()
 
+    async def list_by_subscription(self, subscription_id: str) -> list[ProviderAccount]:
+        result = await self._session.execute(
+            select(ProviderAccount)
+            .where(func.lower(ProviderAccount.subscription_id) == subscription_id.strip().lower())
+            .order_by(ProviderAccount.id)
+        )
+        return list(result.scalars())
+
     async def create(self, account: ProviderAccount) -> ProviderAccount:
         self._session.add(account)
         try:

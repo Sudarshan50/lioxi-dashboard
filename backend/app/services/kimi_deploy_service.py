@@ -39,7 +39,7 @@ from app.services.azure_inventory_cache import (
     get_cached_azure_inventory,
     store_azure_inventory,
 )
-from app.services.join_group import STACK_SUFFIXES, normalize_group
+from app.services.join_group import STACK_SUFFIXES, normalize_group, resolve_group_for_resource
 from app.services.owner_tag import apply_person_associated_tags, person_from_payload, resource_key
 from app.services.service_principal_store import email_or_none
 
@@ -1066,6 +1066,25 @@ def _job_workers(jobs: int, count: int) -> int:
     return min(max(1, jobs), max(1, count), DEPLOY_JOBS_MAX)
 
 
+async def hydrate_group_tags(
+    accounts: list[dict[str, str]], session: AsyncSession | None
+) -> None:
+    """Stamp each payload with its Join group before the deploy script runs.
+
+    The script picks the Azure stack suffix from group_tag and has no database
+    of its own, so a payload that omits the group -- every deploy started from
+    the Deploy K3 page -- would otherwise build SB-named resources for a VCS
+    account while NewAPI named its channel cs-proxy-N.
+    """
+    for account in accounts:
+        account["group_tag"] = await resolve_group_for_resource(
+            session,
+            account.get("group_tag"),
+            account.get("AZURE_SUBSCRIPTION_ID") or "",
+            account.get("account_name") or "",
+        )
+
+
 async def deploy_accounts(
     raw_accounts: list[dict[str, Any]],
     jobs: int,
@@ -1080,6 +1099,7 @@ async def deploy_accounts(
         raise KimiDeployError(status.message)
 
     accounts = await prepare_accounts(raw_accounts, session, persist=persist_principals)
+    await hydrate_group_tags(accounts, session)
     module = load_deploy_module()
     workers = _job_workers(jobs, len(accounts))
     logger.info("Kimi K3 deploy started for %s account(s), jobs=%s", len(accounts), workers)
