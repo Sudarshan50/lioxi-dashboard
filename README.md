@@ -12,10 +12,10 @@ The production endpoints your models serve are never proxied. Azure identities u
 | **Accounts** | Add Azure tenants, discover Cognitive Services / Foundry resources, group accounts, sync now |
 | **Deploy K3** | Upload Azure credentials, deploy Kimi K3, attach NewAPI channels, scale TPM tiers, sync a Google Sheet inventory |
 | **Pending** | Approve or reject Join submissions (creates the monitoring SP and optional autodeploy) |
-| **Ban** | Enrollee allow-list, ban names, toggle Join auto-approve |
+| **Ban** | Enrollee allow-list, ban names, toggle Join auto-approve per group |
 | **Models** | Register deployments and per-million-token pricing |
 | **Alerts** | NewAPI spend headroom, payable export, Telegram test/group messages |
-| **Join** (`/join`) | Password-gated public wizard: Azure device-code login, pick a subscription, pick a name |
+| **Join** (`/join`) | Password-gated public wizard: Azure device-code login, pick a subscription, pick a name and a group |
 
 The sidebar also shows live host CPU / RAM / disk so you can see when Az CLI or deploy jobs are saturating the box.
 
@@ -117,10 +117,50 @@ Then **Accounts → Add account**: tenant ID, client ID, client secret, subscrip
 
 ### Join and Pending
 
-1. Member opens `/join`, unlocks with `JOIN_PASSWORD`, signs in with Azure device code, picks a subscription and an enrollee name.
-2. The portal creates a service principal and waits for approval (or auto-approves if enabled on **Ban**).
-3. Admins review **Pending**. Approve deploys Kimi when autodeploy is on; reject drops the request.
-4. **Ban** holds the enrollee list and a global auto-approve toggle.
+1. Member opens `/join`, unlocks with `JOIN_PASSWORD`, signs in with Azure device code, picks a subscription, an enrollee name, and a group (**SB** or **VCS**, SB by default).
+2. The portal creates a service principal and waits for approval (or auto-approves if that group's toggle is on under **Ban**).
+3. Admins review **Pending**. Approve deploys Kimi when autodeploy is on; reject drops the request. VCS rows carry a `VCS` badge.
+4. **Ban** holds the enrollee list and one auto-approve toggle per group.
+
+### SB and VCS groups
+
+Two member populations share one portal. The group is chosen on the Join wizard,
+stored on the request and on the portal account (`group_tag`, `sb` by default),
+and decided once at onboarding — a later re-deploy never moves an account
+between groups. Rows that predate the split read back as SB.
+
+The group changes exactly two things:
+
+| | SB | VCS |
+| --- | --- | --- |
+| Portal account name | `Lioxi-<Name>` | the enrolled name — `Ambarish` |
+| Azure stack | `rg-<slug>-kimi`, `<slug>-kimi-<rand>` | `rg-<slug>-proxy`, `<slug>-proxy-<rand>` |
+| O1 NewAPI channel | `kimi-k3-500k-proxy-X` | `cs-proxy-X` |
+
+Azure names always derive from the **portal account name** (slugified), never
+from the owner tag: `Lioxi-Gaurav1` gives `rg-lioxigaurav1-kimi`, `Ambarish`
+gives `rg-ambarish-proxy`. If a VCS member picked no name, the account falls
+back to the sign-in email initials (`john.doe@corp.com` → `jd-corp`) and then to
+the SB name, so a submission is never blocked.
+
+The `-kimi` / `-proxy` suffix is also the marker that says "this stack is ours".
+Reuse, cleanup and **deletion** guards all key off it, so both spellings must
+stay recognised for as long as any stack uses them — see `looks_like_stack` in
+`join_group.py` and `looks_like_kimi_stack` in `scripts/kimi_k3_deploy.py`.
+
+Everything else is shared: the name picked in the Join dropdown is the owner tag
+for both, the model deployment is `FW-Kimi-K3` in both (NewAPI routes on that
+name, so it is not renamed), and both channel series live in the same O1 pool —
+same tag, group, model and param overrides — so routing is common. The two name
+series count independently, and collisions get a numeric suffix.
+
+The **enrollee list is per group too**. Ban holds each name under SB or VCS,
+the Join dropdown offers only the names enrolled in the group being submitted,
+and a submission is rejected unless the picked name is on that group's list. The
+same person can be enrolled in both (uniqueness is `(name, group)`), and banning
+one side leaves the other alone. Every name that existed before the split is SB.
+
+Auto-approve is per group, so SB can be open while VCS is held for review.
 
 ### Deploy K3
 
@@ -156,7 +196,7 @@ If a secret ever lands in a commit, rotate it and remove it from history. Do not
 
 ## Notes
 
-- Tables are created with `Base.metadata.create_all` on startup. There is no Alembic yet; add it before changing schema on a database you care about.
+- Tables are created with `Base.metadata.create_all` on startup, plus the idempotent `ADD COLUMN IF NOT EXISTS` passes in `app/database.py` for columns added to existing tables (`group_tag` among them). There is no Alembic yet; add it before changing schema on a database you care about.
 - Cost Management is best-effort. Some subscriptions rate-limit or block it. Estimated cost still works; billed cost may show 0.
 - Az CLI is the memory hog. The compose file caps the backend at 4 GiB and limits concurrent deploy / Az CLI work for a 4 vCPU / 8 GiB host.
 - License: MIT.
