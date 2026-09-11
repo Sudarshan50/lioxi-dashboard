@@ -10,6 +10,7 @@ import {
   invalidateAfterDeploy,
   startKimiDeployJob,
   useKimiAddNewApi,
+  useKimiCapacity,
   useKimiContentFilter,
   useKimiDeployDefaults,
   useKimiDeployJob,
@@ -30,6 +31,7 @@ import {
 } from "@/hooks/useKimiDeploy";
 import { canonicalOwner } from "@/lib/ownerTag";
 import { hasQuotaUpdate, nextQuotaTierLabel, quotaTierLabel, quotaTierNumber } from "@/lib/tpmTier";
+import { groupLabel, resolveGroup } from "@/lib/joinGroup";
 import { toastDismiss, toastError, toastSuccess } from "@/lib/toast";
 import { AzureDeploySecret, parseAzureDeploySecretsArray, toKimiDeployPayload } from "@/lib/parseAzureCredentials";
 import { KimiDeployResult, KimiNewApiPool, KimiStoredAccount, KimiTestResult } from "@/types";
@@ -191,6 +193,7 @@ export default function DeployK3Page() {
     [pageAccounts]
   );
   const inventory = useKimiInventory(pagePayload, showDeployed && !deploying && !results);
+  const capacity = useKimiCapacity(showDeployed && !deploying);
   const inventoryRows = useMemo(
     () =>
       pagePayload.map((account, index) => {
@@ -283,6 +286,19 @@ export default function DeployK3Page() {
   const testableResults = displayed.filter((item) => item.ok && !item.removed && !item.pending);
   const pageFrom = listTotal === 0 ? 0 : safePage * PAGE_SIZE + 1;
   const pageTo = Math.min(listTotal, (safePage + 1) * PAGE_SIZE);
+  const deployedSummary = `${liveResults.length} live${
+    leftoverResults.length ? ` · ${leftoverResults.length} leftover` : ""
+  }${
+    displayed.filter((item) => item.new_api_present).length
+      ? ` · ${displayed.filter((item) => item.new_api_present).length} in NewAPI`
+      : ""
+  }${
+    listTotal > PAGE_SIZE
+      ? showAll
+        ? ` · all ${listTotal}`
+        : ` · ${pageFrom}–${pageTo} of ${listTotal}`
+      : ""
+  }`;
 
   useEffect(() => {
     setPage(0);
@@ -1052,25 +1068,23 @@ export default function DeployK3Page() {
             <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
               <div className="min-w-0 sm:max-w-md sm:flex-1">
                 <h2 className="text-sm font-semibold text-gray-200">Deployed</h2>
+                {capacity.data && capacity.data.accounts > 0 ? (
+                  <p className="text-xs text-gray-500">
+                    {pendingCount > 0 ? null : `${deployedSummary} · `}
+                    <span className="font-semibold text-amber-300">
+                      {formatQuotaTokens(capacity.data.tpm)} TPM
+                    </span>
+                    {" · "}
+                    <span className="font-semibold text-amber-300">
+                      {formatQuotaTokens(capacity.data.rpm)} RPM
+                    </span>
+                  </p>
+                ) : pendingCount === 0 ? (
+                  <p className="text-xs text-gray-500">{deployedSummary}</p>
+                ) : null}
                 {pendingCount > 0 ? (
                   <LookupProgress done={progressItems.length - pendingCount} total={progressItems.length} />
-                ) : (
-                  <p className="text-xs text-gray-500">
-                    {`${liveResults.length} live${
-                      leftoverResults.length ? ` · ${leftoverResults.length} leftover` : ""
-                    }${
-                      displayed.filter((item) => item.new_api_present).length
-                        ? ` · ${displayed.filter((item) => item.new_api_present).length} in NewAPI`
-                        : ""
-                    }${
-                      listTotal > PAGE_SIZE
-                        ? showAll
-                          ? ` · all ${listTotal}`
-                          : ` · ${pageFrom}–${pageTo} of ${listTotal}`
-                        : ""
-                    }`}
-                  </p>
-                )}
+                ) : null}
               </div>
               <div className="flex flex-wrap items-end gap-2">
                 <label className="flex flex-col gap-1 text-[11px] text-gray-500">
@@ -1505,16 +1519,15 @@ function quotaFields(row: KimiDeployResult): Partial<KimiDeployResult> {
   };
 }
 
+function formatQuotaTokens(value?: number | null) {
+  if (value == null) return "—";
+  if (value >= 1_000_000) return `${value / 1_000_000}M`;
+  if (value >= 1_000) return `${value / 1_000}k`;
+  return String(value);
+}
+
 function formatQuotaPair(tpm?: number | null, rpm?: number | null) {
-  const tokens =
-    tpm == null
-      ? "—"
-      : tpm >= 1_000_000
-        ? `${tpm / 1_000_000}M`
-        : tpm >= 1_000
-          ? `${tpm / 1_000}k`
-          : String(tpm);
-  return `${tokens} / ${rpm ?? "—"}`;
+  return `${formatQuotaTokens(tpm)} / ${rpm ?? "—"}`;
 }
 
 function resourceHost(value?: string | null) {
@@ -1638,6 +1651,7 @@ function matchesDeploySearch(item: KimiDeployResult, query: string, extraEmail?:
     item.subscription_name,
     item.subscription_id,
     item.owner_tag,
+    groupLabel(resolveGroup(null, item.new_api_name)),
     item.new_api_name,
     item.azure_openai_endpoint,
     item.resource_group,

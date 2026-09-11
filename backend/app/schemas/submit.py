@@ -21,6 +21,7 @@ class SubmitSessionSnapshot(BaseModel):
     status: str
     account_holder: str | None = None
     person_associated: str | None = None
+    group_tag: str = "sb"
     subscription_id: str | None = None
     subscription_name: str | None = None
     device_user_code: str | None = None
@@ -38,6 +39,8 @@ class SubmitNamesResponse(BaseModel):
 class SubmitCommitRequest(BaseModel):
     subscription_id: str = Field(min_length=1, max_length=64)
     person_associated: str = Field(min_length=1, max_length=64)
+    # "sb" or "vcs"; anything else is read as SB by the service.
+    group_tag: str = Field(default="sb", max_length=8)
 
 
 class JoinUnlockRequest(BaseModel):
@@ -48,6 +51,7 @@ class PendingRequestPublic(BaseModel):
     id: int
     status: str
     person_associated: str | None = None
+    group_tag: str = "sb"
     account_holder: str | None = None
     name: str | None = None
     subscription_id: str | None = None
@@ -61,12 +65,60 @@ class PendingRequestPublic(BaseModel):
     approved_at: datetime | None = None
     rejected_at: datetime | None = None
     can_retry_deploy: bool = False
+    credits_limit: float | None = None
+    credits_remaining: float | None = None
+    credits_used: float | None = None
+    credits_currency: str | None = None
+    credits_label: str | None = None
+    credits_available: bool = False
+    credits_fetched_at: datetime | None = None
+    credits_error: str | None = None
+    grant_usd: float | None = None
+    grant_tier: str | None = None
+
+
+class PendingGrantSummary(BaseModel):
+    total: int = 0
+    fetched: int = 0
+    missing: int = 0
+    failed: int = 0
+    pool_usd: float = 0
+    count_10k: int = 0
+    count_1k: int = 0
+    count_other: int = 0
+    pool_10k_usd: float = 0
+    pool_1k_usd: float = 0
+    fetched_at: datetime | None = None
+
+
+class PendingGrantAccount(BaseModel):
+    id: int
+    email: str | None = None
+    name: str | None = None
+    person_associated: str | None = None
+    group_tag: str = "sb"
+    subscription_id: str | None = None
+    credits_limit: float | None = None
+    credits_remaining: float | None = None
+    credits_currency: str | None = None
+    credits_available: bool = False
+    credits_fetched_at: datetime | None = None
+    credits_error: str | None = None
+    grant_usd: float | None = None
+    grant_tier: str | None = None
+
+
+class PendingGrantsResponse(BaseModel):
+    ok: bool = True
+    summary: PendingGrantSummary
+    accounts: list[PendingGrantAccount] = Field(default_factory=list)
 
 
 class PendingListResponse(BaseModel):
     requests: list[PendingRequestPublic]
     pending_count: int = 0
     failed_count: int = 0
+    grant_summary: PendingGrantSummary = Field(default_factory=PendingGrantSummary)
 
 
 class PendingDeclineResponse(BaseModel):
@@ -90,6 +142,8 @@ class PendingApproveAccepted(BaseModel):
 class PendingBatchApproveRequest(BaseModel):
     ids: list[int] | None = None
     retry: bool = False
+    # Restrict a no-ids sweep to one group. None means every group.
+    group: str | None = Field(default=None, max_length=8)
     new_api_priority: int | None = Field(default=None, ge=0, le=10000)
     new_api_weight: int | None = Field(default=None, ge=1, le=10000)
 

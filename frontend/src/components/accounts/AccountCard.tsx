@@ -12,8 +12,11 @@ import ManualResourceFields, {
   ManualResourceValues,
   parseCreditGrant,
 } from "@/components/accounts/ManualResourceFields";
+import GroupTagField from "@/components/accounts/GroupTagField";
 import OwnerTagField from "@/components/accounts/OwnerTagField";
 import Badge from "@/components/ui/Badge";
+import GroupBadge from "@/components/ui/GroupBadge";
+import { JoinGroup, normalizeGroup } from "@/lib/joinGroup";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Input from "@/components/ui/Input";
@@ -49,6 +52,7 @@ export default function AccountCard({ account }: { account: Account }) {
   const [isEditing, setIsEditing] = useState(false);
   const [nameDraft, setNameDraft] = useState(account.name);
   const [ownerTagDraft, setOwnerTagDraft] = useState(account.owner_tag ?? "");
+  const [groupDraft, setGroupDraft] = useState<JoinGroup>(normalizeGroup(account.group_tag));
   const [resources, setResources] = useState<DiscoveredResource[]>([]);
   const [selectedResourceId, setSelectedResourceId] = useState(account.resource_id);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -178,6 +182,7 @@ export default function AccountCard({ account }: { account: Account }) {
   async function startEditing() {
     setNameDraft(account.name);
     setOwnerTagDraft(account.owner_tag ?? "");
+    setGroupDraft(normalizeGroup(account.group_tag));
     setSelectedResourceId(account.resource_id);
     setCreditsLimitDraft(account.credits_limit != null ? String(account.credits_limit) : "");
     setManual({
@@ -294,11 +299,13 @@ export default function AccountCard({ account }: { account: Account }) {
       credits_limit?: number;
       credits_limit_manual?: boolean;
       owner_tag?: string;
+      group_tag?: string;
     } = {};
     if (trimmed !== account.name) payload.name = trimmed;
     const nextTag = ownerTagDraft.trim();
     const prevTag = (account.owner_tag ?? "").trim();
     if (nextTag !== prevTag) payload.owner_tag = nextTag;
+    if (groupDraft !== normalizeGroup(account.group_tag)) payload.group_tag = groupDraft;
     if (useManualResource) {
       if (!manual.resourceName.trim()) {
         setError("Resource name is required.");
@@ -419,6 +426,7 @@ export default function AccountCard({ account }: { account: Account }) {
                 </button>
               </div>
               <OwnerTagField value={ownerTagDraft} onChange={setOwnerTagDraft} id={`edit-owner-tag-${account.id}`} compact />
+              <GroupTagField value={groupDraft} onChange={setGroupDraft} id={`edit-group-tag-${account.id}`} compact />
               <div className="flex items-end gap-3">
                 <div className="min-w-0 flex-1">
                   {!useManualResource ? (
@@ -557,6 +565,7 @@ export default function AccountCard({ account }: { account: Account }) {
                     {account.owner_tag}
                   </Badge>
                 )}
+                <GroupBadge group={account.group_tag} channel={account.new_api_name} />
                 <button type="button" onClick={startEditing} className="text-gray-600 hover:text-gray-300" aria-label="Edit account">
                   <Pencil size={12} />
                 </button>

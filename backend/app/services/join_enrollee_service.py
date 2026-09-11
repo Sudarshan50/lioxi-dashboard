@@ -12,11 +12,13 @@ from app.models.azure_service_principal import AzureServicePrincipal
 from app.models.join_enrollee import JoinEnrollee
 from app.models.provider_account import ProviderAccount
 from app.models.sp_submit_request import SpSubmitRequest
+from app.services.join_group import GROUP_SB, GROUP_VCS, GROUPS, group_label, normalize_group
 from app.services.owner_tag import join_picker_name, parse_owner_tag
 
 logger = logging.getLogger(__name__)
 
-JOIN_AUTO_APPROVE_KEY = "join_auto_approve"
+# SB keeps the original key so an existing toggle survives the VCS split.
+JOIN_AUTO_APPROVE_KEYS = {GROUP_SB: "join_auto_approve", GROUP_VCS: "join_auto_approve_vcs"}
 JOIN_ENROLLEES_SEEDED_KEY = "join_enrollees_seeded"
 SEED_NAME = "Snig"
 
@@ -36,7 +38,9 @@ def normalize_enrollee_name(value: str | None) -> str:
 
 
 def normalize_auto_approve(payload: dict | None = None) -> bool:
-    data = payload or {}
+    # A hand-edited setting can be any JSON scalar; anything but an object
+    # means "off" rather than an AttributeError on every Join and Pending call.
+    data = payload if isinstance(payload, dict) else {}
     value = data.get("enabled", False)
     if isinstance(value, bool):
         return value
@@ -47,8 +51,9 @@ def normalize_auto_approve(payload: dict | None = None) -> bool:
     return False
 
 
-async def is_auto_approve_enabled(session: AsyncSession) -> bool:
-    row = await session.get(AppSetting, JOIN_AUTO_APPROVE_KEY)
+async def is_auto_approve_enabled(session: AsyncSession, group: str | None = GROUP_SB) -> bool:
+    """Auto-approve is per group: SB and VCS are switched independently."""
+    row = await session.get(AppSetting, JOIN_AUTO_APPROVE_KEYS[normalize_group(group)])
     if row is None:
         return False
     try:
@@ -57,11 +62,16 @@ async def is_auto_approve_enabled(session: AsyncSession) -> bool:
         return False
 
 
-async def save_auto_approve(session: AsyncSession, enabled: bool) -> bool:
+async def auto_approve_settings(session: AsyncSession) -> dict[str, bool]:
+    return {group: await is_auto_approve_enabled(session, group) for group in GROUPS}
+
+
+async def save_auto_approve(session: AsyncSession, enabled: bool, group: str | None = GROUP_SB) -> bool:
+    key = JOIN_AUTO_APPROVE_KEYS[normalize_group(group)]
     payload = json.dumps({"enabled": bool(enabled)})
-    row = await session.get(AppSetting, JOIN_AUTO_APPROVE_KEY)
+    row = await session.get(AppSetting, key)
     if row is None:
-        session.add(AppSetting(key=JOIN_AUTO_APPROVE_KEY, value=payload))
+        session.add(AppSetting(key=key, value=payload))
     else:
         row.value = payload
     await session.commit()
@@ -69,6 +79,7 @@ async def save_auto_approve(session: AsyncSession, enabled: bool) -> bool:
 
 
 async def discover_legacy_join_names(session: AsyncSession) -> list[str]:
+    """Names found on pre-split data. All of it predates VCS, so all of it is SB."""
     names: set[str] = set()
     for stmt in (
         select(ProviderAccount.owner_tag),
@@ -92,7 +103,7 @@ async def ensure_enrollees_seeded(session: AsyncSession) -> int:
     added = 0
     if not count:
         for name in await discover_legacy_join_names(session):
-            session.add(JoinEnrollee(name=name, banned=False))
+            session.add(JoinEnrollee(name=name, group_tag=GROUP_SB, banned=False))
             added += 1
     session.add(AppSetting(key=JOIN_ENROLLEES_SEEDED_KEY, value="1"))
     try:
@@ -105,17 +116,27 @@ async def ensure_enrollees_seeded(session: AsyncSession) -> int:
     return added
 
 
-async def list_enrollees(session: AsyncSession) -> list[JoinEnrollee]:
+async def list_enrollees(session: AsyncSession, group: str | None = None) -> list[JoinEnrollee]:
     await ensure_enrollees_seeded(session)
+    stmt = select(JoinEnrollee)
+    if group is not None:
+        stmt = stmt.where(JoinEnrollee.group_tag == normalize_group(group))
     rows = (
-        await session.execute(select(JoinEnrollee).order_by(func.lower(JoinEnrollee.name)))
+        await session.execute(stmt.order_by(JoinEnrollee.group_tag, func.lower(JoinEnrollee.name)))
     ).scalars()
     return list(rows)
 
 
-async def list_join_picker_names(session: AsyncSession) -> list[str]:
+async def list_join_picker_names(session: AsyncSession, group: str | None = GROUP_SB) -> list[str]:
+    """Unbanned names enrolled in this group. The Join dropdown offers exactly
+    these, and a submission is rejected unless the picked name is one of them."""
     await ensure_enrollees_seeded(session)
-    rows = await session.execute(select(JoinEnrollee.name).where(JoinEnrollee.banned.is_(False)))
+    rows = await session.execute(
+        select(JoinEnrollee.name).where(
+            JoinEnrollee.banned.is_(False),
+            JoinEnrollee.group_tag == normalize_group(group),
+        )
+    )
     names: set[str] = set()
     for (name,) in rows.all():
         person = join_picker_name(name)
@@ -124,20 +145,27 @@ async def list_join_picker_names(session: AsyncSession) -> list[str]:
     return sorted(names, key=lambda item: item.lower())
 
 
-async def create_enrollee(session: AsyncSession, raw_name: str) -> JoinEnrollee:
+async def create_enrollee(session: AsyncSession, raw_name: str, group: str | None = GROUP_SB) -> JoinEnrollee:
     name = normalize_enrollee_name(raw_name)
+    tag = normalize_group(group)
+    label = group_label(tag)
     existing = (
-        await session.execute(select(JoinEnrollee).where(func.lower(JoinEnrollee.name) == name.lower()))
+        await session.execute(
+            select(JoinEnrollee).where(
+                func.lower(JoinEnrollee.name) == name.lower(),
+                JoinEnrollee.group_tag == tag,
+            )
+        )
     ).scalar_one_or_none()
     if existing is not None:
-        raise EnrolleeError(f"{name} is already on the list.")
-    row = JoinEnrollee(name=name, banned=False)
+        raise EnrolleeError(f"{name} is already on the {label} list.")
+    row = JoinEnrollee(name=name, group_tag=tag, banned=False)
     session.add(row)
     try:
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()
-        raise EnrolleeError(f"{name} is already on the list.") from exc
+        raise EnrolleeError(f"{name} is already on the {label} list.") from exc
     await session.refresh(row)
     return row
 

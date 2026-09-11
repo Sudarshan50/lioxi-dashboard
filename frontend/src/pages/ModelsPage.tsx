@@ -32,6 +32,7 @@ import {
 } from "@/lib/accountSort";
 import { formatCurrency } from "@/lib/format";
 import { amountPayableUsd } from "@/lib/payable";
+import { JOIN_GROUPS, JoinGroup, groupLabel, matchesGroup, resolveGroup } from "@/lib/joinGroup";
 import { matchesOwner, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
 import { toastError } from "@/lib/toast";
 import { Account, BreakdownItem, MonitoredModel, RegisteredModel } from "@/types";
@@ -73,6 +74,7 @@ export default function ModelsPage() {
   const [deletingRegisteredId, setDeletingRegisteredId] = useState<number | null>(null);
   const [accountFilter, setAccountFilter] = useState<string>(ALL);
   const [ownerFilter, setOwnerFilter] = useState<string>(ALL);
+  const [joinGroupFilter, setJoinGroupFilter] = useState<string>(ALL);
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<ModelSort>("account");
 
@@ -99,6 +101,7 @@ export default function ModelsPage() {
   );
 
   const owner = ownerFilter === ALL ? null : ownerFilter;
+  const joinGroup = joinGroupFilter === ALL ? null : (joinGroupFilter as JoinGroup);
   const ownerOptions = useMemo(() => uniqueOwners(accounts ?? []), [accounts]);
 
   const filteredModels = useMemo(() => {
@@ -107,6 +110,7 @@ export default function ModelsPage() {
       if (accountFilter !== ALL && model.provider_account_id !== Number(accountFilter)) return false;
       const account = accountById.get(model.provider_account_id);
       if (owner && !matchesOwner(account?.owner_tag, owner)) return false;
+      if (joinGroup && !(account && matchesGroup(account, joinGroup))) return false;
       if (search.trim()) {
         const needle = search.trim().toLowerCase();
         return (
@@ -114,13 +118,14 @@ export default function ModelsPage() {
           model.deployment_name.toLowerCase().includes(needle) ||
           (model.provider_account_name ?? "").toLowerCase().includes(needle) ||
           (account?.owner_tag ?? "").toLowerCase().includes(needle) ||
+          groupLabel(resolveGroup(account?.group_tag, account?.new_api_name)).toLowerCase().includes(needle) ||
           (account?.new_api_name ?? "").toLowerCase().includes(needle) ||
           (account?.resource_name ?? "").toLowerCase().includes(needle)
         );
       }
       return true;
     });
-  }, [accountById, accountFilter, models, owner, search]);
+  }, [accountById, accountFilter, joinGroup, models, owner, search]);
 
   const deploymentGroups = useMemo(() => {
     const byAccount = new Map<number, typeof filteredModels>();
@@ -289,6 +294,14 @@ export default function ModelsPage() {
                 {(accounts ?? []).some((account) => !(account.owner_tag ?? "").trim()) && (
                   <option value={UNTAGGED_OWNER}>Untagged</option>
                 )}
+              </Select>
+              <Select label="Join group" value={joinGroupFilter} onChange={(e) => setJoinGroupFilter(e.target.value)}>
+                <option value={ALL}>All groups</option>
+                {JOIN_GROUPS.map((option) => (
+                  <option key={option} value={option}>
+                    {groupLabel(option)}
+                  </option>
+                ))}
               </Select>
               <Select label="Account" value={accountFilter} onChange={(e) => setAccountFilter(e.target.value)}>
                 <option value={ALL}>All accounts</option>

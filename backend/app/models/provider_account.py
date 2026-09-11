@@ -46,6 +46,8 @@ class ProviderAccount(Base, TimestampMixin):
     new_api_name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
     new_api_tag: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
     owner_tag: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    # Join group this account was onboarded under. "sb" for everything pre-VCS.
+    group_tag: Mapped[str] = mapped_column(String(8), nullable=False, default="sb", server_default="sb", index=True)
     new_api_used_quota: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o1_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o2_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)

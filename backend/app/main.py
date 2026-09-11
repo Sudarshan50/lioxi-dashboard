@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
@@ -10,7 +11,7 @@ from app.database import SessionLocal, init_models
 from app.runtime import configure_runtime
 from app.dependencies import get_sync_orchestrator
 from app.repositories.admin_repository import AdminRepository
-from app.routers import account_groups, accounts, alerts, auth, ban, dashboard, kimi_deploy, models, pending, registered_models, submit, system, telegram
+from app.routers import account_groups, accounts, alerts, auth, ban, dashboard, kimi_deploy, models, notifications, pending, registered_models, submit, system, telegram
 from app.services.alert_service import (
     DEFAULT_AZURE_SYNC_INTERVAL_MINUTES,
     DEFAULT_SYNC_INTERVAL_MINUTES,
@@ -33,13 +34,13 @@ async def lifespan(app: FastAPI):
     async with SessionLocal() as session:
         await ensure_admin_seeded(AdminRepository(session), settings.admin_username, settings.admin_password)
         await apply_owner_tags(session)
-        from app.services.join_enrollee_service import ensure_enrollees_seeded, is_auto_approve_enabled
+        from app.services.join_enrollee_service import ensure_enrollees_seeded
         from app.services.submit_service import expire_stale, kick_auto_approve_queue
 
         await expire_stale(session, orphan_open=True)
         await ensure_enrollees_seeded(session)
-        if await is_auto_approve_enabled(session):
-            await kick_auto_approve_queue(session)
+        # Drains the backlog of every group whose toggle is on; a no-op when none are.
+        await kick_auto_approve_queue(session)
         from app.services.service_principal_store import apply_join_emails
 
         await apply_join_emails(session)
@@ -77,6 +78,9 @@ async def lifespan(app: FastAPI):
     scheduler.start()
 
     await setup_telegram_webhook()
+    from app.services.kimi_capacity import warmup_capacity
+
+    asyncio.create_task(warmup_capacity())
     try:
         yield
     finally:
@@ -88,7 +92,7 @@ async def lifespan(app: FastAPI):
         cleanup_stale_config_dirs()
 
 
-app = FastAPI(title="LLM Usage Monitoring Portal", lifespan=lifespan)
+app = FastAPI(title="Lioxi", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -109,6 +113,7 @@ app.include_router(kimi_deploy.router)
 app.include_router(submit.router)
 app.include_router(pending.router)
 app.include_router(ban.router)
+app.include_router(notifications.router)
 app.include_router(system.router)
 app.include_router(telegram.router)
 

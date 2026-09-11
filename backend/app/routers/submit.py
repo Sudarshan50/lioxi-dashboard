@@ -151,6 +151,7 @@ async def commit(
                 session_id,
                 payload.subscription_id,
                 payload.person_associated,
+                payload.group_tag,
                 on_progress=on_progress,
             )
         except SubmitError as exc:
@@ -197,5 +198,6 @@ async def cancel(
 async def names(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(require_join_password),
+    group: str = Query(default="sb", max_length=8),
 ) -> SubmitNamesResponse:
-    return SubmitNamesResponse(names=await list_owner_names(db))
+    return SubmitNamesResponse(names=await list_owner_names(db, group))

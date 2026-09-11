@@ -3,8 +3,13 @@
 Kimi channels are created only on O1 (NEW_API_BASE_URL). O2 is never
 listed, matched, or written. Channel fields clone the live O1
 kimi-k3-500k-proxy-* rows (group default,azure-zr-highTPM, tag kimi-k3-pool).
-Names are kimi-k3-500k-proxy-X where X is one past the highest number
-already on O1 (gaps are not reused).
+
+Names depend on the Join group and nothing else does:
+  sb  -> kimi-k3-500k-proxy-X
+  vcs -> cs-proxy-X
+X is one past the highest number already on O1 for that prefix (gaps are not
+reused), counted per prefix so the two series advance independently. Both
+series share one pool: same tag, group, model and param overrides.
 """
 
 from __future__ import annotations
@@ -37,12 +42,18 @@ from app.services.new_api_service import (
 )
 from app.services.deploy_defaults import DEFAULT_PRIORITY, DEFAULT_WEIGHT
 from app.services.openai_key_store import decrypt_foundry_key
+from app.services.join_group import GROUP_SB, GROUP_VCS, GROUPS, normalize_group
 from app.services.owner_tag import resource_key
 
 logger = logging.getLogger(__name__)
 
 KIMI_CHANNEL_PREFIX = "kimi-k3-500k-proxy-"
 KIMI_CHANNEL_RE = re.compile(r"^kimi-k3-500k-proxy-(\d+)$", re.I)
+VCS_CHANNEL_PREFIX = "cs-proxy-"
+VCS_CHANNEL_RE = re.compile(r"^cs-proxy-(\d+)$", re.I)
+# Both series live in the same O1 pool; only the name prefix differs.
+CHANNEL_PREFIX_BY_GROUP = {GROUP_SB: KIMI_CHANNEL_PREFIX, GROUP_VCS: VCS_CHANNEL_PREFIX}
+CHANNEL_RE_BY_GROUP = {GROUP_SB: KIMI_CHANNEL_RE, GROUP_VCS: VCS_CHANNEL_RE}
 # Exact O1 string. NewAPI tag mode does not trim, so a trailing space is a
 # second tag (second ID in the tag-mode list).
 KIMI_POOL_TAG = " kimi-k3-pool"
@@ -109,17 +120,32 @@ def kimi_pool_gateway() -> Gateway:
     raise NewApiError("O1 NewAPI is not configured (NEW_API_SYSTEM_TOKEN).")
 
 
-def next_kimi_index(channels: list[dict]) -> int:
+def channel_prefix(group: str | None) -> str:
+    return CHANNEL_PREFIX_BY_GROUP[normalize_group(group)]
+
+
+def channel_index(name: str | None) -> int | None:
+    """Trailing number of a pool channel name, whichever series it belongs to."""
+    text = str(name or "").strip()
+    for pattern in CHANNEL_RE_BY_GROUP.values():
+        match = pattern.match(text)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def next_kimi_index(channels: list[dict], group: str | None = GROUP_SB) -> int:
+    pattern = CHANNEL_RE_BY_GROUP[normalize_group(group)]
     highest = -1
     for channel in channels:
-        match = KIMI_CHANNEL_RE.match(str(channel.get("name") or ""))
+        match = pattern.match(str(channel.get("name") or ""))
         if match:
             highest = max(highest, int(match.group(1)))
     return max(highest, 0) + 1
 
 
-def next_kimi_channel_name(channels: list[dict]) -> str:
-    return f"{KIMI_CHANNEL_PREFIX}{next_kimi_index(channels)}"
+def next_kimi_channel_name(channels: list[dict], group: str | None = GROUP_SB) -> str:
+    return f"{channel_prefix(group)}{next_kimi_index(channels, group)}"
 
 
 def _tag_key(value: str | None) -> str:
@@ -134,7 +160,7 @@ def pool_tag(channels: list[dict]) -> str:
     """
     counts: dict[str, int] = {}
     for channel in channels:
-        if not KIMI_CHANNEL_RE.match(str(channel.get("name") or "")):
+        if channel_index(channel.get("name")) is None:
             continue
         tag = channel.get("tag")
         if not isinstance(tag, str) or not _is_pool_tag(tag):
@@ -156,7 +182,7 @@ def pool_tag_variants(channels: list[dict], canonical: str | None = None) -> lis
     variants: list[str] = []
     seen: set[str] = set()
     for channel in channels:
-        if not KIMI_CHANNEL_RE.match(str(channel.get("name") or "")):
+        if channel_index(channel.get("name")) is None:
             continue
         tag = channel.get("tag")
         if not isinstance(tag, str) or not _is_pool_tag(tag) or tag == wanted:
@@ -268,6 +294,15 @@ def _is_pool_tag(value: str | None) -> bool:
     return _tag_key(value) == _tag_key(KIMI_POOL_TAG)
 
 
+def is_kimi_channel_name(name: str | None) -> bool:
+    """True for either pool series, so O1 sync and capacity see VCS rows too."""
+    return channel_index(name) is not None
+
+
+def is_kimi_pool_channel(channel: dict) -> bool:
+    return is_kimi_channel_name(channel.get("name")) or _is_pool_tag(channel.get("tag"))
+
+
 def match_channel(channels: list[dict], hosts: set[str]) -> dict | None:
     wanted = {host.strip().lower() for host in hosts if host and host.strip()}
     if not wanted:
@@ -276,10 +311,10 @@ def match_channel(channels: list[dict], hosts: set[str]) -> dict | None:
     for channel in channels:
         if _host_key(channel.get("base_url")) not in wanted:
             continue
-        match = KIMI_CHANNEL_RE.match(str(channel.get("name") or ""))
-        if not match:
+        index = channel_index(channel.get("name"))
+        if index is None:
             continue
-        named.append((channel, int(match.group(1))))
+        named.append((channel, index))
     if not named:
         return None
     named.sort(key=lambda item: (0 if _channel_status(item[0].get("status")) == 1 else 1, -item[1]))
@@ -323,22 +358,46 @@ async def kimi_newapi_pool() -> KimiNewApiPool:
     visible = [
         channel
         for channel in channels
-        if KIMI_CHANNEL_RE.match(str(channel.get("name") or ""))
-        or _is_pool_tag(channel.get("tag"))
+        if channel_index(channel.get("name")) is not None or _is_pool_tag(channel.get("tag"))
     ]
     ordered = sorted(
         visible,
         key=lambda channel: (
-            0 if KIMI_CHANNEL_RE.match(str(channel.get("name") or "")) else 1,
+            0 if channel_index(channel.get("name")) is not None else 1,
             str(channel.get("name") or ""),
         ),
     )
     return KimiNewApiPool(
         ok=True,
         gateway="O1",
-        next_name=next_kimi_channel_name(channels),
+        next_name=next_kimi_channel_name(channels, GROUP_SB),
+        next_name_vcs=next_kimi_channel_name(channels, GROUP_VCS),
         channels=[public_channel(channel) for channel in ordered],
     )
+
+
+async def _group_for_account(
+    session: AsyncSession | None,
+    account: dict[str, str],
+    subscription_id: str,
+    resource_name: str,
+) -> str:
+    """Group from the deploy payload, else the one the portal account was
+    onboarded under. A re-deploy or a NewAPI retry that carries no group must
+    not move a VCS resource into the SB name series."""
+    stated = (account.get("group_tag") or "").strip()
+    if stated:
+        return normalize_group(stated)
+    if session is None or not subscription_id or not resource_name:
+        return GROUP_SB
+    try:
+        portal = await AccountRepository(session).get_by_subscription_and_resource(
+            subscription_id, resource_name
+        )
+    except Exception:  # noqa: BLE001 - naming must never block a deploy
+        logger.warning("Could not read the portal group for %s", resource_name, exc_info=True)
+        return GROUP_SB
+    return normalize_group(getattr(portal, "group_tag", None) if portal else None)
 
 
 async def _hosts_for(_session: AsyncSession | None, result: KimiDeployResult, account: dict[str, str] | None) -> set[str]:
@@ -528,7 +587,7 @@ async def ensure_kimi_newapi_channels(
         canonical_tag = pool_tag(channels)
         channels = await _align_kimi_pool_tags(gateway, channels, canonical_tag)
         canonical_tag = pool_tag(channels)
-        next_index = next_kimi_index(channels)
+        next_index = {group: next_kimi_index(channels, group) for group in GROUPS}
         for index, result in enumerate(results):
             account = accounts[index] if index < len(accounts) else {}
             if only_ok and not result.ok:
@@ -542,6 +601,7 @@ async def ensure_kimi_newapi_channels(
             hosts = await _hosts_for(session, result, account)
             if not resource_name:
                 resource_name = next(iter(hosts), "")
+            row_group = await _group_for_account(session, account, subscription_id, resource_name)
             existing = match_channel(channels, hosts)
             if existing is not None:
                 current_pri = _as_int(existing.get("priority"))
@@ -560,7 +620,7 @@ async def ensure_kimi_newapi_channels(
                         )
                         invalidate_kimi_pool_cache()
                         channels = await list_kimi_pool_channels(force=True)
-                        next_index = next_kimi_index(channels)
+                        next_index = {group: next_kimi_index(channels, group) for group in GROUPS}
                         refreshed = next(
                             (item for item in channels if _as_int(item.get("id")) == _as_int(existing.get("id"))),
                             None,
@@ -639,11 +699,12 @@ async def ensure_kimi_newapi_channels(
                     )
                     created = name
                 else:
+                    prefix = channel_prefix(row_group)
                     for _attempt in range(8):
-                        name = f"{KIMI_CHANNEL_PREFIX}{next_index}"
+                        name = f"{prefix}{next_index[row_group]}"
                         if _name_owner(channels, name) is not None:
                             last_error = f"O1 already has a channel named {name}."
-                            next_index += 1
+                            next_index[row_group] += 1
                             continue
                         try:
                             await _post_channel(
@@ -671,14 +732,14 @@ async def ensure_kimi_newapi_channels(
                                 or "名称" in last_error
                             ):
                                 channels = await list_kimi_pool_channels(force=True)
-                                next_index = next_kimi_index(channels)
+                                next_index = {group: next_kimi_index(channels, group) for group in GROUPS}
                                 continue
                             raise
                     if created is None:
                         raise NewApiError(last_error or "Could not allocate a NewAPI channel name.")
                 invalidate_kimi_pool_cache()
                 channels = await list_kimi_pool_channels(force=True)
-                next_index = next_kimi_index(channels)
+                next_index = {group: next_kimi_index(channels, group) for group in GROUPS}
                 channel = match_channel(channels, {resource_key(resource_name), resource_key(base_url)})
                 if channel is None:
                     channel = next((item for item in channels if item.get("name") == created), None) or {
@@ -697,6 +758,17 @@ async def ensure_kimi_newapi_channels(
             except Exception as exc:  # noqa: BLE001
                 logger.warning("NewAPI channel create failed for %s: %s", resource_name, exc)
                 result.new_api_error = str(exc)[:300]
+
+    from app.services.kimi_capacity import set_host_live
+
+    for result in results:
+        host = resource_key(result.account_name) or resource_key(result.azure_openai_endpoint)
+        if not host:
+            continue
+        if result.new_api_present and result.new_api_status == 1:
+            await set_host_live(host, True, result.tpm, result.rpm)
+        elif result.new_api_present:
+            await set_host_live(host, False)
 
 
 def _channel_update_body(
@@ -800,6 +872,7 @@ async def rename_kimi_newapi_channel(
     subscription_id: str = "",
     resource_name: str = "",
     endpoint: str | None = None,
+    sync_sheet: bool = True,
 ) -> KimiDeployResult:
     """Update name/priority/weight on an existing O1 channel. Does not touch O2."""
     result = KimiDeployResult(
@@ -883,7 +956,7 @@ async def rename_kimi_newapi_channel(
             logger.warning("NewAPI channel update failed: %s", exc)
             result.ok = False
             result.new_api_error = str(exc)[:300]
-    if result.ok:
+    if result.ok and sync_sheet:
         from app.services.google_sheet_inventory import sync_deploy_results
 
         await sync_deploy_results([result])

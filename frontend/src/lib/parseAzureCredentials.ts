@@ -231,6 +231,7 @@ export interface AzureAccountImport {
   creditsLimit?: number;
   deploymentName?: string;
   ownerTag?: string;
+  groupTag?: string;
 }
 
 export interface AzureDeploySecret {
@@ -313,6 +314,7 @@ export function parseAzureAccountImportArray(raw: string): { accounts: AzureAcco
       creditsLimit: creditsLimit ?? undefined,
       deploymentName: deploymentName || undefined,
       ownerTag: ownerTag || undefined,
+      groupTag: firstString(extra, ["group_tag", "groupTag", "group", "join_group"]) || undefined,
     });
   }
   return { accounts };

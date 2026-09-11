@@ -1,9 +1,12 @@
+import logging
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 engine = create_async_engine(
     settings.database_url,
@@ -53,6 +56,7 @@ _ACCOUNT_EXTRA_COLUMNS = (
     ("payable_settled_at", "TIMESTAMPTZ"),
     ("at_cap_manual", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("openai_api_key_encrypted", "TEXT"),
+    ("group_tag", "VARCHAR(8) NOT NULL DEFAULT 'sb'"),
 )
 
 
@@ -65,10 +69,81 @@ async def _ensure_azure_openai_key_columns(conn) -> None:
     await conn.execute(text("ALTER TABLE azure_openai_keys ADD COLUMN IF NOT EXISTS owner_tag VARCHAR(64)"))
 
 
+_SUBMIT_EXTRA_COLUMNS = (
+    ("error_kind", "VARCHAR(16)"),
+    ("auto_retry_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("credits_limit", "DOUBLE PRECISION"),
+    ("credits_remaining", "DOUBLE PRECISION"),
+    ("credits_used", "DOUBLE PRECISION"),
+    ("credits_currency", "VARCHAR(8)"),
+    ("credits_label", "VARCHAR(256)"),
+    ("credits_available", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("credits_fetched_at", "TIMESTAMPTZ"),
+    ("credits_error", "TEXT"),
+    ("group_tag", "VARCHAR(8) NOT NULL DEFAULT 'sb'"),
+)
+
+
 async def _ensure_submit_columns(conn) -> None:
-    await conn.execute(text("ALTER TABLE sp_submit_requests ADD COLUMN IF NOT EXISTS error_kind VARCHAR(16)"))
+    for name, definition in _SUBMIT_EXTRA_COLUMNS:
+        await conn.execute(text(f"ALTER TABLE sp_submit_requests ADD COLUMN IF NOT EXISTS {name} {definition}"))
+
+
+async def _ensure_join_enrollee_group(conn) -> None:
+    """Add group_tag and move the uniqueness from name to (name, group_tag).
+
+    Existing names stay SB. The old unique index on name alone is dropped so
+    the same person can be enrolled under both groups.
+    """
     await conn.execute(
-        text("ALTER TABLE sp_submit_requests ADD COLUMN IF NOT EXISTS auto_retry_count INTEGER NOT NULL DEFAULT 0")
+        text("ALTER TABLE join_enrollees ADD COLUMN IF NOT EXISTS group_tag VARCHAR(8) NOT NULL DEFAULT 'sb'")
+    )
+    # An older build declared this as an ORM UniqueConstraint, which owns the
+    # same relation name and would make the CREATE UNIQUE INDEX below a no-op.
+    await conn.execute(
+        text("ALTER TABLE join_enrollees DROP CONSTRAINT IF EXISTS uq_join_enrollee_name_group")
+    )
+    await conn.execute(text("DROP INDEX IF EXISTS ix_join_enrollees_name"))
+    await conn.execute(text("CREATE INDEX IF NOT EXISTS ix_join_enrollees_name ON join_enrollees (name)"))
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_join_enrollees_group_tag ON join_enrollees (group_tag)")
+    )
+    # Refuse to fail the whole boot over pre-existing duplicates: log them and
+    # leave the index absent so an operator can clean up and restart.
+    duplicates = (
+        await conn.execute(
+            text(
+                """
+                SELECT lower(name) AS name, group_tag, count(*) AS n
+                FROM join_enrollees
+                GROUP BY lower(name), group_tag
+                HAVING count(*) > 1
+                """
+            )
+        )
+    ).all()
+    if duplicates:
+        logger.error(
+            "join_enrollees has duplicate (name, group) rows; unique index not created: %s",
+            ", ".join(f"{row.name}/{row.group_tag} x{row.n}" for row in duplicates),
+        )
+        return
+    await conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_join_enrollee_name_group
+            ON join_enrollees (lower(name), group_tag)
+            """
+        )
+    )
+
+
+async def _ensure_group_tag_indexes(conn) -> None:
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_provider_accounts_group_tag ON provider_accounts (group_tag)")
+    )
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_sp_submit_requests_group_tag ON sp_submit_requests (group_tag)")
     )
 
 
@@ -141,5 +216,7 @@ async def init_models() -> None:
         await _ensure_account_columns(conn)
         await _ensure_azure_openai_key_columns(conn)
         await _ensure_submit_columns(conn)
+        await _ensure_group_tag_indexes(conn)
+        await _ensure_join_enrollee_group(conn)
         await _ensure_submit_indexes(conn)
         await _ensure_sp_elevated_access(conn)

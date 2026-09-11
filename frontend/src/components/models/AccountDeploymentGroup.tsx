@@ -1,6 +1,7 @@
 import { ReactNode } from "react";
 
 import Badge from "@/components/ui/Badge";
+import GroupBadge from "@/components/ui/GroupBadge";
 import ModelRow from "@/components/models/ModelRow";
 import { EstimateCurrency, formatCurrency, formatEstimatedCost } from "@/lib/format";
 import { Account, BreakdownItem, MonitoredModel } from "@/types";
@@ -47,6 +48,7 @@ export default function AccountDeploymentGroup({
                   {account.owner_tag}
                 </Badge>
               )}
+              <GroupBadge group={account?.group_tag} channel={account?.new_api_name} />
               {portals.map((portal) => {
                 const status = portal === "O1" ? account?.new_api_status_o1 : account?.new_api_status_o2;
                 const enabled = status === 1;

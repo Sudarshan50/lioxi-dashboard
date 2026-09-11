@@ -33,6 +33,8 @@ import { GrantBucket, GrantTierBits, summarizeAccounts } from "@/lib/grantSpend"
 import { amountPayableUsd } from "@/lib/payable";
 import { formatCurrency } from "@/lib/format";
 import { matchesOwner, ownerCounts, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
+import GroupChips from "@/components/ui/GroupChips";
+import { JoinGroup, groupCounts, groupLabel, matchesGroup, resolveGroup } from "@/lib/joinGroup";
 import { toastError, toastSuccess } from "@/lib/toast";
 import { Account, AccountGroup } from "@/types";
 
@@ -71,6 +73,7 @@ export default function AccountsPage() {
   const [editingGroup, setEditingGroup] = useState<AccountGroup | null>(null);
   const [search, setSearch] = useState("");
   const [ownerFilter, setOwnerFilter] = useState<string | null>(null);
+  const [groupFilter, setGroupFilter] = useState<JoinGroup | null>(null);
   const [gatewayFilter, setGatewayFilter] = useState<GatewayFilter>("enabled");
   const [grantFilter, setGrantFilter] = useState<GrantFilter>("all");
   const [sort, setSort] = useState<AccountSort>("name");
@@ -139,25 +142,28 @@ export default function AccountsPage() {
   }, [groups]);
 
   const ownerStats = useMemo(() => ownerCounts(accounts ?? []), [accounts]);
+  const groupStats = useMemo(() => groupCounts(accounts ?? []), [accounts]);
   const owners = useMemo(() => uniqueOwners(accounts ?? []), [accounts]);
 
   const filteredAccounts = useMemo(() => {
     const visible = (accounts ?? []).filter((account) => {
       if (!matchesOwner(account.owner_tag, ownerFilter)) return false;
+      if (!matchesGroup(account, groupFilter)) return false;
       if (!matchesGatewayFilter(account, gatewayFilter)) return false;
       if (grantFilter !== "all" && grantTier(account, usdInr) !== grantFilter) return false;
       return matchesAccountSearch(account, search, groupsByAccountId.get(account.id) ?? []);
     });
     return [...visible].sort((left, right) => compareAccounts(left, right, sort, usdInr));
-  }, [accounts, gatewayFilter, grantFilter, groupsByAccountId, ownerFilter, search, sort, usdInr]);
+  }, [accounts, gatewayFilter, grantFilter, groupFilter, groupsByAccountId, ownerFilter, search, sort, usdInr]);
 
   const hasActiveFilters = Boolean(
-    search.trim() || ownerFilter || gatewayFilter !== "enabled" || grantFilter !== "all"
+    search.trim() || ownerFilter || groupFilter || gatewayFilter !== "enabled" || grantFilter !== "all"
   );
 
   function resetFilters() {
     setSearch("");
     setOwnerFilter(null);
+    setGroupFilter(null);
     setGatewayFilter("enabled");
     setGrantFilter("all");
   }
@@ -385,6 +391,13 @@ export default function AccountsPage() {
               </Select>
             </div>
 
+            <GroupChips
+              counts={groupStats}
+              total={(accounts ?? []).length}
+              value={groupFilter}
+              onChange={setGroupFilter}
+            />
+
             <OwnerChips
               owners={owners}
               counts={ownerStats.counts}
@@ -502,6 +515,7 @@ function matchesAccountSearch(account: Account, rawQuery: string, groupNames: st
       account.endpoint,
       account.location,
       account.owner_tag,
+      groupLabel(resolveGroup(account.group_tag, account.new_api_name)),
       account.new_api_name,
       account.new_api_tag,
       account.new_api_gateway,

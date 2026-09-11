@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Integer, String, Text
+from sqlalchemy import DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -16,6 +16,7 @@ class SpSubmitRequest(Base, TimestampMixin):
     session_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(32), index=True, default="login_started")
     person_associated: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
+    group_tag: Mapped[str] = mapped_column(String(8), nullable=False, default="sb", server_default="sb", index=True)
     account_holder: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
     subscription_id: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None, index=True)
     subscription_name: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
@@ -25,6 +26,14 @@ class SpSubmitRequest(Base, TimestampMixin):
     name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
     sp_display_name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
     billing_error: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    credits_limit: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    credits_remaining: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    credits_used: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    credits_currency: Mapped[str | None] = mapped_column(String(8), nullable=True, default=None)
+    credits_label: Mapped[str | None] = mapped_column(String(256), nullable=True, default=None)
+    credits_available: Mapped[bool] = mapped_column(default=False)
+    credits_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    credits_error: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     error_kind: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
     auto_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

@@ -25,6 +25,7 @@ from app.models.provider_account import ProviderAccount
 from app.models.sp_submit_request import SpSubmitRequest
 from app.schemas.submit import PendingRequestPublic, SubmitSessionSnapshot, SubmitSubscription
 from app.services.account_service import allocate_unique_name
+from app.services.pending_grants import public_grant_fields
 from app.services.az_cli_session import (
     AzCliError,
     drop_az_session,
@@ -34,6 +35,7 @@ from app.services.az_cli_session import (
     scrub_az_text,
 )
 from app.services.deploy_defaults import resolve_routing
+from app.services.join_group import group_label, join_account_name, normalize_group
 from app.services.kimi_deploy_service import load_deploy_module
 from app.services.owner_tag import parse_owner_tag
 from app.services.service_principal_store import persist_service_principals
@@ -170,6 +172,7 @@ def public_snapshot(row: SpSubmitRequest, message: str | None = None) -> SubmitS
         status=row.status,
         account_holder=row.account_holder,
         person_associated=row.person_associated,
+        group_tag=normalize_group(row.group_tag),
         subscription_id=row.subscription_id,
         subscription_name=row.subscription_name,
         device_user_code=row.device_user_code,
@@ -186,6 +189,7 @@ def pending_public(row: SpSubmitRequest) -> PendingRequestPublic:
         id=row.id,
         status=row.status,
         person_associated=row.person_associated,
+        group_tag=normalize_group(row.group_tag),
         account_holder=row.account_holder,
         name=row.name,
         subscription_id=row.subscription_id,
@@ -198,6 +202,7 @@ def pending_public(row: SpSubmitRequest) -> PendingRequestPublic:
         updated_at=row.updated_at,
         approved_at=row.approved_at,
         rejected_at=row.rejected_at,
+        **public_grant_fields(row),
         can_retry_deploy=bool(
             row.client_secret_encrypted
             and row.client_id
@@ -386,10 +391,10 @@ async def _discard_failed_for_subscription(
         await db.delete(old)
 
 
-async def list_owner_names(db: AsyncSession) -> list[str]:
+async def list_owner_names(db: AsyncSession, group: str | None = None) -> list[str]:
     from app.services.join_enrollee_service import list_join_picker_names
 
-    return await list_join_picker_names(db)
+    return await list_join_picker_names(db, group)
 
 
 def _wipe_secret(row: SpSubmitRequest) -> None:
@@ -465,9 +470,9 @@ async def _expire_open_login(row: SpSubmitRequest, message: str) -> None:
 async def expire_stale(db: AsyncSession, *, orphan_open: bool = False) -> int:
     now = _utcnow()
     login_cutoff = now - timedelta(seconds=_ttl_seconds())
-    from app.services.join_enrollee_service import is_auto_approve_enabled
+    from app.services.join_enrollee_service import auto_approve_settings
 
-    auto_approve = await is_auto_approve_enabled(db)
+    auto_approve = await auto_approve_settings(db)
     rows = (
         await db.execute(
             select(SpSubmitRequest).where(
@@ -509,7 +514,7 @@ async def expire_stale(db: AsyncSession, *, orphan_open: bool = False) -> int:
                 keep_network=True,
                 error_kind=ERROR_KIND_DEPLOY,
             )
-            if auto_approve:
+            if auto_approve[normalize_group(row.group_tag)]:
                 _aborted_approvals.discard(expired_id)
                 schedule_auto_retry(expired_id)
             count += 1
@@ -670,6 +675,7 @@ async def commit_session(
     session_id: str,
     subscription_id: str,
     person_associated: str,
+    group_tag: str | None = None,
     on_progress: ProgressFn | None = None,
 ) -> SpSubmitRequest:
     await expire_stale(db)
@@ -691,15 +697,18 @@ async def commit_session(
     if row.status != STATUS_LOGGED_IN:
         raise SubmitError("Finish Azure sign-in before submitting.")
 
+    group = normalize_group(group_tag)
     try:
         person = parse_owner_tag(person_associated)
     except ValueError as exc:
         raise SubmitError(str(exc)) from exc
     if not person:
         raise SubmitError("Pick a name from the dropdown.")
-    allowed = set(await list_owner_names(db))
+    # Only names enrolled in the submitted group are accepted, so a VCS
+    # submission can never claim an SB-only name and vice versa.
+    allowed = set(await list_owner_names(db, group))
     if person not in allowed:
-        raise SubmitError("Pick a name from the dropdown.")
+        raise SubmitError(f"Pick a name from the {group_label(group)} dropdown.")
 
     wanted = subscription_id.strip().lower()
     snap = public_snapshot(row)
@@ -745,8 +754,13 @@ async def commit_session(
         ).all()
         if name
     )
-    display_name = allocate_unique_name(f"Lioxi-{label or slug}", taken)
+    # The picked name is the owner tag for both groups. Only the portal
+    # account label differs: Lioxi-<Name> for SB, the bare enrolled name for
+    # VCS (which then drives the Azure <slug>-proxy stack names).
+    preferred = join_account_name(group, row.account_holder, f"Lioxi-{label or slug}", person)
+    display_name = allocate_unique_name(preferred, taken)
     row.status = STATUS_CREATING_SP
+    row.group_tag = group
     row.person_associated = person
     row.name = display_name
     row.subscription_id = match.subscription_id
@@ -793,7 +807,7 @@ async def commit_session(
         return row
     from app.services.join_enrollee_service import is_auto_approve_enabled
 
-    if await is_auto_approve_enabled(db):
+    if await is_auto_approve_enabled(db, row.group_tag):
         try:
             await enqueue_approve(db, row.id, authorized_by=AUTH_AUTO)
             await db.refresh(row)
@@ -1028,6 +1042,7 @@ async def _create_or_name_sp(
 def deploy_payload_from_row(row: SpSubmitRequest, secret: str) -> dict[str, str]:
     return {
         "name": row.name or row.person_associated or "account",
+        "group_tag": normalize_group(row.group_tag),
         "account_holder": row.account_holder or "",
         "person_associated": row.person_associated or "",
         "AZURE_TENANT_ID": row.tenant_id or "",
@@ -1211,13 +1226,17 @@ async def enqueue_approve_many(
     authorized_by: str = AUTH_ADMIN,
     new_api_priority: int | None = None,
     new_api_weight: int | None = None,
+    group: str | None = None,
 ) -> tuple[list[int], list[tuple[int, str]]]:
     rows = await list_pending(db)
     wanted = {int(item) for item in ids} if ids else None
+    only_group = normalize_group(group) if group is not None else None
     started: list[int] = []
     skipped: list[tuple[int, str]] = []
     for row in rows:
         if wanted is not None and row.id not in wanted:
+            continue
+        if only_group is not None and normalize_group(row.group_tag) != only_group:
             continue
         if retry:
             if row.status != STATUS_FAILED or row.error_kind != ERROR_KIND_DEPLOY:
@@ -1246,12 +1265,26 @@ async def enqueue_approve_many(
     return started, skipped
 
 
-async def kick_auto_approve_queue(db: AsyncSession) -> tuple[list[int], list[tuple[int, str]]]:
-    started, skipped = await enqueue_approve_many(db, None, retry=False, authorized_by=AUTH_AUTO)
-    retried, retry_skipped = await enqueue_approve_many(
-        db, None, retry=True, auto_retry=True, authorized_by=AUTH_AUTO
-    )
-    return started + retried, skipped + retry_skipped
+async def kick_auto_approve_queue(
+    db: AsyncSession, group: str | None = None
+) -> tuple[list[int], list[tuple[int, str]]]:
+    """Drain the backlog for one group, or for every group whose toggle is on."""
+    from app.services.join_enrollee_service import auto_approve_settings
+
+    if group is None:
+        enabled = [name for name, on in (await auto_approve_settings(db)).items() if on]
+    else:
+        enabled = [normalize_group(group)]
+    started: list[int] = []
+    skipped: list[tuple[int, str]] = []
+    for name in enabled:
+        for retry in (False, True):
+            batch, batch_skipped = await enqueue_approve_many(
+                db, None, retry=retry, auto_retry=retry, authorized_by=AUTH_AUTO, group=name
+            )
+            started += batch
+            skipped += batch_skipped
+    return started, skipped
 
 
 async def _auto_retry_approve(request_id: int) -> None:
@@ -1262,9 +1295,9 @@ async def _auto_retry_approve(request_id: int) -> None:
     from app.services.join_enrollee_service import is_auto_approve_enabled
 
     async with SessionLocal() as db:
-        if not await is_auto_approve_enabled(db):
-            return
         row = await get_request_by_id(db, request_id)
+        if row is None or not await is_auto_approve_enabled(db, row.group_tag):
+            return
         if not _row_can_auto_retry(row):
             return
         try:
@@ -1286,9 +1319,9 @@ async def _maybe_auto_retry_after_job(request_id: int) -> None:
     from app.services.join_enrollee_service import is_auto_approve_enabled
 
     async with SessionLocal() as db:
-        if not await is_auto_approve_enabled(db):
-            return
         row = await get_request_by_id(db, request_id)
+        if row is None or not await is_auto_approve_enabled(db, row.group_tag):
+            return
         if not _row_can_auto_retry(row):
             return
     schedule_auto_retry(request_id)
@@ -1462,6 +1495,7 @@ async def execute_approve(
             (row.person_associated or "").strip() or (result.owner_tag or "").strip() or "Unknown",
             (result.name or row.name or "").strip() or "account",
             authorized_by,
+            normalize_group(row.group_tag),
         )
     else:
         row.status = STATUS_FAILED

@@ -39,6 +39,7 @@ from app.services.azure_inventory_cache import (
     get_cached_azure_inventory,
     store_azure_inventory,
 )
+from app.services.join_group import STACK_SUFFIXES, normalize_group
 from app.services.owner_tag import apply_person_associated_tags, person_from_payload, resource_key
 from app.services.service_principal_store import email_or_none
 
@@ -421,6 +422,12 @@ def normalize_account(raw: dict[str, Any], index: int) -> dict[str, str]:
         raise KimiDeployError(str(exc)) from exc
     if person:
         out["person_associated"] = person
+    # Join group. Only set when the payload said so: an absent value lets
+    # NewAPI fall back to the group already recorded on the portal account,
+    # which is what a re-deploy of an existing VCS resource needs.
+    group = _pick(merged, ("group_tag", "groupTag", "group", "join_group"))
+    if group:
+        out["group_tag"] = normalize_group(group)
     new_api_name = _pick(merged, ("new_api_name", "newApiName", "channel_name", "channelName"))
     if new_api_name:
         out["new_api_name"] = new_api_name
@@ -727,7 +734,8 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
                     used_by_others += int(item.capacity or 0)
             if kimi is None:
                 continue
-            score = 2 if "-kimi-" in (resource.name or "").lower() else 1
+            resource_lower = (resource.name or "").lower()
+            score = 2 if any(f"-{suffix}-" in resource_lower for suffix in STACK_SUFFIXES) else 1
             matches.append((score, resource, kimi, used_by_others))
         if not matches:
             return KimiDeployResult(
@@ -1336,6 +1344,13 @@ async def delete_accounts(
             await drop_azure_inventory(result.subscription_id or sub, result.account_name)
         if result.ok and session is not None:
             await drop_stored_principal(session, sub)
+        if result.ok:
+            from app.services.kimi_capacity import set_host_live
+            from app.services.owner_tag import resource_key
+
+            host = resource_key(account.get("account_name")) or resource_key(result.account_name)
+            if host:
+                await set_host_live(host, False)
     return results
 
 

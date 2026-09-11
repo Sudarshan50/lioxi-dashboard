@@ -108,8 +108,8 @@ export async function fetchSubmitSnapshot(sessionId: string) {
   return (await response.json()) as SubmitSessionSnapshot;
 }
 
-export async function fetchSubmitNames() {
-  const response = await fetch(`${submitBaseUrl()}/api/submit/names`, {
+export async function fetchSubmitNames(group: string) {
+  const response = await fetch(`${submitBaseUrl()}/api/submit/names?group=${encodeURIComponent(group)}`, {
     cache: "no-store",
     headers: joinHeaders({ Accept: "application/json" }),
   });
@@ -217,7 +217,7 @@ export async function streamSubmitEvents(
 
 export async function commitSubmitSession(
   sessionId: string,
-  payload: { subscription_id: string; person_associated: string },
+  payload: { subscription_id: string; person_associated: string; group_tag: string },
   onEvent: (event: SubmitSessionSnapshot & Record<string, unknown>) => void
 ) {
   const response = await fetch(`${submitBaseUrl()}/api/submit/sessions/${sessionId}/commit`, {
@@ -287,6 +287,8 @@ export async function enqueuePendingApprove(
 export async function enqueuePendingApproveBatch(payload: {
   ids?: number[];
   retry: boolean;
+  // Restricts an ids-less sweep to one Join group; omit for every group.
+  group?: string;
   new_api_priority?: number;
   new_api_weight?: number;
 }) {

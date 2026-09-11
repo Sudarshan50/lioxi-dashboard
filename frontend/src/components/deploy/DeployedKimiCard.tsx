@@ -2,6 +2,7 @@ import { ArrowUpCircle, Check, Copy, FileSpreadsheet, KeyRound, Play, Radio, Ref
 import { useEffect, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
+import GroupBadge from "@/components/ui/GroupBadge";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import { formatCurrency, formatDeployedAt, formatRelative, formatTokens } from "@/lib/format";
@@ -112,6 +113,7 @@ export default function DeployedKimiCard({
                 {item.owner_tag}
               </Badge>
             )}
+            <GroupBadge channel={item.new_api_name} />
             {quotaTier && live && (
               <Badge tone="neutral" title="Azure Foundry quota tier for this subscription">
                 {quotaTier}

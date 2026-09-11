@@ -25,6 +25,7 @@ export interface Account {
   new_api_name: string | null;
   new_api_tag: string | null;
   owner_tag: string | null;
+  group_tag?: string;
   new_api_used_quota: number | null;
   new_api_cost_o1_usd: number | null;
   new_api_cost_o2_usd: number | null;
@@ -457,6 +458,12 @@ export interface KimiNewApiChannel {
   models?: string | null;
 }
 
+export interface KimiCapacitySummary {
+  tpm: number;
+  rpm: number;
+  accounts: number;
+}
+
 export interface KimiNewApiPool {
   ok: boolean;
   gateway?: string | null;
@@ -488,6 +495,7 @@ export interface SubmitSessionSnapshot {
   person_associated?: string | null;
   subscription_id?: string | null;
   subscription_name?: string | null;
+  group_tag?: string;
   device_user_code?: string | null;
   device_verification_uri?: string | null;
   subscriptions?: SubmitSubscription[];
@@ -504,6 +512,7 @@ export interface PendingSubmitRequest {
   id: number;
   status: string;
   person_associated?: string | null;
+  group_tag?: string;
   account_holder?: string | null;
   name?: string | null;
   subscription_id?: string | null;
@@ -517,12 +526,60 @@ export interface PendingSubmitRequest {
   approved_at?: string | null;
   rejected_at?: string | null;
   can_retry_deploy?: boolean;
+  credits_limit?: number | null;
+  credits_remaining?: number | null;
+  credits_used?: number | null;
+  credits_currency?: string | null;
+  credits_label?: string | null;
+  credits_available?: boolean;
+  credits_fetched_at?: string | null;
+  credits_error?: string | null;
+  grant_usd?: number | null;
+  grant_tier?: "1k" | "10k" | "other" | null;
+}
+
+export interface PendingGrantSummary {
+  total: number;
+  fetched: number;
+  missing: number;
+  failed: number;
+  pool_usd: number;
+  count_10k: number;
+  count_1k: number;
+  count_other: number;
+  pool_10k_usd: number;
+  pool_1k_usd: number;
+  fetched_at?: string | null;
+}
+
+export interface PendingGrantAccount {
+  id: number;
+  email?: string | null;
+  name?: string | null;
+  person_associated?: string | null;
+  group_tag?: string;
+  subscription_id?: string | null;
+  credits_limit?: number | null;
+  credits_remaining?: number | null;
+  credits_currency?: string | null;
+  credits_available: boolean;
+  credits_fetched_at?: string | null;
+  credits_error?: string | null;
+  grant_usd?: number | null;
+  grant_tier?: "1k" | "10k" | "other" | null;
+}
+
+export interface PendingGrantsResponse {
+  ok: boolean;
+  summary: PendingGrantSummary;
+  accounts: PendingGrantAccount[];
 }
 
 export interface PendingListResponse {
   requests: PendingSubmitRequest[];
   pending_count: number;
   failed_count: number;
+  grant_summary?: PendingGrantSummary;
 }
 
 export interface PendingApproveAccepted {
@@ -540,6 +597,7 @@ export interface PendingBatchApproveResponse {
 export interface JoinEnrollee {
   id: number;
   name: string;
+  group_tag: string;
   banned: boolean;
   created_at?: string | null;
   updated_at?: string | null;
@@ -547,13 +605,35 @@ export interface JoinEnrollee {
 
 export interface BanSettings {
   auto_approve: boolean;
+  auto_approve_vcs: boolean;
   names: JoinEnrollee[];
 }
 
 export interface BanAutoApproveResponse {
+  group: string;
   auto_approve: boolean;
   started: number[];
   skipped: number[];
+}
+
+export interface SyncNotification {
+  id: number;
+  kind: string;
+  status: string;
+  email: string | null;
+  owner_tag: string | null;
+  account_name: string | null;
+  resource_name: string | null;
+  subscription_id: string | null;
+  new_api_name: string | null;
+  detail: string;
+  error: string | null;
+  created_at: string;
+}
+
+export interface NotificationListResponse {
+  items: SyncNotification[];
+  total: number;
 }
 
 export interface ResourceMetric {

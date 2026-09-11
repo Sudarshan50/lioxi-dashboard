@@ -129,6 +129,7 @@ class KimiNewApiPool(BaseModel):
     ok: bool
     gateway: str | None = None
     next_name: str | None = None
+    next_name_vcs: str | None = None
     channels: list[KimiNewApiChannel] = Field(default_factory=list)
     error: str | None = None
     auth_expired: bool = False
@@ -273,6 +274,12 @@ class KimiDropStoredRequest(BaseModel):
 class KimiDropStoredResponse(BaseModel):
     ok: bool = True
     dropped: int = 0
+
+
+class KimiCapacitySummary(BaseModel):
+    tpm: int = 0
+    rpm: int = 0
+    accounts: int = 0
 
 
 class KimiSheetStatus(BaseModel):

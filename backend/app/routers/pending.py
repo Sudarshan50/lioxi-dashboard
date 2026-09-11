@@ -10,8 +10,10 @@ from app.schemas.submit import (
     PendingBatchApproveResponse,
     PendingBatchSkipped,
     PendingDeclineResponse,
+    PendingGrantsResponse,
     PendingListResponse,
 )
+from app.services.pending_grants import refresh_pending_grants, stored_pending_grants, summarize_pending_public
 from app.services.submit_service import (
     SubmitError,
     enqueue_approve,
@@ -32,7 +34,18 @@ async def pending_list(db: AsyncSession = Depends(get_db)) -> PendingListRespons
         requests=public,
         pending_count=sum(1 for row in public if row.status == "pending_approval"),
         failed_count=sum(1 for row in public if row.status == "failed"),
+        grant_summary=summarize_pending_public(public),
     )
+
+
+@router.get("/grants", response_model=PendingGrantsResponse)
+async def pending_grants(db: AsyncSession = Depends(get_db)) -> PendingGrantsResponse:
+    return await stored_pending_grants(db)
+
+
+@router.post("/grants/refresh", response_model=PendingGrantsResponse)
+async def pending_grants_refresh(db: AsyncSession = Depends(get_db)) -> PendingGrantsResponse:
+    return await refresh_pending_grants(db)
 
 
 @router.post("/{request_id}/reject", response_model=PendingDeclineResponse)
@@ -57,6 +70,7 @@ async def pending_approve_batch(
             retry=payload.retry,
             new_api_priority=payload.new_api_priority,
             new_api_weight=payload.new_api_weight,
+            group=payload.group,
         )
     except SubmitError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

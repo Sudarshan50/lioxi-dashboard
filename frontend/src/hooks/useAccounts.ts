@@ -74,6 +74,7 @@ export function useUpdateAccount() {
       credits_limit?: number;
       credits_limit_manual?: boolean;
       owner_tag?: string;
+      group_tag?: string;
     }) => (await apiClient.patch<Account>(`/api/accounts/${accountId}`, payload)).data,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });

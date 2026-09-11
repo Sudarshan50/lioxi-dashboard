@@ -6,6 +6,15 @@ import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import Input from "@/components/ui/Input";
 import Spinner from "@/components/ui/Spinner";
+import {
+  GROUP_SB,
+  GROUP_VCS,
+  JoinGroup,
+  groupLabel,
+  isVcs,
+  joinAccountName,
+  normalizeGroup,
+} from "@/lib/joinGroup";
 import { joinPickerName } from "@/lib/ownerTag";
 import { toastDismiss, toastError } from "@/lib/toast";
 import {
@@ -129,6 +138,7 @@ export default function JoinPage() {
   const [subscriptions, setSubscriptions] = useState<SubmitSubscription[]>([]);
   const [subscriptionId, setSubscriptionId] = useState("");
   const [person, setPerson] = useState("");
+  const [group, setGroup] = useState<JoinGroup>(GROUP_SB);
   const [names, setNames] = useState<string[]>([]);
   const [namesLoading, setNamesLoading] = useState(() => Boolean(sessionStorage.getItem(JOIN_PASSWORD_KEY)));
   const [namesError, setNamesError] = useState<string | null>(null);
@@ -145,6 +155,18 @@ export default function JoinPage() {
     [subscriptions, subscriptionId]
   );
 
+  // Preview the account label this choice produces, so it is not blind. Uses
+  // the same precedence as the backend: picked name, then sign-in email.
+  const groupHint = useMemo(() => {
+    if (!isVcs(group)) return "Default. Your account is named Lioxi-<your name>.";
+    const picked = joinPickerName(person);
+    const derived = joinAccountName(group, snapshot?.account_holder, "", picked);
+    if (!derived) return "Your account is named after you, not Lioxi.";
+    return picked
+      ? `Your account is named ${derived}.`
+      : `Your account is named ${derived}, from your Azure sign-in email.`;
+  }, [group, person, snapshot?.account_holder]);
+
   useEffect(() => {
     if (error) toastError(error, { persist: true, toastId: "join-error" });
     else toastDismiss("join-error");
@@ -155,10 +177,17 @@ export default function JoinPage() {
     let cancelled = false;
     setNamesLoading(true);
     setNamesError(null);
-    void fetchSubmitNames()
+    void fetchSubmitNames(group)
       .then((rows) => {
         if (cancelled) return;
-        setNames(rows.map((name) => joinPickerName(name)).filter((name): name is string => Boolean(name)));
+        const allowed = rows
+          .map((name) => joinPickerName(name))
+          .filter((name): name is string => Boolean(name));
+        setNames(allowed);
+        // A name from the other group's list is not valid here.
+        setPerson((current) =>
+          allowed.some((name) => name.toLowerCase() === current.toLowerCase()) ? current : ""
+        );
         setNamesError(null);
       })
       .catch((exc) => {
@@ -177,11 +206,12 @@ export default function JoinPage() {
     return () => {
       cancelled = true;
     };
-  }, [unlocked, namesTick]);
+  }, [unlocked, namesTick, group]);
 
   useEffect(() => {
     if (step === "name") setNamesTick((n) => n + 1);
   }, [step]);
+
 
   useEffect(() => {
     if (!unlocked || !sessionId) return;
@@ -244,7 +274,7 @@ export default function JoinPage() {
     return () => {
       cancelled = true;
     };
-    // resume once on mount
+    // deps intentionally narrow: re-runs only when the gate opens
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [unlocked]);
 
@@ -268,6 +298,7 @@ export default function JoinPage() {
     if (current.subscription_id) setSubscriptionId(current.subscription_id);
     const savedName = joinPickerName(current.person_associated);
     if (savedName) setPerson(savedName);
+    if (current.group_tag) setGroup(normalizeGroup(current.group_tag));
     if (current.error) setError(current.error);
     if (current.status === "logged_in") {
       pickSubscription(current.subscriptions ?? [], current.subscription_id);
@@ -485,7 +516,11 @@ export default function JoinPage() {
     setStep("working");
     setPhaseMessage("Creating monitor identity…");
     try {
-      await commitSubmitSession(sessionId, { subscription_id: subscriptionId, person_associated: tag }, applyEvent);
+      await commitSubmitSession(
+        sessionId,
+        { subscription_id: subscriptionId, person_associated: tag, group_tag: group },
+        applyEvent
+      );
     } catch (exc) {
       const snap = await fetchSubmitSnapshot(sessionId).catch(() => null);
       if (snap && isSubmitComplete(snap.status)) {
@@ -694,7 +729,9 @@ export default function JoinPage() {
                   disabled={names.length === 0}
                   className="w-full rounded-lg border border-surface-border bg-surface px-3 py-2 text-sm text-gray-100 outline-none focus:border-accent disabled:opacity-60"
                 >
-                  <option value="">{names.length ? "Select from the dropdown…" : "No names available"}</option>
+                  <option value="">
+                    {names.length ? "Select from the dropdown…" : `No ${groupLabel(group)} names available`}
+                  </option>
                   {names.map((name) => (
                     <option key={name} value={name}>
                       {name}
@@ -702,10 +739,43 @@ export default function JoinPage() {
                   ))}
                 </select>
               )}
-              {names.length > 0 && (
+              {names.length > 0 ? (
                 <p className="text-xs text-gray-500">Use the dropdown. Custom names are not allowed.</p>
+              ) : (
+                !namesLoading &&
+                !namesError && (
+                  <p className="text-xs text-gray-500">
+                    No names are enrolled for {groupLabel(group)}. Ask an admin to add yours.
+                  </p>
+                )
               )}
             </label>
+            <div className="flex min-w-0 w-full flex-col gap-1.5">
+              <span className="text-xs font-medium text-gray-400">Group</span>
+              <div
+                role="radiogroup"
+                aria-label="Group"
+                className="flex gap-2 rounded-lg border border-surface-border bg-surface p-1"
+              >
+                {([GROUP_SB, GROUP_VCS] as JoinGroup[]).map((option) => (
+                  <button
+                    key={option}
+                    type="button"
+                    role="radio"
+                    aria-checked={group === option}
+                    onClick={() => setGroup(option)}
+                    className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors ${
+                      group === option
+                        ? "bg-accent text-white"
+                        : "text-gray-400 hover:bg-white/[0.04] hover:text-gray-200"
+                    }`}
+                  >
+                    {groupLabel(option)}
+                  </button>
+                ))}
+              </div>
+              <p className="text-xs text-gray-500">{groupHint}</p>
+            </div>
             <Button
               type="submit"
               isLoading={busy}

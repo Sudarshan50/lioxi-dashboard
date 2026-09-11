@@ -15,6 +15,7 @@ from app.schemas.account import (
     AccountUpdateRequest,
 )
 from app.services.openai_key_store import attach_stored_key
+from app.services.join_group import normalize_group
 from app.services.owner_tag import apply_owner_to_account, parse_owner_tag, person_from_payload
 
 
@@ -103,6 +104,7 @@ class AccountService:
             endpoint=resource["endpoint"],
             kind=resource["kind"],
             location=resource["location"],
+            group_tag=normalize_group(payload.group_tag),
         )
         _apply_credit_grant(account, payload.credits_limit, manual=True)
         try:
@@ -192,6 +194,10 @@ class AccountService:
             raise AccountValidationError(str(exc)) from exc
         if tag:
             account.owner_tag = tag
+        # Join group is decided once, at onboarding. A later re-deploy of the
+        # same resource must not silently move an account between pools.
+        if created:
+            account.group_tag = normalize_group(payload.get("group_tag"))
         siblings = await self._account_repository.list_all()
         apply_owner_to_account(account, siblings)
 
@@ -283,6 +289,8 @@ class AccountService:
             _apply_credit_grant(account, payload.credits_limit, manual=True)
         if payload.credits_limit_manual is not None:
             account.credits_limit_manual = payload.credits_limit_manual
+        if payload.group_tag is not None:
+            account.group_tag = normalize_group(payload.group_tag)
         if payload.owner_tag is not None:
             try:
                 account.owner_tag = parse_owner_tag(payload.owner_tag)

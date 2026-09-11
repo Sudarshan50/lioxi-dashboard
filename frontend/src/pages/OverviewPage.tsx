@@ -28,6 +28,7 @@ import { useModels } from "@/hooks/useModels";
 import { convertUsd, formatCurrency, formatDateTime, formatEstimatedCost, formatRate, formatRelative, formatTokens } from "@/lib/format";
 import { toastError, toastSuccess } from "@/lib/toast";
 import { amountPayableUsd, downloadPayableCsv } from "@/lib/payable";
+import { JOIN_GROUPS, JoinGroup, groupLabel, matchesGroup } from "@/lib/joinGroup";
 import { matchesOwner, rollupBreakdownByTag, rollupTpmByTag, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
 
 const RANGE_OPTIONS = [
@@ -45,6 +46,7 @@ export default function OverviewPage() {
   const [modelFilter, setModelFilter] = useState<string>(ALL);
   const [groupFilter, setGroupFilter] = useState<string>(ALL);
   const [ownerFilter, setOwnerFilter] = useState<string>(ALL);
+  const [joinGroupFilter, setJoinGroupFilter] = useState<string>(ALL);
 
   const { data: accounts, isLoading: accountsLoading, isError: accountsError } = useAccounts();
   const { data: models, isLoading: modelsLoading, isError: modelsError } = useModels();
@@ -61,6 +63,7 @@ export default function OverviewPage() {
   const modelId = modelFilter === ALL ? null : Number(modelFilter);
   const groupId = groupFilter === ALL ? null : Number(groupFilter);
   const owner = ownerFilter === ALL ? null : ownerFilter;
+  const joinGroup = joinGroupFilter === ALL ? null : (joinGroupFilter as JoinGroup);
   const selectedGroup = (groups ?? []).find((g) => g.id === groupId);
   const ownerOptions = useMemo(() => uniqueOwners(accounts ?? []), [accounts]);
 
@@ -70,10 +73,9 @@ export default function OverviewPage() {
       if (!model.model_name || model.registered_model_id == null) return false;
       if (accountId && model.provider_account_id !== accountId) return false;
       if (memberIds && !memberIds.has(model.provider_account_id)) return false;
-      if (owner) {
-        const account = (accounts ?? []).find((item) => item.id === model.provider_account_id);
-        if (!matchesOwner(account?.owner_tag, owner)) return false;
-      }
+      const modelAccount = (accounts ?? []).find((item) => item.id === model.provider_account_id);
+      if (owner && !matchesOwner(modelAccount?.owner_tag, owner)) return false;
+      if (joinGroup && !(modelAccount && matchesGroup(modelAccount, joinGroup))) return false;
       return true;
     });
     const unique = new Map<number, (typeof scoped)[number]>();
@@ -81,7 +83,7 @@ export default function OverviewPage() {
       if (!unique.has(model.registered_model_id)) unique.set(model.registered_model_id, model);
     }
     return [...unique.values()].sort((a, b) => a.model_name.localeCompare(b.model_name, undefined, { sensitivity: "base" }));
-  }, [accounts, models, accountId, groupId, owner, selectedGroup]);
+  }, [accounts, models, accountId, groupId, joinGroup, owner, selectedGroup]);
 
   function handleAccountChange(value: string) {
     setAccountFilter(value);
@@ -192,7 +194,13 @@ export default function OverviewPage() {
   const selectedAccount = (accounts ?? []).find((account) => account.id === accountId);
   const selectedModel = (models ?? []).find((model) => model.registered_model_id === modelId);
   const ownerLabel = owner === UNTAGGED_OWNER ? "Untagged" : owner;
-  const scopeHint = [ownerLabel, selectedGroup?.name, selectedAccount?.name, selectedModel?.model_name]
+  const scopeHint = [
+    joinGroup ? groupLabel(joinGroup) : null,
+    ownerLabel,
+    selectedGroup?.name,
+    selectedAccount?.name,
+    selectedModel?.model_name,
+  ]
     .filter(Boolean)
     .join(" · ");
 
@@ -203,8 +211,9 @@ export default function OverviewPage() {
       rows = rows.filter((account) => memberIds.has(account.id));
     }
     if (owner) rows = rows.filter((account) => matchesOwner(account.owner_tag, owner));
+    if (joinGroup) rows = rows.filter((account) => matchesGroup(account, joinGroup));
     return rows;
-  }, [accounts, groupId, owner, selectedGroup]);
+  }, [accounts, groupId, joinGroup, owner, selectedGroup]);
 
   const scopedAccounts = useMemo(() => {
     let rows = accounts ?? [];
@@ -214,8 +223,9 @@ export default function OverviewPage() {
       rows = rows.filter((account) => memberIds.has(account.id));
     }
     if (owner) rows = rows.filter((account) => matchesOwner(account.owner_tag, owner));
+    if (joinGroup) rows = rows.filter((account) => matchesGroup(account, joinGroup));
     return rows;
-  }, [accounts, accountId, groupId, owner, selectedGroup]);
+  }, [accounts, accountId, groupId, joinGroup, owner, selectedGroup]);
 
   const lastSyncedAt = useMemo(() => {
     let latest: string | null = null;
@@ -350,6 +360,18 @@ export default function OverviewPage() {
             {(accounts ?? []).some((account) => !(account.owner_tag ?? "").trim()) && (
               <option value={UNTAGGED_OWNER}>Untagged</option>
             )}
+          </Select>
+          <Select
+            label="Join group"
+            value={joinGroupFilter}
+            onChange={(e) => { setJoinGroupFilter(e.target.value); setAccountFilter(ALL); setModelFilter(ALL); }}
+          >
+            <option value={ALL}>All groups</option>
+            {JOIN_GROUPS.map((option) => (
+              <option key={option} value={option}>
+                {groupLabel(option)}
+              </option>
+            ))}
           </Select>
           <Select label="Group" value={groupFilter} onChange={(e) => handleGroupChange(e.target.value)} disabled={groupsLoading}>
             <option value={ALL}>{groupsLoading ? "Loading groups..." : "All groups"}</option>

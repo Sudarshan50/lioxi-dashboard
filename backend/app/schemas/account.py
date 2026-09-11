@@ -41,6 +41,7 @@ class AccountCreateRequest(BaseModel):
     location: str = ""
     credits_limit: float | None = None
     owner_tag: str | None = None
+    group_tag: str | None = None
 
 
 class AccountUpdateRequest(BaseModel):
@@ -54,6 +55,7 @@ class AccountUpdateRequest(BaseModel):
     credits_limit: float | None = None
     credits_limit_manual: bool | None = None
     owner_tag: str | None = None
+    group_tag: str | None = None
 
 
 class AccountResponse(BaseModel):
@@ -85,6 +87,7 @@ class AccountResponse(BaseModel):
     new_api_name: str | None = None
     new_api_tag: str | None = None
     owner_tag: str | None = None
+    group_tag: str = "sb"
     new_api_used_quota: float | None = None
     new_api_cost_o1_usd: float | None = None
     new_api_cost_o2_usd: float | None = None

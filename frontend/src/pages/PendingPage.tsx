@@ -1,18 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Inbox } from "lucide-react";
+import { AlertTriangle, Inbox, Wallet } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import Badge from "@/components/ui/Badge";
+import GroupBadge from "@/components/ui/GroupBadge";
+import GroupChips from "@/components/ui/GroupChips";
 import Button from "@/components/ui/Button";
 import Card from "@/components/ui/Card";
 import EmptyState from "@/components/ui/EmptyState";
 import Spinner from "@/components/ui/Spinner";
+import PendingGrantsModal from "@/components/pending/PendingGrantsModal";
+import { JoinGroup, groupCounts, matchesGroup } from "@/lib/joinGroup";
 import { invalidateAfterDeploy, useKimiDeployDefaults, useSaveKimiDeployDefaults } from "@/hooks/useKimiDeploy";
 import apiClient from "@/lib/apiClient";
 import { useBanSettings } from "@/hooks/useBan";
+import { formatCurrency } from "@/lib/format";
 import { enqueuePendingApprove, enqueuePendingApproveBatch } from "@/lib/submitApi";
 import { toastError, toastSuccess } from "@/lib/toast";
-import { PendingListResponse, PendingSubmitRequest } from "@/types";
+import { PendingGrantSummary, PendingListResponse, PendingSubmitRequest } from "@/types";
 
 function statusTone(status: string): "info" | "success" | "error" | "warning" | "neutral" {
   if (status === "pending_approval") return "info";
@@ -66,6 +71,7 @@ function SubmitCard({
                 {row.person_associated}
               </Badge>
             )}
+            <GroupBadge group={row.group_tag} />
             <Badge tone={statusTone(row.status)} className={inFlight ? "animate-pulse" : undefined}>
               {statusLabel(row.status)}
             </Badge>
@@ -164,6 +170,8 @@ export default function PendingPage() {
     },
   });
   const [submitting, setSubmitting] = useState(false);
+  const [grantsOpen, setGrantsOpen] = useState(false);
+  const [groupFilter, setGroupFilter] = useState<JoinGroup | null>(null);
 
   useEffect(() => {
     if (!defaults.data || seededDefaults.current) return;
@@ -243,7 +251,13 @@ export default function PendingPage() {
   async function approveBatch(retry: boolean) {
     setSubmitting(true);
     try {
-      const result = await enqueuePendingApproveBatch({ retry, ...routing });
+      // Without the filter the server sweeps every pending row, deploying
+      // accounts the admin cannot see on screen.
+      const result = await enqueuePendingApproveBatch({
+        retry,
+        ...(groupFilter ? { group: groupFilter } : {}),
+        ...routing,
+      });
       if (result.started.length === 0) {
         toastError(retry ? "Nothing to retry." : "Nothing to approve.");
       } else {
@@ -261,7 +275,12 @@ export default function PendingPage() {
     }
   }
 
-  const rows = list.data?.requests ?? [];
+  const allRows = list.data?.requests ?? [];
+  const groupStats = useMemo(() => groupCounts(allRows), [allRows]);
+  const rows = useMemo(
+    () => allRows.filter((row) => matchesGroup(row, groupFilter)),
+    [allRows, groupFilter]
+  );
   const waiting = useMemo(() => rows.filter((row) => row.status === "pending_approval"), [rows]);
   const inflight = useMemo(
     () => rows.filter((row) => row.status === "creating_sp" || row.status === "approving"),
@@ -273,6 +292,20 @@ export default function PendingPage() {
     [failedRows]
   );
   const approvedRows = useMemo(() => rows.filter((row) => row.status === "approved"), [rows]);
+  const grantSummary: PendingGrantSummary = list.data?.grant_summary ?? {
+    total: waiting.length,
+    fetched: 0,
+    missing: waiting.length,
+    failed: 0,
+    pool_usd: 0,
+    count_10k: 0,
+    count_1k: 0,
+    count_other: 0,
+    pool_10k_usd: 0,
+    pool_1k_usd: 0,
+    fetched_at: null,
+  };
+  const grantsLoaded = grantSummary.fetched > 0;
   const busy = submitting || reject.isPending;
   const empty =
     !list.isLoading && waiting.length === 0 && inflight.length === 0 && failedRows.length === 0 && approvedRows.length === 0;
@@ -393,6 +426,12 @@ export default function PendingPage() {
               </div>
             </section>
           )}
+          <GroupChips
+            counts={groupStats}
+            total={allRows.length}
+            value={groupFilter}
+            onChange={setGroupFilter}
+          />
           <section className="flex flex-col gap-3">
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="text-sm font-semibold text-gray-100">Ready to approve</h2>
@@ -408,6 +447,28 @@ export default function PendingPage() {
                 </Button>
               )}
             </div>
+            {waiting.length > 0 && (
+              <div className="flex flex-wrap items-center gap-2 text-xs text-gray-400">
+                <span>
+                  {grantsLoaded ? (
+                    <>
+                      Pending Azure grants:{" "}
+                      <span className="tabular-nums text-gray-200">{formatCurrency(grantSummary.pool_usd, "USD")}</span>{" "}
+                      pool · {grantSummary.count_10k}× 10k · {grantSummary.count_1k}× 1k
+                      {grantSummary.count_other > 0 ? ` · ${grantSummary.count_other}× other` : ""}
+                      {grantSummary.missing > 0 ? ` · ${grantSummary.missing} not loaded` : ""}
+                      {grantSummary.failed > 0 ? ` · ${grantSummary.failed} null` : ""}
+                    </>
+                  ) : (
+                    "Pending Azure grants not loaded"
+                  )}
+                </span>
+                <Button variant="secondary" className="px-2.5 py-1 text-[11px]" onClick={() => setGrantsOpen(true)}>
+                  <Wallet size={12} />
+                  {grantsLoaded ? "View grants" : "Load grants"}
+                </Button>
+              </div>
+            )}
             {waiting.length === 0 && inflight.length === 0 ? (
               <p className="text-xs text-gray-500">No submissions waiting for K3 deploy.</p>
             ) : (
@@ -452,6 +513,11 @@ export default function PendingPage() {
           )}
         </>
       )}
+      <PendingGrantsModal
+        isOpen={grantsOpen}
+        onClose={() => setGrantsOpen(false)}
+        needsFetch={!grantsLoaded || grantSummary.missing > 0}
+      />
     </div>
   );
 }

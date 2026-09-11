@@ -12,6 +12,8 @@ import ManualResourceFields, {
   ManualResourceValues,
   parseCreditGrant,
 } from "@/components/accounts/ManualResourceFields";
+import GroupTagField from "@/components/accounts/GroupTagField";
+import { GROUP_SB, JoinGroup } from "@/lib/joinGroup";
 import OwnerTagField from "@/components/accounts/OwnerTagField";
 import Button from "@/components/ui/Button";
 import Input from "@/components/ui/Input";
@@ -56,6 +58,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
   const [manualModels, setManualModels] = useState<ManualModelRow[]>([newManualModelRow()]);
   const [discoveredCreditsLimit, setDiscoveredCreditsLimit] = useState("");
   const [ownerTag, setOwnerTag] = useState("");
+  const [groupTag, setGroupTag] = useState<JoinGroup>(GROUP_SB);
   const [error, setError] = useState<string | null>(null);
   const [didSave, setDidSave] = useState(false);
 
@@ -233,6 +236,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
   async function saveAccount(payload: Record<string, unknown>, links: Record<string, string>) {
     const tag = ownerTag.trim();
     if (tag) payload.owner_tag = tag;
+    payload.group_tag = groupTag;
     const account = await createAccount.mutateAsync(payload);
     const failed = await linkSelectedDeployments(createModel.mutateAsync, account.id, links);
     if (failed.length > 0) {
@@ -331,6 +335,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <Input label="Account name" placeholder="e.g. Production - East US" value={name} onChange={(e) => setName(e.target.value)} />
               <OwnerTagField value={ownerTag} onChange={setOwnerTag} id="add-account-owner-tag" compact />
+              <GroupTagField value={groupTag} onChange={setGroupTag} id="add-account-group-tag" compact />
             </div>
             <p className="-mt-2 text-xs text-gray-500">
               Name tag is the person this account belongs to. Pick an existing name or type a new one.
@@ -401,6 +406,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
               onChange={(e) => setDiscoveredCreditsLimit(e.target.value)}
             />
             <OwnerTagField value={ownerTag} onChange={setOwnerTag} id="add-account-owner-tag-resource" compact />
+            <GroupTagField value={groupTag} onChange={setGroupTag} id="add-account-group-tag-resource" compact />
 
             <DeploymentLinkPicker
               deployments={deployments}
@@ -436,6 +442,7 @@ export default function AddAccountModal({ isOpen, onClose }: AddAccountModalProp
           <div className="flex flex-col gap-4">
             <ManualResourceFields values={manual} onChange={(patch) => setManual((prev) => ({ ...prev, ...patch }))} />
             <OwnerTagField value={ownerTag} onChange={setOwnerTag} id="add-account-owner-tag-manual" compact />
+            <GroupTagField value={groupTag} onChange={setGroupTag} id="add-account-group-tag-manual" compact />
             <div className="flex flex-col gap-2">
               <label className="text-xs font-medium text-gray-400">Models / deployments</label>
               {manualModels.map((row) => (

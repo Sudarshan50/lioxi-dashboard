@@ -18,7 +18,9 @@ import { useRegisteredModels } from "@/hooks/useRegisteredModels";
 import { AzureAccountImport, parseAzureAccountImportArray } from "@/lib/parseAzureCredentials";
 import { allocateUniqueName } from "@/lib/uniqueName";
 import { parseCreditGrant } from "@/components/accounts/ManualResourceFields";
+import GroupTagField from "@/components/accounts/GroupTagField";
 import OwnerTagField from "@/components/accounts/OwnerTagField";
+import { GROUP_SB, JoinGroup, normalizeGroup } from "@/lib/joinGroup";
 import { Deployment, DiscoveredResource } from "@/types";
 
 interface BulkUploadAccountsModalProps {
@@ -49,6 +51,7 @@ interface ImportRow {
   deploymentName: string;
   registeredId: string;
   ownerTag: string;
+  groupTag: JoinGroup;
 }
 
 export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadAccountsModalProps) {
@@ -256,6 +259,7 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
         }
         if (grant) payload.credits_limit = grant;
         if (row.ownerTag.trim()) payload.owner_tag = row.ownerTag.trim();
+        payload.group_tag = row.groupTag ?? GROUP_SB;
         try {
           const account = await createAccount.mutateAsync(payload);
           const links = { ...row.deploymentLinks };
@@ -347,6 +351,12 @@ export default function BulkUploadAccountsModal({ isOpen, onClose }: BulkUploadA
                       value={row.ownerTag}
                       onChange={(value) => patchRow(row.id, { ownerTag: value })}
                       id={`bulk-owner-tag-${row.id}`}
+                      compact
+                    />
+                    <GroupTagField
+                      value={row.groupTag ?? GROUP_SB}
+                      onChange={(value) => patchRow(row.id, { groupTag: value })}
+                      id={`bulk-group-tag-${row.id}`}
                       compact
                     />
                     <div className="flex flex-col gap-1.5">
@@ -553,5 +563,6 @@ function toRow(account: AzureAccountImport, index: number): ImportRow {
     deploymentName: account.deploymentName ?? "",
     registeredId: "",
     ownerTag: account.ownerTag ?? "",
+    groupTag: normalizeGroup(account.groupTag),
   };
 }
