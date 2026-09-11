@@ -193,6 +193,42 @@ async def _ensure_submit_indexes(conn) -> None:
 ELEVATED_BACKFILL_KEY = "sp_elevated_access_backfilled"
 
 
+async def _ensure_submit_name_unique(conn) -> None:
+    """Back the advisory lock in submit_service with a real constraint.
+
+    The lock serialises allocation, so this should never fire; it exists so a
+    future path that forgets the lock cannot silently mint a duplicate name.
+    """
+    duplicates = (
+        await conn.execute(
+            text(
+                """
+                SELECT lower(name) AS name, count(*) AS n
+                FROM sp_submit_requests
+                WHERE name IS NOT NULL AND btrim(name) <> ''
+                GROUP BY lower(name)
+                HAVING count(*) > 1
+                """
+            )
+        )
+    ).all()
+    if duplicates:
+        logger.error(
+            "sp_submit_requests has duplicate names; unique index not created: %s",
+            ", ".join(f"{row.name} x{row.n}" for row in duplicates),
+        )
+        return
+    await conn.execute(
+        text(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_sp_submit_name
+            ON sp_submit_requests (lower(name))
+            WHERE name IS NOT NULL AND btrim(name) <> ''
+            """
+        )
+    )
+
+
 async def _ensure_sp_elevated_access(conn) -> None:
     """Backfill elevated_access for pre-existing deploys, once.
 
@@ -254,4 +290,5 @@ async def init_models() -> None:
         await _ensure_group_tag_indexes(conn)
         await _ensure_join_enrollee_group(conn)
         await _ensure_submit_indexes(conn)
+        await _ensure_submit_name_unique(conn)
         await _ensure_sp_elevated_access(conn)

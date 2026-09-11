@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -65,6 +65,13 @@ DUPLICATE_SUB_MESSAGE = (
 ALREADY_ONBOARDED_MESSAGE = "This Azure subscription is already in the portal."
 
 SP_NAME = "usage-and-credits-monitor"
+# Arbitrary constant; only has to be stable and unique among our advisory locks.
+NAME_ALLOCATION_LOCK = 8_724_193_055_110_001
+_NAME_CONSTRAINT = "uq_sp_submit_name"
+
+
+def _is_duplicate_name_error(exc: IntegrityError) -> bool:
+    return _NAME_CONSTRAINT in str(getattr(exc, "orig", exc))
 CREATING_SP_MAX_AGE = timedelta(minutes=25)
 APPROVING_MAX_AGE = timedelta(minutes=45)
 LOGIN_TASK_GRACE = timedelta(seconds=45)
@@ -670,6 +677,31 @@ async def _run_login(session_id: str, tenant_id: str | None = None) -> None:
         await _publish(session_id, {"type": "error", "detail": detail})
 
 
+async def allocate_submit_name(db: AsyncSession, preferred: str, exclude_id: int) -> str:
+    """Claim a portal account name that no account or submission holds yet.
+
+    Takes a transaction-scoped advisory lock first. Without it two concurrent
+    commits read the same taken-set and allocate the same name; the portal
+    would later rename one to Lioxi-Ayush1 while its Azure stack had already
+    been built from Lioxi-Ayush, leaving the two permanently disagreeing.
+    The lock is released when the caller's transaction ends.
+    """
+    await db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": NAME_ALLOCATION_LOCK})
+    taken = {
+        str(name).lower()
+        for (name,) in (await db.execute(select(ProviderAccount.name))).all()
+        if name
+    }
+    taken.update(
+        str(name).lower()
+        for (name,) in (
+            await db.execute(select(SpSubmitRequest.name).where(SpSubmitRequest.id != exclude_id))
+        ).all()
+        if name
+    )
+    return allocate_unique_name(preferred, taken)
+
+
 async def commit_session(
     db: AsyncSession,
     session_id: str,
@@ -742,23 +774,11 @@ async def commit_session(
     mod = load_deploy_module()
     slug = mod.slugify(person)
     label = "".join(person.split())
-    taken = {
-        str(name).lower()
-        for (name,) in (await db.execute(select(ProviderAccount.name))).all()
-        if name
-    }
-    taken.update(
-        str(name).lower()
-        for (name,) in (
-            await db.execute(select(SpSubmitRequest.name).where(SpSubmitRequest.id != row.id))
-        ).all()
-        if name
-    )
     # The picked name is the owner tag for both groups. Only the portal
     # account label differs: Lioxi-<Name> for SB, the bare enrolled name for
     # VCS (which then drives the Azure <slug>-proxy stack names).
     preferred = join_account_name(group, row.account_holder, f"Lioxi-{label or slug}", person)
-    display_name = allocate_unique_name(preferred, taken)
+    display_name = await allocate_submit_name(db, preferred, exclude_id=row.id)
     row.status = STATUS_CREATING_SP
     row.group_tag = group
     row.person_associated = person
@@ -771,6 +791,10 @@ async def commit_session(
         await db.commit()
     except IntegrityError as exc:
         await db.rollback()
+        if _is_duplicate_name_error(exc):
+            raise SubmitError(
+                "That account name was just taken. Submit again to get the next one."
+            ) from exc
         raise SubmitError(DUPLICATE_SUB_MESSAGE) from exc
 
     async def emit(event: dict[str, Any]) -> None:
