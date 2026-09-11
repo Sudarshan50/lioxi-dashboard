@@ -88,6 +88,21 @@ def _is_duplicate_enrollee_error(exc: IntegrityError) -> bool:
     return _constraint_in_error(exc, _ENROLLEE_CONSTRAINT)
 
 
+def _grant_steps() -> tuple[list[str], set[str], int]:
+    """Roles to assign, which of them are mandatory, and the progress step count.
+
+    A step is the monitor identity, then each role, then billing reader. The
+    Join wizard sizes its progress bar from this before any Azure call runs,
+    so the count has to be known up front rather than discovered on the way.
+    """
+    mod = load_deploy_module()
+    roles: list[str] = list(getattr(mod, "ALL_ROLES", []))
+    if "Contributor" in roles:
+        roles = ["Contributor"] + [item for item in roles if item != "Contributor"]
+    admin_roles = set(getattr(mod, "ADMIN_ROLES", _DEFAULT_ADMIN_ROLES))
+    return roles, admin_roles, len(roles) + 2
+
+
 CREATING_SP_MAX_AGE = timedelta(minutes=25)
 APPROVING_MAX_AGE = timedelta(minutes=45)
 LOGIN_TASK_GRACE = timedelta(seconds=45)
@@ -818,7 +833,15 @@ async def commit_session(
         if on_progress is not None:
             await on_progress(payload)
 
-    await emit({"type": "phase", "phase": "sp", "message": "Creating monitor identity…"})
+    await emit(
+        {
+            "type": "phase",
+            "phase": "sp",
+            "message": "Creating monitor identity…",
+            "done": 0,
+            "total": _grant_steps()[2],
+        }
+    )
     try:
         await _provision_sp(db, row, slug, emit)
     except asyncio.CancelledError:
@@ -924,6 +947,22 @@ async def _provision_sp(
             "This Microsoft account has no Azure subscription (tenant-level login only). "
             "Ask them to join again with the account that owns the subscription."
         )
+
+    roles, admin_roles, total_grants = _grant_steps()
+
+    async def emit_progress(message: str, done: int, role: str | None = None) -> None:
+        event: dict[str, Any] = {
+            "type": "phase",
+            "phase": "roles" if done else "sp",
+            "message": message,
+            "done": done,
+            "total": total_grants,
+        }
+        if role is not None:
+            event["role"] = role
+        await emit(event)
+
+    await emit_progress("Creating monitor identity…", 0)
     await az.set_subscription(sub)
 
     stored = (
@@ -972,40 +1011,22 @@ async def _provision_sp(
     row.sp_display_name = sp_name
     await db.commit()
 
+    await emit_progress("Monitor identity ready.", 1)
     oid = await az.sp_object_id(app_id)
     if stored is None and oid:
         await az.add_sp_as_app_owner(app_id, oid)
-    mod = load_deploy_module()
-    roles: list[str] = list(getattr(mod, "ALL_ROLES", []))
-    admin_roles = set(getattr(mod, "ADMIN_ROLES", _DEFAULT_ADMIN_ROLES))
-    if "Contributor" in roles:
-        roles = ["Contributor"] + [item for item in roles if item != "Contributor"]
     tenant = str(row.tenant_id or "")
     assigns_billing = bool(oid and tenant)
-    total_grants = len(roles) + (1 if assigns_billing else 0)
 
-    async def emit_roles(message: str, done: int, role: str | None = None) -> None:
-        event: dict[str, Any] = {
-            "type": "phase",
-            "phase": "roles",
-            "message": message,
-            "done": done,
-            "total": total_grants,
-        }
-        if role is not None:
-            event["role"] = role
-        await emit(event)
-
-    await emit_roles("Assigning Azure roles…", 0)
     failed_by_role: dict[str, str] = {}
     for index, role in enumerate(roles):
         if session_aborted(row.session_id):
             raise asyncio.CancelledError
-        await emit_roles(f"Assigning {role}…", index, role)
+        await emit_progress(f"Assigning {role}…", index + 1, role)
         ok, err = await az.assign_role(app_id, role, sub, object_id=oid, timeout=90 if role == "Contributor" else 45)
         if not ok:
             failed_by_role[role] = err or "assignment failed"
-        await emit_roles(f"Assigning {role}…", index + 1, role)
+        await emit_progress(f"Assigning {role}…", index + 2, role)
 
     admin_failed = [f"{role}: {err}" for role, err in failed_by_role.items() if role in admin_roles]
     if admin_failed:
@@ -1015,11 +1036,11 @@ async def _provision_sp(
 
     billing_err = None
     if assigns_billing:
-        await emit_roles("Assigning billing reader…", len(roles))
+        await emit_progress("Assigning billing reader…", total_grants - 1)
         ok, err = await az.assign_billing_reader(oid, tenant)
         if not ok:
             billing_err = err
-        await emit_roles("Assigning billing reader…", total_grants)
+    await emit_progress("Finishing…", total_grants)
 
     await _ensure_still_creating(db, row)
     row.billing_error = billing_err

@@ -5,6 +5,7 @@ export default function JoinProgress({ label, value }: { label: string; value: J
   const done = Math.min(Math.max(value.done, 0), total);
   const percent = Math.round((done / total) * 100);
   const complete = done >= total;
+  const starting = done === 0;
 
   return (
     <div className="flex flex-col gap-2 rounded-xl border border-white/[0.08] bg-surface-raised/60 p-3">
@@ -22,19 +23,23 @@ export default function JoinProgress({ label, value }: { label: string; value: J
         aria-valuenow={done}
         className="relative h-2 overflow-hidden rounded-full bg-white/[0.06] shadow-[inset_0_1px_0_rgba(255,255,255,0.05)]"
       >
-        <div
-          className={`relative h-full rounded-full transition-[width] duration-500 ease-out ${
-            complete ? "bg-emerald-400/90" : "bg-accent-gradient shadow-glow-sm"
-          }`}
-          style={{ width: `${percent}%` }}
-        >
-          {!complete && percent > 0 && (
-            <span className="absolute inset-y-0 left-0 w-1/3 animate-bar-shimmer bg-gradient-to-r from-transparent via-white/35 to-transparent" />
-          )}
-        </div>
+        {starting ? (
+          <span className="absolute inset-y-0 left-0 w-1/3 animate-bar-shimmer rounded-full bg-accent-gradient opacity-70" />
+        ) : (
+          <div
+            className={`relative h-full rounded-full transition-[width] duration-500 ease-out ${
+              complete ? "bg-emerald-400/90" : "bg-accent-gradient shadow-glow-sm"
+            }`}
+            style={{ width: `${percent}%` }}
+          >
+            {!complete && (
+              <span className="absolute inset-y-0 left-0 w-1/3 animate-bar-shimmer bg-gradient-to-r from-transparent via-white/35 to-transparent" />
+            )}
+          </div>
+        )}
       </div>
       <p className={`text-[11px] ${complete ? "text-emerald-300/90" : "text-gray-500"}`}>
-        {complete ? "All permissions granted." : `${percent}% of Azure permissions granted`}
+        {complete ? "Azure setup complete." : starting ? "Preparing…" : `${percent}% complete`}
       </p>
     </div>
   );

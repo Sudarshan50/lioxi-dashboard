@@ -83,30 +83,41 @@ class RoleProgressEvents(unittest.IsolatedAsyncioTestCase):
             ),
         ):
             await submit_service._provision_sp(db, _row(), "slug", emit)
-        return az, [event for event in events if event.get("phase") == "roles"]
+        return az, [event for event in events if "total" in event]
 
-    async def test_total_counts_every_role_plus_billing(self):
-        _, roles = await self._run(["Reader", "Contributor"], ["Contributor"])
-        self.assertTrue(roles)
-        self.assertEqual({event["total"] for event in roles}, {3})
+    async def test_total_counts_identity_every_role_and_billing(self):
+        _, progress = await self._run(["Reader", "Contributor"], ["Contributor"])
+        self.assertTrue(progress)
+        self.assertEqual({event["total"] for event in progress}, {4})
+
+    async def test_bar_starts_at_zero_before_any_azure_call(self):
+        _, progress = await self._run(["Reader"], [])
+        self.assertEqual(progress[0]["done"], 0)
+        self.assertIn("monitor identity", progress[0]["message"].lower())
+
+    async def test_identity_is_the_first_completed_step(self):
+        _, progress = await self._run(["Reader"], [])
+        identity = next(event for event in progress if event["done"] == 1)
+        self.assertNotIn("role", identity)
 
     async def test_progress_never_moves_backwards_and_finishes_full(self):
-        _, roles = await self._run(["Reader", "Monitoring Reader", "Contributor"], ["Contributor"])
-        done = [event["done"] for event in roles]
+        _, progress = await self._run(["Reader", "Monitoring Reader", "Contributor"], ["Contributor"])
+        done = [event["done"] for event in progress]
         self.assertEqual(done[0], 0)
         self.assertEqual(done, sorted(done))
-        self.assertEqual(done[-1], roles[-1]["total"])
+        self.assertEqual(done[-1], progress[-1]["total"])
 
-    async def test_each_role_reports_start_and_finish(self):
-        az, roles = await self._run(["Reader", "Contributor"], ["Contributor"])
-        pairs = [(event["role"], event["done"]) for event in roles if "role" in event]
+    async def test_each_role_reports_start_and_finish_after_identity(self):
+        az, progress = await self._run(["Reader", "Contributor"], ["Contributor"])
+        pairs = [(event["role"], event["done"]) for event in progress if "role" in event]
         self.assertEqual(az.assigned, ["Contributor", "Reader"])
-        self.assertEqual(pairs, [("Contributor", 0), ("Contributor", 1), ("Reader", 1), ("Reader", 2)])
+        self.assertEqual(pairs, [("Contributor", 1), ("Contributor", 2), ("Reader", 2), ("Reader", 3)])
 
     async def test_billing_step_completes_the_bar(self):
-        _, roles = await self._run(["Reader"], [])
-        billing = [event for event in roles if "billing reader" in event["message"]]
-        self.assertEqual([event["done"] for event in billing], [1, 2])
+        _, progress = await self._run(["Reader"], [])
+        billing = [event for event in progress if "billing reader" in event["message"]]
+        self.assertEqual([event["done"] for event in billing], [2])
+        self.assertEqual(progress[-1]["done"], progress[-1]["total"])
 
 
 if __name__ == "__main__":

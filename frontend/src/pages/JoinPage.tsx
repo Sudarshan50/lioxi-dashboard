@@ -779,7 +779,7 @@ export default function JoinPage() {
         {step === "working" && (
           <div className="flex flex-col gap-3">
             <p className="text-center text-xs text-gray-400">{phaseMessage}</p>
-            {roleProgress && <JoinProgress label="Azure permissions" value={roleProgress} />}
+            {roleProgress && <JoinProgress label="Azure setup" value={roleProgress} />}
             <JoinTerminal lines={termLines} waiting />
             <Button type="button" variant="secondary" onClick={() => void handleCancelSignIn()} className="w-full">
               Cancel
