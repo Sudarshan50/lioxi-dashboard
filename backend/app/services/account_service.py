@@ -303,8 +303,44 @@ class AccountService:
         except IntegrityError as exc:
             raise DuplicateAccountError("An account with that name already exists.") from exc
 
+    def _undeploy_payload(self, account: ProviderAccount) -> dict[str, str]:
+        return {
+            "AZURE_TENANT_ID": account.tenant_id,
+            "AZURE_CLIENT_ID": account.client_id,
+            "AZURE_CLIENT_SECRET": self._secret_box.decrypt(account.client_secret_encrypted),
+            "AZURE_SUBSCRIPTION_ID": account.subscription_id,
+            "name": account.name,
+            "account_name": account.resource_name or "",
+            "resource_group": account.resource_group or "",
+            "azure_openai_endpoint": account.endpoint or "",
+            "person_associated": account.owner_tag or "",
+            "group_tag": account.group_tag or "",
+            "new_api_name": account.new_api_name or "",
+        }
+
     async def delete_account(self, account_id: int) -> None:
         account = await self._get_or_raise(account_id)
+        session = self._account_repository._session
+        from app.services.google_sheet_inventory import mark_deleted_inventory
+        from app.services.kimi_deploy_service import KimiDeployError, delete_accounts
+        from app.services.openai_key_store import drop_foundry_key
+        from app.services.azure_inventory_cache import drop_azure_inventory
+        from app.services.service_principal_store import drop_stored_principal
+
+        try:
+            results = await delete_accounts([self._undeploy_payload(account)], jobs=1, session=session)
+        except KimiDeployError as exc:
+            raise AccountValidationError(str(exc)) from exc
+        if results and not results[0].ok:
+            raise AccountValidationError(results[0].error or "Could not undeploy the Azure stack.")
+        await mark_deleted_inventory(
+            endpoint=account.endpoint,
+            resource_name=account.resource_name,
+            proxy_name=account.new_api_name,
+        )
+        await drop_foundry_key(session, account.subscription_id, account.resource_name)
+        await drop_azure_inventory(account.subscription_id, account.resource_name)
+        await drop_stored_principal(session, account.subscription_id)
         await self._account_repository.delete(account)
 
     async def _get_or_raise(self, account_id: int) -> ProviderAccount:

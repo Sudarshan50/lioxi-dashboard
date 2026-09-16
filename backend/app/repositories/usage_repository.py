@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -152,6 +152,14 @@ class UsageRepository:
                 func.coalesce(func.sum(UsageSnapshot.total_tokens), 0),
                 func.coalesce(func.sum(UsageSnapshot.request_count), 0),
                 func.coalesce(func.sum(UsageSnapshot.estimated_cost_usd), 0.0),
+                func.min(
+                    case(
+                        (
+                            (UsageSnapshot.total_tokens > 0) | (UsageSnapshot.request_count > 0),
+                            UsageSnapshot.bucket_start,
+                        )
+                    )
+                ),
             )
             .select_from(ProviderAccount)
             .outerjoin(UsageSnapshot, join_condition)
@@ -159,7 +167,18 @@ class UsageRepository:
         if account_ids is not None:
             query = query.where(ProviderAccount.id.in_(account_ids))
         query = query.group_by(ProviderAccount.id, ProviderAccount.name).order_by(ProviderAccount.name)
-        return _to_breakdown(await self._session.execute(query))
+        rows = (await self._session.execute(query)).all()
+        return [
+            {
+                "id": row_id,
+                "name": name,
+                "total_tokens": int(tokens),
+                "requests": int(requests),
+                "estimated_cost_usd": float(cost),
+                "first_bucket": first_bucket,
+            }
+            for row_id, name, tokens, requests, cost, first_bucket in rows
+        ]
 
     async def get_breakdown_by_model(
         self, start: datetime, end: datetime, account_ids: list[int] | None, model_id: int | None = None

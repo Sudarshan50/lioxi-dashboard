@@ -132,6 +132,27 @@ async def decrypt_foundry_key(
     return None
 
 
+async def drop_foundry_key(
+    session: AsyncSession,
+    subscription_id: str | None,
+    resource_name: str | None,
+) -> None:
+    subscription_id = (subscription_id or "").strip()
+    target = resource_key(resource_name)
+    if not subscription_id or not target:
+        return
+    stored_rows = (
+        await session.execute(select(AzureOpenaiKey).where(AzureOpenaiKey.subscription_id == subscription_id))
+    ).scalars()
+    changed = False
+    for stored in stored_rows:
+        if resource_key(stored.resource_name) == target or resource_key(stored.endpoint) == target:
+            await session.delete(stored)
+            changed = True
+    if changed:
+        await session.commit()
+
+
 async def foundry_resource_names(session: AsyncSession, subscription_id: str) -> list[str]:
     subscription_id = (subscription_id or "").strip()
     if not subscription_id:

@@ -82,9 +82,10 @@ export function rollupBreakdownByTag<T extends NumericBreakdown>(
     const prevTokens = current.total_tokens || 0;
     const addTokens = item.total_tokens || 0;
     const nextTokens = prevTokens + addTokens;
-    if (nextTokens > 0) {
-      current.avg_tpm = ((current.avg_tpm ?? 0) * prevTokens + (item.avg_tpm ?? 0) * addTokens) / nextTokens;
-    }
+    const prevMinutes = prevTokens > 0 && (current.avg_tpm ?? 0) > 0 ? prevTokens / (current.avg_tpm as number) : 0;
+    const addMinutes = addTokens > 0 && (item.avg_tpm ?? 0) > 0 ? addTokens / (item.avg_tpm as number) : 0;
+    const minutes = Math.max(prevMinutes, addMinutes);
+    if (minutes > 0) current.avg_tpm = nextTokens / minutes;
     current.total_tokens = nextTokens;
     current.requests += item.requests || 0;
     current.estimated_cost_usd += item.estimated_cost_usd || 0;

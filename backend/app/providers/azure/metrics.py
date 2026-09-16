@@ -9,6 +9,8 @@ _METRICS_API = "2023-10-01"
 _FOUNDRY_METRIC_NAMES = "InputTokens,OutputTokens,TotalTokens,ModelRequests,cacheReadInputTokens"
 # Classic Azure OpenAI accounts (kind=OpenAI) emit these instead.
 _LEGACY_METRIC_NAMES = "ProcessedPromptTokens,GeneratedTokens,TokenTransaction,AzureOpenAIRequests"
+_FOUNDRY_IO_METRIC_NAMES = "InputTokens,OutputTokens"
+_LEGACY_IO_METRIC_NAMES = "ProcessedPromptTokens,GeneratedTokens"
 
 
 class AzureMetricsService:
@@ -27,14 +29,38 @@ class AzureMetricsService:
         end: datetime,
     ) -> list[TokenUsage]:
         metric_names = _FOUNDRY_METRIC_NAMES if kind == "AIServices" else _LEGACY_METRIC_NAMES
+        return await self._read(credentials, resource_id, kind, start, end, metric_names, deployment_name)
+
+    async def get_account_input_output(
+        self,
+        credentials: ProviderCredentials,
+        resource_id: str,
+        kind: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[TokenUsage]:
+        metric_names = _FOUNDRY_IO_METRIC_NAMES if kind == "AIServices" else _LEGACY_IO_METRIC_NAMES
+        return await self._read(credentials, resource_id, kind, start, end, metric_names)
+
+    async def _read(
+        self,
+        credentials: ProviderCredentials,
+        resource_id: str,
+        kind: str,
+        start: datetime,
+        end: datetime,
+        metric_names: str,
+        deployment_name: str | None = None,
+    ) -> list[TokenUsage]:
         params = {
             "api-version": _METRICS_API,
             "timespan": f"{_iso(start)}/{_iso(end)}",
             "interval": "PT1H",
             "metricnames": metric_names,
             "aggregation": "Total",
-            "$filter": f"ModelDeploymentName eq '{deployment_name}'",
         }
+        if deployment_name:
+            params["$filter"] = f"ModelDeploymentName eq '{deployment_name}'"
         body = await self._arm_client.get(
             credentials, f"{resource_id}/providers/Microsoft.Insights/metrics", params=params
         )

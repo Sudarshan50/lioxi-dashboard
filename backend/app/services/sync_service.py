@@ -7,6 +7,7 @@ from app.providers.base import CreditBalance, ProviderCredentials
 from app.providers.registry import get_provider
 from app.repositories.model_repository import ModelRepository
 from app.repositories.usage_repository import UsageRepository
+from app.services.azure_token_totals import TOKEN_RANGE_MAP, cache_end, totals_by_range
 from app.services.pricing_service import PricingService
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,20 @@ class SyncService:
                 actual_cost_usd=daily.amount,
                 currency=daily.currency,
             )
+
+        await self._cache_account_input_output(provider, credentials, account)
+
+    async def _cache_account_input_output(self, provider, credentials: ProviderCredentials, account: ProviderAccount) -> None:
+        fetch_io = getattr(provider, "get_account_input_output", None)
+        if fetch_io is None:
+            return
+        end = cache_end()
+        start = end - TOKEN_RANGE_MAP["90d"]
+        try:
+            points = await fetch_io(credentials, account.resource_id, account.kind, start, end + timedelta(hours=1))
+            account.azure_token_totals = totals_by_range(points, end)
+        except Exception:
+            logger.warning("Azure input/output token cache failed for %s", account.name, exc_info=True)
 
     @staticmethod
     def _lookback_window() -> tuple[datetime, datetime]:

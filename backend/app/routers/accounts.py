@@ -171,4 +171,6 @@ async def delete_account(account_id: int, service: AccountService = Depends(_ser
         await service.delete_account(account_id)
     except AccountNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except AccountValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "deleted"}

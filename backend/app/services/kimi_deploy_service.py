@@ -1371,6 +1371,14 @@ async def delete_accounts(
             host = resource_key(account.get("account_name")) or resource_key(result.account_name)
             if host:
                 await set_host_live(host, False)
+        if result.ok:
+            from app.services.google_sheet_inventory import mark_deleted_inventory
+
+            await mark_deleted_inventory(
+                endpoint=account.get("azure_openai_endpoint"),
+                resource_name=account.get("account_name") or result.account_name,
+                proxy_name=account.get("new_api_name"),
+            )
     return results
 
 

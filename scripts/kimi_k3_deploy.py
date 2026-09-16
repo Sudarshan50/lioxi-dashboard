@@ -1447,6 +1447,87 @@ def looks_like_kimi_stack(acct_name: str, rg: str) -> bool:
     return False
 
 
+def stack_project_name(rg: str) -> str:
+    group = (rg or "").strip()
+    if group.lower().startswith("rg-") and len(group) > 3:
+        return group[3:]
+    return ""
+
+
+def project_names_from_list(projects: Any) -> list[str]:
+    names: list[str] = []
+    for proj in projects or []:
+        if not isinstance(proj, dict):
+            continue
+        name = str(proj.get("name") or "").strip()
+        if not name:
+            rid = str(proj.get("id") or "")
+            match = re.search(r"/projects/([^/]+)$", rid, flags=re.I)
+            name = match.group(1) if match else ""
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
+def project_names_from_error(err: str) -> list[str]:
+    found: list[str] = []
+    for name in re.findall(r"/projects/([^/'\"\\s]+)", err or "", flags=re.I):
+        if name and name not in found:
+            found.append(name)
+    return found
+
+
+def _azure_missing(err: str) -> bool:
+    lowered = (err or "").lower()
+    return "not found" in lowered or "does not exist" in lowered
+
+
+def _delete_foundry_project(env: dict[str, str], acct_name: str, rg: str, pname: str) -> tuple[bool, str]:
+    return az_ok(
+        [
+            "az",
+            "cognitiveservices",
+            "account",
+            "project",
+            "delete",
+            "-n",
+            acct_name,
+            "-g",
+            rg,
+            "--project-name",
+            pname,
+            "-o",
+            "none",
+        ],
+        env=env,
+        timeout=180,
+    )
+
+
+def _list_foundry_projects(env: dict[str, str], acct_name: str, rg: str) -> list[str]:
+    try:
+        return project_names_from_list(
+            az_json(
+                [
+                    "az",
+                    "cognitiveservices",
+                    "account",
+                    "project",
+                    "list",
+                    "-n",
+                    acct_name,
+                    "-g",
+                    rg,
+                    "-o",
+                    "json",
+                ],
+                env=env,
+            )
+        )
+    except AzError:
+        return []
+
+
 def purge_kimi_stack(env: dict[str, str], acct_name: str, rg: str) -> list[str]:
     """Delete K3 deployment, Foundry projects, account, then RG. Raises on hard failures."""
     deleted: list[str] = []
@@ -1471,82 +1552,63 @@ def purge_kimi_stack(env: dict[str, str], acct_name: str, rg: str) -> list[str]:
     )
     if ok:
         deleted.append(f"deployment {DEPLOYMENT_NAME}")
-    elif "not found" not in err.lower() and "does not exist" not in err.lower():
+    elif not _azure_missing(err):
         raise AzError(f"Could not delete deployment {DEPLOYMENT_NAME}: {err}")
 
     if not looks_like_kimi_stack(acct_name, rg):
         return deleted
 
-    projects = []
-    try:
-        projects = (
-            az_json(
-                [
-                    "az",
-                    "cognitiveservices",
-                    "account",
-                    "project",
-                    "list",
-                    "-n",
-                    acct_name,
-                    "-g",
-                    rg,
-                    "-o",
-                    "json",
-                ],
-                env=env,
-            )
-            or []
-        )
-    except AzError:
-        projects = []
-    for proj in projects:
-        pname = (proj or {}).get("name") if isinstance(proj, dict) else None
-        if not pname:
-            continue
+    pending = _list_foundry_projects(env, acct_name, rg)
+    expected = stack_project_name(rg)
+    if expected and expected not in pending:
+        pending.append(expected)
+    removed_projects: set[str] = set()
+    for pname in pending:
+        ok, err = _delete_foundry_project(env, acct_name, rg, pname)
+        if ok:
+            deleted.append(f"project {pname}")
+            removed_projects.add(pname)
+        elif not _azure_missing(err):
+            raise AzError(f"Could not delete project {pname}: {err}")
+
+    last_err = ""
+    for attempt in range(6):
         ok, err = az_ok(
             [
                 "az",
                 "cognitiveservices",
                 "account",
-                "project",
                 "delete",
                 "-n",
                 acct_name,
                 "-g",
                 rg,
-                "--project-name",
-                pname,
                 "-o",
                 "none",
             ],
             env=env,
-            timeout=180,
+            timeout=300,
         )
         if ok:
-            deleted.append(f"project {pname}")
-        elif "not found" not in err.lower() and "does not exist" not in err.lower():
-            raise AzError(f"Could not delete project {pname}: {err}")
-    ok, err = az_ok(
-        [
-            "az",
-            "cognitiveservices",
-            "account",
-            "delete",
-            "-n",
-            acct_name,
-            "-g",
-            rg,
-            "-o",
-            "none",
-        ],
-        env=env,
-        timeout=300,
-    )
-    if ok:
-        deleted.append(f"account {acct_name}")
-    elif "not found" not in err.lower() and "does not exist" not in err.lower():
-        raise AzError(f"Could not delete account {acct_name}: {err}")
+            deleted.append(f"account {acct_name}")
+            last_err = ""
+            break
+        if _azure_missing(err):
+            last_err = ""
+            break
+        last_err = err
+        leftover = [name for name in project_names_from_error(err) if name not in removed_projects]
+        for pname in leftover:
+            pok, perr = _delete_foundry_project(env, acct_name, rg, pname)
+            if pok or _azure_missing(perr):
+                deleted.append(f"project {pname}")
+                removed_projects.add(pname)
+            else:
+                raise AzError(f"Could not delete project {pname}: {perr}")
+        if attempt < 5:
+            time.sleep(8)
+    if last_err:
+        raise AzError(f"Could not delete account {acct_name}: {last_err}")
     ok, err = az_ok(
         ["az", "group", "delete", "-n", rg, "--yes", "--no-wait", "-o", "none"],
         env=env,
@@ -1554,7 +1616,7 @@ def purge_kimi_stack(env: dict[str, str], acct_name: str, rg: str) -> list[str]:
     )
     if ok:
         deleted.append(f"resource group {rg} (delete started)")
-    elif "not found" not in err.lower() and "does not exist" not in err.lower():
+    elif not _azure_missing(err):
         deleted.append(f"resource group {rg} left in place: {err[-200:]}")
     return deleted
 

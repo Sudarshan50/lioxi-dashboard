@@ -26,6 +26,7 @@ IGNORE = {
     "new_api_cost_o1_usd",
     "new_api_cost_o2_usd",
     "new_api_cost_usd",
+    "azure_token_totals",
     "new_api_status",
     "new_api_status_o1",
     "new_api_status_o2",

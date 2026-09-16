@@ -2,6 +2,8 @@ import unittest
 
 from app.services.google_sheet_inventory import (
     _a1_col,
+    _delete_hosts,
+    _deleted_row_numbers,
     _ensure_headers,
     _is_rate_limit,
     _plan_writes,
@@ -73,6 +75,23 @@ class SheetHelpers(unittest.TestCase):
         )
         self.assertEqual(writes, [])
         self.assertEqual(appends, [])
+
+    def test_deleted_rows_match_endpoint_host(self):
+        mapping = _ensure_headers(["Sno", "Name", "Email", "Endpoint", "TPM", "Proxy_Name", "Pool"])
+        existing = [
+            ["1", "Anirudh", "a@x.com", "https://anirudh-proxy-o2bwni.openai.azure.com/", "500k", "cs-proxy-2", "10k"],
+            ["2", "Alex", "b@x.com", "https://other.openai.azure.com/", "500k", "p2", "10k"],
+        ]
+        hosts = _delete_hosts("https://anirudh-proxy-o2bwni.openai.azure.com/", "anirudh-proxy-o2bwni")
+        self.assertEqual(_deleted_row_numbers(mapping, existing, hosts), [2])
+
+    def test_deleted_rows_match_proxy_name(self):
+        mapping = _ensure_headers(["Sno", "Name", "Email", "Endpoint", "TPM", "Proxy_Name", "Pool"])
+        existing = [
+            ["1", "Anirudh", "a@x.com", "", "500k", "cs-proxy-2", "10k"],
+        ]
+        hosts = _delete_hosts(None, None, "cs-proxy-2")
+        self.assertEqual(_deleted_row_numbers(mapping, existing, hosts), [2])
 
 
 if __name__ == "__main__":

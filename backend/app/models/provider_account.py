@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import DateTime, Float, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -52,6 +52,7 @@ class ProviderAccount(Base, TimestampMixin):
     new_api_cost_o1_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o2_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    azure_token_totals: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     new_api_status: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     new_api_status_o1: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     new_api_status_o2: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

@@ -49,6 +49,13 @@ _ipv4_patched = False
 _WS_CACHE_TTL = 90.0
 _ws_cache: dict[str, Any] = {"key": "", "ws": None, "until": 0.0}
 _WRITE_CHUNK = 200
+_DELETED_ROW_FORMAT = {
+    "backgroundColor": {"red": 0.96, "green": 0.70, "blue": 0.70},
+    "textFormat": {
+        "foregroundColor": {"red": 0.61, "green": 0.04, "blue": 0.04},
+        "bold": True,
+    },
+}
 
 
 def _force_ipv4() -> None:
@@ -447,3 +454,78 @@ async def sync_deploy_results(results: list[KimiDeployResult]) -> None:
             logger.info("Google Sheet inventory updated for %s row(s)", changed)
     except Exception:
         logger.exception("Could not update the Google Sheet inventory")
+
+
+def _delete_hosts(*values: str | None) -> set[str]:
+    hosts: set[str] = set()
+    for value in values:
+        host = resource_key(value)
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+def _row_hosts(row: list[str], mapping: dict[str, int]) -> set[str]:
+    return _delete_hosts(_cell(row, mapping, "Endpoint"), _cell(row, mapping, "Proxy_Name"))
+
+
+def _deleted_row_numbers(mapping: dict[str, int], data_rows: list[list[str]], hosts: set[str]) -> list[int]:
+    if not hosts:
+        return []
+    found: list[int] = []
+    for offset, row in enumerate(data_rows):
+        if _row_hosts(row, mapping) & hosts:
+            found.append(offset + 2)
+    return found
+
+
+def _paint_deleted_rows(worksheet, row_numbers: list[int], last_col: str) -> None:
+    if not row_numbers:
+        return
+    payload = [
+        {"range": f"A{number}:{last_col}{number}", "format": _DELETED_ROW_FORMAT}
+        for number in row_numbers
+    ]
+    formatter = getattr(worksheet, "batch_format", None)
+    if callable(formatter):
+        _call(formatter, payload)
+        return
+    for item in payload:
+        _call(worksheet.format, item["range"], item["format"])
+
+
+def _mark_deleted_rows(hosts: set[str]) -> int:
+    if not hosts or not configured():
+        return 0
+    _clear_tpm_cache()
+    with _lock:
+        worksheet = _call(_open_worksheet)
+        existing = _call(worksheet.get_all_values)
+        if not existing:
+            return 0
+        mapping = _column_map(existing[0])
+        numbers = _deleted_row_numbers(mapping, existing[1:], hosts)
+        if not numbers:
+            return 0
+        last_index = max((len(row) for row in existing), default=1) - 1
+        _paint_deleted_rows(worksheet, numbers, _a1_col(max(last_index, 0)))
+        return len(numbers)
+
+
+async def mark_deleted_inventory(
+    *,
+    endpoint: str | None = None,
+    resource_name: str | None = None,
+    proxy_name: str | None = None,
+) -> None:
+    hosts = _delete_hosts(endpoint, resource_name, proxy_name)
+    if not hosts or not configured():
+        return
+    try:
+        changed = await asyncio.to_thread(_mark_deleted_rows, hosts)
+        if changed:
+            logger.info("Google Sheet inventory marked %s deleted row(s) red", changed)
+        else:
+            logger.info("Google Sheet inventory had no row to mark deleted for %s", sorted(hosts))
+    except Exception:
+        logger.exception("Could not mark deleted rows on the Google Sheet")

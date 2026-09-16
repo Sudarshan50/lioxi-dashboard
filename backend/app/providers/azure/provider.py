@@ -42,6 +42,16 @@ class AzureProvider(CloudMetricsProvider):
     ) -> list[TokenUsage]:
         return await self._metrics.get_token_usage(credentials, resource_id, kind, deployment_name, start, end)
 
+    async def get_account_input_output(
+        self,
+        credentials: ProviderCredentials,
+        resource_id: str,
+        kind: str,
+        start: datetime,
+        end: datetime,
+    ) -> list[TokenUsage]:
+        return await self._metrics.get_account_input_output(credentials, resource_id, kind, start, end)
+
     async def get_daily_cost(
         self,
         credentials: ProviderCredentials,

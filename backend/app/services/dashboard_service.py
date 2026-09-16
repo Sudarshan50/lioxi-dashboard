@@ -1,27 +1,63 @@
 import csv
 import io
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from app.repositories.account_group_repository import AccountGroupRepository
 from app.repositories.account_repository import AccountRepository
 from app.repositories.model_repository import ModelRepository
 from app.repositories.usage_repository import UsageRepository
+from app.services.azure_token_totals import TOKEN_RANGE_MAP, apply_cached_account_tokens
 from app.services.join_group import normalize_group
 from app.services.owner_tag import UNTAGGED
 
 _PAYABLE_RATE = 0.12
 
-_RANGE_MAP = {
-    "24h": timedelta(hours=24),
-    "7d": timedelta(days=7),
-    "30d": timedelta(days=30),
-    "90d": timedelta(days=90),
-}
+_RANGE_MAP = TOKEN_RANGE_MAP
 
 # Azure Monitor TPM/RPM are 1-minute Totals. Our snapshots are PT1H sums, so
 # an hour's equivalent rate is hourly_total / 60.
 _MINUTES_PER_HOUR = 60
+
+
+def _as_utc(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _first_usage(hourly: list[dict]) -> datetime | None:
+    first = None
+    for point in hourly:
+        if (point.get("total_tokens") or 0) <= 0 and (point.get("requests") or 0) <= 0:
+            continue
+        bucket = _as_utc(point.get("bucket"))
+        if bucket is not None and (first is None or bucket < first):
+            first = bucket
+    return first
+
+
+def _window_minutes(start: datetime, end: datetime, usage_start: datetime | None) -> float:
+    start_utc = _as_utc(start)
+    end_utc = _as_utc(end)
+    if start_utc is None or end_utc is None:
+        return _MINUTES_PER_HOUR
+    usage_utc = _as_utc(usage_start)
+    if usage_utc is not None:
+        start_utc = max(start_utc, usage_utc)
+    minutes = (end_utc - start_utc).total_seconds() / 60
+    if minutes <= 0:
+        return _MINUTES_PER_HOUR
+    return minutes
 
 
 def throughput_rates(
@@ -31,26 +67,12 @@ def throughput_rates(
     end: datetime,
     hourly: list[dict],
 ) -> dict[str, float]:
-    """Average and peak TPM/RPM from hourly Azure Monitor totals.
-
-    Microsoft measures tokens-per-minute and requests-per-minute as the Total
-    of Processed Inference Tokens / Azure OpenAI Requests over 1-minute
-    windows, then reports min/avg/max of those windows.
-
-    We only store hourly buckets, so:
-    - hour rate = tokens_in_hour / 60  (and requests_in_hour / 60)
-    - avg = mean of those hour rates over the full selected window, counting
-      idle hours as zero, which equals window_total / window_minutes
-    - peak = max hour rate, the closest quota comparison this grain allows
-    """
-    window_minutes = (end - start).total_seconds() / 60
-    if window_minutes <= 0:
-        window_minutes = _MINUTES_PER_HOUR
+    minutes = _window_minutes(start, end, _first_usage(hourly))
     peak_tokens = max((point["total_tokens"] for point in hourly), default=0)
     peak_requests = max((point["requests"] for point in hourly), default=0)
     return {
-        "avg_tpm": total_tokens / window_minutes,
-        "avg_rpm": total_requests / window_minutes,
+        "avg_tpm": total_tokens / minutes,
+        "avg_rpm": total_requests / minutes,
         "peak_tpm": peak_tokens / _MINUTES_PER_HOUR,
         "peak_rpm": peak_requests / _MINUTES_PER_HOUR,
     }
@@ -102,7 +124,11 @@ class DashboardService:
             overview["models_count"] = sum(1 for model in models if model.provider_account_id in valid_ids)
         overview["estimated_cost"] = float(overview.get("estimated_cost_usd") or 0)
         overview["estimated_cost_currency"] = "USD"
-        total, o1, o2 = await self._sum_new_api_cost(account_ids)
+        accounts = await self._account_repository.list_all()
+        scoped = [account for account in accounts if account_ids is None or account.id in account_ids]
+        total = sum(account.new_api_cost_usd or 0 for account in scoped)
+        o1 = sum(account.new_api_cost_o1_usd or 0 for account in scoped)
+        o2 = sum(account.new_api_cost_o2_usd or 0 for account in scoped)
         if gateway == "O1":
             total = o1
         elif gateway == "O2":
@@ -111,18 +137,16 @@ class DashboardService:
         overview["new_api_cost_o1"] = o1
         overview["new_api_cost_o2"] = o2
         overview["new_api_cost_currency"] = "USD"
+        await apply_cached_account_tokens(
+            overview,
+            scoped,
+            range_key,
+            model_id,
+            lambda ids: self._usage_repository.get_overview(start, end, ids, None),
+        )
         if model_id is not None:
             overview["actual_cost"] = None
         return overview
-
-    async def _sum_new_api_cost(self, account_ids: list[int] | None) -> tuple[float, float, float]:
-        accounts = await self._account_repository.list_all()
-        scoped = [a for a in accounts if account_ids is None or a.id in account_ids]
-        return (
-            sum(a.new_api_cost_usd or 0 for a in scoped),
-            sum(a.new_api_cost_o1_usd or 0 for a in scoped),
-            sum(a.new_api_cost_o2_usd or 0 for a in scoped),
-        )
 
     async def get_timeseries(
         self,
@@ -165,7 +189,6 @@ class DashboardService:
         start, end = self._resolve_range(range_key)
         account_ids = await self._resolve_account_ids(account_id, group_id, gateway, owner, join_group)
         items = await self._usage_repository.get_breakdown_by_account(start, end, model_id, account_ids)
-        minutes = max((end - start).total_seconds() / 60, 60)
         billed = await self._usage_repository.get_actual_cost_by_account(start, end, account_ids)
         accounts = await self._account_repository.list_all()
         new_api_by_account = {
@@ -176,7 +199,7 @@ class DashboardService:
             account.id: (account.credits_limit, account.credits_currency or "USD") for account in accounts
         }
         for item in items:
-            item["avg_tpm"] = item["total_tokens"] / minutes
+            item["avg_tpm"] = item["total_tokens"] / _window_minutes(start, end, _as_utc(item.pop("first_bucket", None)))
             amount, currency = billed.get(item["id"], (0.0, "USD"))
             if model_id is not None:
                 item["actual_cost"] = None
