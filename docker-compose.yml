@@ -66,6 +66,7 @@ services:
     volumes:
       - ./scripts:/app/scripts:ro
       - ./secrets:/run/secrets:ro
+      - ./public:/app/public:ro
     depends_on:
       db:
         condition: service_healthy

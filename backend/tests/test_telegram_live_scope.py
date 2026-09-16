@@ -282,5 +282,259 @@ class ScopeWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen.get("scope"), "vcs")
 
 
+class LivePickerOwnerTests(unittest.IsolatedAsyncioTestCase):
+    SB = "-100111"
+
+    def setUp(self):
+        from app.services import telegram_bot
+
+        telegram_bot._picker_owners.clear()
+
+    def tearDown(self):
+        from app.services import telegram_bot
+
+        telegram_bot._picker_owners.clear()
+
+    def _settings(self):
+        return SimpleNamespace(
+            telegram_bot_token="token",
+            telegram_chat_id=self.SB,
+            telegram_vcs_chat_id="-100222",
+            telegram_admin_id_set={"111"},
+            telegram_owner_id_set={"111"},
+        )
+
+    def _callback(self, sender, data="live:abc"):
+        return {
+            "id": f"cb-{sender}",
+            "from": {"id": sender},
+            "data": data,
+            "message": {"message_id": 4, "chat": {"id": self.SB, "type": "supergroup"}},
+        }
+
+    def _update(self, sender="333"):
+        return {
+            "update_id": 1,
+            "message": {
+                "message_id": 9,
+                "from": {"id": sender},
+                "chat": {"id": self.SB, "type": "supergroup"},
+                "text": "/live",
+            },
+        }
+
+    async def test_picker_is_owned_by_the_live_requester(self):
+        from app.services import telegram_bot
+
+        async def fake_cmd_live(query, source_message_id=None, scope="sb"):
+            return "Whose live usage?", {"inline_keyboard": [[{"text": "Gaurav", "callback_data": "live:x"}]]}
+
+        with patch("app.services.telegram_bot.get_settings", return_value=self._settings()):
+            with patch("app.services.telegram_bot._cmd_live", fake_cmd_live):
+                with patch(
+                    "app.services.telegram_bot.telegram_service.send_message",
+                    new_callable=AsyncMock,
+                    return_value=5,
+                ):
+                    with patch("app.services.telegram_bot.schedule_self_destruct", return_value=None):
+                        await telegram_bot._process_update(self._update("333"))
+        self.assertEqual(telegram_bot._picker_owner(self.SB, 5), "333")
+
+    async def _click(self, sender, data="live:abc"):
+        from app.services import telegram_bot
+
+        answers = []
+        replaced = []
+
+        async def fake_answer(callback_id):
+            answers.append(callback_id)
+
+        async def fake_replace(*_args, **_kwargs):
+            replaced.append(True)
+
+        class _Repo:
+            def __init__(self, _s):
+                pass
+
+            async def list_all(self):
+                return []
+
+        class _Session:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        telegram_bot._remember_picker_owner(self.SB, 4, "333")
+        with patch("app.services.telegram_bot.get_settings", return_value=self._settings()):
+            with patch("app.services.telegram_bot.AccountRepository", _Repo):
+                with patch("app.services.telegram_bot.SessionLocal", _Session):
+                    with patch(
+                        "app.services.telegram_bot.telegram_service.answer_callback_query",
+                        side_effect=fake_answer,
+                    ):
+                        with patch("app.services.telegram_bot._replace_message", side_effect=fake_replace):
+                            with patch(
+                                "app.services.telegram_bot.telegram_service.edit_message_text",
+                                new_callable=AsyncMock,
+                            ) as edit:
+                                with patch(
+                                    "app.services.telegram_bot.telegram_service.send_message",
+                                    new_callable=AsyncMock,
+                                ) as send:
+                                    await telegram_bot._process_callback(self._callback(sender, data))
+        return answers, replaced, edit, send
+
+    async def test_requester_click_still_edits_the_picker(self):
+        answers, replaced, _edit, send = await self._click("333")
+        self.assertEqual(replaced, [True])
+        self.assertEqual(len(answers), 1)
+        send.assert_not_awaited()
+
+    async def test_other_member_cannot_use_the_picker(self):
+        answers, replaced, edit, send = await self._click("444")
+        self.assertEqual(len(answers), 1)
+        self.assertEqual(replaced, [])
+        edit.assert_not_awaited()
+        send.assert_not_awaited()
+
+    async def test_other_member_cannot_page_or_cancel(self):
+        for data in ("livep:1", "cancel:9"):
+            answers, replaced, edit, send = await self._click("444", data)
+            self.assertEqual(len(answers), 1, data)
+            self.assertEqual(replaced, [], data)
+            edit.assert_not_awaited()
+            send.assert_not_awaited()
+
+
+class LiveGifPreludeTests(unittest.IsolatedAsyncioTestCase):
+    SB, VCS = "-100111", "-100222"
+    GIF_USER = "7094346806"
+
+    def _settings(self):
+        return SimpleNamespace(
+            telegram_bot_token="token",
+            telegram_chat_id=self.SB,
+            telegram_vcs_chat_id=self.VCS,
+            telegram_admin_id_set={"111"},
+            telegram_owner_id_set={"111"},
+        )
+
+    def _update(self, chat_id, sender, kind="supergroup", username=None, text="/live"):
+        user = {"id": sender}
+        if username:
+            user["username"] = username
+        return {
+            "update_id": 1,
+            "message": {
+                "message_id": 9,
+                "from": user,
+                "chat": {"id": chat_id, "type": kind},
+                "text": text,
+            },
+        }
+
+    async def _run(self, update, gif_path="/tmp/animation.gif.mp4"):
+        from pathlib import Path
+
+        from app.services import telegram_bot
+
+        order = []
+        scheduled = []
+
+        async def fake_cmd_live(query, source_message_id=None, scope="sb"):
+            return "live-card", None
+
+        async def fake_gif(*_args, **_kwargs):
+            order.append("gif")
+            return 77
+
+        async def fake_send(*_args, **_kwargs):
+            order.append("live")
+            return 5
+
+        def fake_sched(chat_id, *message_ids, delay=telegram_bot.LIVE_MESSAGE_TTL_SECONDS):
+            scheduled.append((str(chat_id), tuple(message_ids), delay))
+            return None
+
+        with patch("app.services.telegram_bot.get_settings", return_value=self._settings()):
+            with patch("app.services.telegram_bot._cmd_live", fake_cmd_live):
+                with patch("app.services.telegram_bot._live_gif_path", return_value=Path(gif_path)):
+                    with patch(
+                        "app.services.telegram_bot.telegram_service.send_animation",
+                        side_effect=fake_gif,
+                    ):
+                        with patch(
+                            "app.services.telegram_bot.telegram_service.send_message",
+                            side_effect=fake_send,
+                        ):
+                            with patch("app.services.telegram_bot.schedule_self_destruct", side_effect=fake_sched):
+                                await telegram_bot._process_update(update)
+        return order, scheduled
+
+    async def test_trade_center_gif_user_gets_gif_then_live(self):
+        from app.services.telegram_bot import LIVE_GIF_TTL_SECONDS, LIVE_MESSAGE_TTL_SECONDS
+
+        order, scheduled = await self._run(self._update(self.SB, self.GIF_USER))
+        self.assertEqual(order, ["gif", "live"])
+        self.assertEqual(scheduled[0], (self.SB, (77,), LIVE_GIF_TTL_SECONDS))
+        self.assertEqual(scheduled[1][0], self.SB)
+        self.assertIn(5, scheduled[1][1])
+        self.assertEqual(scheduled[1][2], LIVE_MESSAGE_TTL_SECONDS)
+
+    async def test_username_alone_does_not_trigger(self):
+        order, _scheduled = await self._run(
+            self._update(self.SB, "999", username="abhishek_iitd2")
+        )
+        self.assertEqual(order, ["live"])
+
+    async def test_other_trade_center_member_skips_gif(self):
+        order, scheduled = await self._run(self._update(self.SB, "333"))
+        self.assertEqual(order, ["live"])
+        self.assertTrue(all(delay == 30 for *_rest, delay in scheduled))
+
+    async def test_same_user_in_vcs_group_skips_gif(self):
+        order, _scheduled = await self._run(self._update(self.VCS, self.GIF_USER))
+        self.assertEqual(order, ["live"])
+
+    async def test_missing_gif_file_still_sends_live(self):
+        from app.services import telegram_bot
+
+        called = []
+
+        async def fake_cmd_live(query, source_message_id=None, scope="sb"):
+            return "live-card", None
+
+        async def fake_send(*_args, **_kwargs):
+            called.append("live")
+            return 5
+
+        with patch("app.services.telegram_bot.get_settings", return_value=self._settings()):
+            with patch("app.services.telegram_bot._cmd_live", fake_cmd_live):
+                with patch("app.services.telegram_bot._live_gif_path", return_value=None):
+                    with patch(
+                        "app.services.telegram_bot.telegram_service.send_animation",
+                        new_callable=AsyncMock,
+                    ) as gif:
+                        with patch(
+                            "app.services.telegram_bot.telegram_service.send_message",
+                            side_effect=fake_send,
+                        ):
+                            with patch("app.services.telegram_bot.schedule_self_destruct", return_value=None):
+                                await telegram_bot._process_update(self._update(self.SB, self.GIF_USER))
+        gif.assert_not_awaited()
+        self.assertEqual(called, ["live"])
+
+    def test_is_live_gif_user_matches_numeric_id_only(self):
+        from app.services.telegram_bot import _is_live_gif_user
+
+        self.assertTrue(_is_live_gif_user({"id": 7094346806}))
+        self.assertTrue(_is_live_gif_user({"id": "7094346806"}))
+        self.assertFalse(_is_live_gif_user({"id": "1", "username": "abhishek_iitd2"}))
+        self.assertFalse(_is_live_gif_user({"id": "333"}))
+        self.assertFalse(_is_live_gif_user({}))
+
+
 if __name__ == "__main__":
     unittest.main()

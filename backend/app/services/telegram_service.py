@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import httpx
 
@@ -156,6 +157,38 @@ async def send_message(
     message_id = (data.get("result") or {}).get("message_id")
     if message_id is not None:
         note_group_message_id(target, int(message_id))
+        return int(message_id)
+    return None
+
+
+async def send_animation(
+    chat_id: str | int,
+    path: str | Path,
+    *,
+    message_thread_id: int | None = None,
+) -> int | None:
+    settings = get_settings()
+    if not settings.telegram_bot_token:
+        raise TelegramError("Telegram is not configured (set TELEGRAM_BOT_TOKEN)")
+    url = f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendAnimation"
+    fields: dict = {"chat_id": str(chat_id)}
+    if message_thread_id is not None:
+        fields["message_thread_id"] = str(int(message_thread_id))
+    with Path(path).open("rb") as handle:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                url,
+                data=fields,
+                files={"animation": ("animation.mp4", handle, "video/mp4")},
+            )
+    data = response.json() if response.content else {}
+    if response.status_code != 200 or not data.get("ok"):
+        raise TelegramError(
+            f"Telegram sendAnimation failed ({response.status_code}): {response.text[:200]}"
+        )
+    message_id = (data.get("result") or {}).get("message_id")
+    if message_id is not None:
+        note_group_message_id(chat_id, int(message_id))
         return int(message_id)
     return None
 

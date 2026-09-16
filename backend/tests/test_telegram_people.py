@@ -223,6 +223,70 @@ class ProcessUpdate(unittest.IsolatedAsyncioTestCase):
                     await _process_update(update)
                     send.assert_awaited()
 
+    async def test_unauthorized_requests_get_the_reject_line(self):
+        from app.services.telegram_bot import UNAUTHORIZED_REPLY, _process_update
+
+        settings = SimpleNamespace(
+            telegram_admin_id_set={"111"},
+            telegram_owner_id_set={"111"},
+            telegram_chat_id="-100",
+            telegram_vcs_chat_id="-200",
+        )
+
+        async def sent_text(update):
+            with patch("app.services.telegram_bot.get_settings", return_value=settings):
+                with patch(
+                    "app.services.telegram_bot.telegram_service.send_message",
+                    new_callable=AsyncMock,
+                    return_value=20,
+                ) as send:
+                    await _process_update(update)
+                    if not send.await_args_list:
+                        return None
+                    return send.await_args_list[0].args[0]
+
+        self.assertEqual(
+            await sent_text(
+                {
+                    "update_id": 1,
+                    "message": {
+                        "message_id": 9,
+                        "from": {"id": 333},
+                        "chat": {"id": -100, "type": "supergroup"},
+                        "text": "/enable",
+                    },
+                }
+            ),
+            UNAUTHORIZED_REPLY,
+        )
+        self.assertEqual(
+            await sent_text(
+                {
+                    "update_id": 2,
+                    "message": {
+                        "message_id": 10,
+                        "from": {"id": 333},
+                        "chat": {"id": 333, "type": "private"},
+                        "text": "hello",
+                    },
+                }
+            ),
+            UNAUTHORIZED_REPLY,
+        )
+        self.assertIsNone(
+            await sent_text(
+                {
+                    "update_id": 3,
+                    "message": {
+                        "message_id": 11,
+                        "from": {"id": 333},
+                        "chat": {"id": -100, "type": "supergroup"},
+                        "text": "hello",
+                    },
+                }
+            )
+        )
+
     async def test_result_edit_clears_keyboard(self):
         from app.services.telegram_bot import _replace_message
 

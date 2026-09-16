@@ -29,9 +29,17 @@ logger = logging.getLogger(__name__)
 PROJECTED_INCOME_RATE = 0.12
 UNTAGGED_PERSON = "Untagged"
 LIVE_MESSAGE_TTL_SECONDS = 30
+LIVE_GIF_TTL_SECONDS = 15
+LIVE_GIF_USER_IDS = frozenset({"7094346806"})
+LIVE_GIF_FILENAME = "animation.gif.mp4"
 
 _PUBLIC_COMMANDS = {"/live", "/help", "/start"}
+UNAUTHORIZED_REPLY = "Bhag Bhosdike!"
 _pending_deletes: dict[tuple[str, int], asyncio.Task] = {}
+_picker_owners: dict[tuple[str, int], str] = {}
+ACCOUNT_PAGE_SIZE = 16
+_PAGE_PREFIX = {"en": "enp", "dis": "disp", "acct": "acp", "who": "whop", "live": "livep"}
+_PAGE_KIND = {value: key for key, value in _PAGE_PREFIX.items()}
 
 _PUBLIC_HELP = (
     "👋 <b>Commands</b>\n"
@@ -139,6 +147,11 @@ def cancel_all_self_destructs(chat_id: str | int | None = None) -> int:
     for key, task in pending:
         _pending_deletes.pop(key, None)
         task.cancel()
+    if wanted is None:
+        _picker_owners.clear()
+    else:
+        for key in [k for k in _picker_owners if k[0] == wanted]:
+            _picker_owners.pop(key, None)
     return len(pending)
 
 
@@ -158,6 +171,30 @@ def _message_ids(*message_ids: int | None | list[int | None] | tuple[int | None,
     return list(dict.fromkeys(ids))
 
 
+def _picker_key(chat_id, message_id) -> tuple[str, int] | None:
+    if chat_id is None or message_id is None:
+        return None
+    return (str(chat_id), int(message_id))
+
+
+def _remember_picker_owner(chat_id, message_id, user_id) -> None:
+    key = _picker_key(chat_id, message_id)
+    if key is None or not user_id:
+        return
+    _picker_owners[key] = str(user_id)
+
+
+def _forget_picker_owner(chat_id, message_id) -> None:
+    key = _picker_key(chat_id, message_id)
+    if key is not None:
+        _picker_owners.pop(key, None)
+
+
+def _picker_owner(chat_id, message_id) -> str | None:
+    key = _picker_key(chat_id, message_id)
+    return _picker_owners.get(key) if key else None
+
+
 def schedule_self_destruct(
     chat_id: str | int | None,
     *message_ids: int | None | list[int | None] | tuple[int | None, ...],
@@ -175,6 +212,7 @@ def schedule_self_destruct(
             await asyncio.sleep(delay)
             for message_id in ids:
                 await telegram_service.delete_message(chat_id, message_id)
+                _forget_picker_owner(chat_id, message_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -196,6 +234,37 @@ def _live_ttl_note() -> str:
     return f"\n\n<i>⏱ Disappears in {LIVE_MESSAGE_TTL_SECONDS}s</i>"
 
 
+def _live_gif_path() -> Path | None:
+    path = Path("/app/public") / LIVE_GIF_FILENAME
+    return path if path.is_file() else None
+
+
+def _is_live_gif_user(user: dict | None) -> bool:
+    return str((user or {}).get("id") or "") in LIVE_GIF_USER_IDS
+
+
+async def _send_live_gif_prelude(
+    chat: dict | None,
+    user: dict | None,
+    message_thread_id: int | None = None,
+) -> int | None:
+    if _group_scope(chat) != GROUP_SB or not _is_live_gif_user(user):
+        return None
+    chat_id = (chat or {}).get("id")
+    if chat_id is None:
+        return None
+    try:
+        path = _live_gif_path()
+        if path is None:
+            return None
+        return await telegram_service.send_animation(
+            chat_id, path, message_thread_id=message_thread_id
+        )
+    except Exception:
+        logger.warning("Live GIF prelude failed", exc_info=True)
+        return None
+
+
 def _command_allowed(chat: dict | None, sender: str, command: str) -> bool:
     if _chat_allowed(chat, sender):
         return True
@@ -206,7 +275,10 @@ def _callback_allowed(chat: dict | None, sender: str, data: str) -> bool:
     if _chat_allowed(chat, sender):
         return True
     return _group_open(chat) and (
-        data.startswith("live:") or data == "cancel" or data.startswith("cancel:")
+        data.startswith("live:")
+        or data.startswith("livep:")
+        or data == "cancel"
+        or data.startswith("cancel:")
     )
 
 
@@ -290,17 +362,61 @@ def _group_by_token(groups: list[tuple[str, list]], token: str) -> tuple[str, li
     return None
 
 
+def _page_query_token(query: str) -> str:
+    return " ".join((query or "").split())[:40]
+
+
+def _page_callback(prefix: str, page: int, *, source_id: int | None = None, query: str = "") -> str:
+    parts = [prefix, str(int(page))]
+    if source_id is not None:
+        parts.append(str(int(source_id)))
+    token = _page_query_token(query)
+    if token:
+        parts.append(token)
+    return ":".join(parts)
+
+
+def _page_query(parts: list[str], *, has_source: bool = False) -> str:
+    if has_source:
+        return parts[3] if len(parts) > 3 else ""
+    if len(parts) > 2 and not parts[2].isdigit():
+        return parts[2]
+    return parts[3] if len(parts) > 3 else ""
+
+
+def _nav_row(page_prefix: str, page: int, pages: int, *, source_id: int | None = None, query: str = "") -> list[dict]:
+    nav = []
+    if page > 0:
+        nav.append(
+            {"text": "‹ Prev", "callback_data": _page_callback(page_prefix, page - 1, source_id=source_id, query=query)}
+        )
+    nav.append(
+        {"text": f"{page + 1}/{pages}", "callback_data": _page_callback(page_prefix, page, source_id=source_id, query=query)}
+    )
+    if page < pages - 1:
+        nav.append(
+            {"text": "Next ›", "callback_data": _page_callback(page_prefix, page + 1, source_id=source_id, query=query)}
+        )
+    return nav
+
+
 def _people_keyboard(
     groups: list[tuple[str, list]],
     selected: list[int] | None = None,
     prefix: str = "who",
     source_message_id: int | None = None,
+    page: int = 0,
+    query: str = "",
 ) -> dict:
     indexes = selected if selected is not None else list(range(len(groups)))
+    pages = _account_page_count(len(indexes))
+    page = max(0, min(int(page), pages - 1))
+    start = page * ACCOUNT_PAGE_SIZE
+    page_indexes = indexes[start : start + ACCOUNT_PAGE_SIZE]
     suffix = f":{int(source_message_id)}" if source_message_id is not None else ""
     buttons = []
     row = []
-    for index in indexes:
+    for index in page_indexes:
         tag, rows = groups[index]
         marker = "" if any(_is_live(account) for account in rows) else "⏸ "
         label = f"{marker}{tag}"
@@ -312,6 +428,16 @@ def _people_keyboard(
             row = []
     if row:
         buttons.append(row)
+    if pages > 1:
+        buttons.append(
+            _nav_row(
+                _PAGE_PREFIX.get(prefix, f"{prefix}p"),
+                page,
+                pages,
+                source_id=source_message_id,
+                query=query,
+            )
+        )
     buttons.append([{"text": "✖️ Cancel", "callback_data": f"cancel{suffix}"}])
     return {"inline_keyboard": buttons}
 
@@ -400,13 +526,26 @@ def _split_telegram(text: str, limit: int = 4000) -> list[str]:
     return chunks or [text]
 
 
-async def _cmd_people(query: str) -> tuple[str, dict | None]:
+def _people_caption(kind: str, total: int, page: int = 0, query: str = "") -> str:
+    pages = _account_page_count(total)
+    page = max(0, min(int(page), pages - 1))
+    head = "Whose live usage?" if kind == "live" else "Whose report?"
+    extra = f" {total} names match “{html.escape(query)}”" if query else ""
+    if pages > 1:
+        return f"{head} · {page + 1}/{pages} · {total}{extra}"
+    if extra:
+        return f"{head}{extra}."
+    return head
+
+
+async def _cmd_people(query: str, page: int = 0) -> tuple[str, dict | None]:
     async with SessionLocal() as session:
         accounts = await AccountRepository(session).list_all()
     groups = _people_groups(accounts)
     if not groups:
         return "No people to show yet.", None
 
+    matches = None
     if query:
         needle = query.lower()
         matches = [index for index, (tag, _rows) in enumerate(groups) if needle in tag.lower()]
@@ -415,16 +554,18 @@ async def _cmd_people(query: str) -> tuple[str, dict | None]:
         if len(matches) == 1:
             tag, rows = groups[matches[0]]
             return _person_card(tag, rows), None
-        return (
-            f"Whose report? {len(matches)} names match “{html.escape(query)}”.",
-            _people_keyboard(groups, matches),
-        )
-
-    return "Whose report?", _people_keyboard(groups)
+    shown = len(matches) if matches is not None else len(groups)
+    return (
+        f"{_people_caption('who', shown, page, query)}",
+        _people_keyboard(groups, matches, page=page, query=query),
+    )
 
 
 async def _cmd_live(
-    query: str, source_message_id: int | None = None, scope: str | None = GROUP_SB
+    query: str,
+    source_message_id: int | None = None,
+    scope: str | None = GROUP_SB,
+    page: int = 0,
 ) -> tuple[str, dict | None]:
     async with SessionLocal() as session:
         accounts = await AccountRepository(session).list_all()
@@ -432,6 +573,7 @@ async def _cmd_live(
     if not groups:
         return f"No live channels to show right now.{_live_ttl_note()}", None
 
+    matches = None
     if query:
         needle = query.lower()
         matches = [index for index, (tag, _rows) in enumerate(groups) if needle in tag.lower()]
@@ -440,23 +582,46 @@ async def _cmd_live(
         if len(matches) == 1:
             tag, rows = groups[matches[0]]
             return _live_card(tag, rows), None
-        return (
-            f"Whose live usage? {len(matches)} names match “{html.escape(query)}”.{_live_ttl_note()}",
-            _people_keyboard(groups, matches, prefix="live", source_message_id=source_message_id),
-        )
-
+    shown = len(matches) if matches is not None else len(groups)
     return (
-        f"Whose live usage?{_live_ttl_note()}",
-        _people_keyboard(groups, prefix="live", source_message_id=source_message_id),
+        f"{_people_caption('live', shown, page, query)}{_live_ttl_note()}",
+        _people_keyboard(
+            groups,
+            matches,
+            prefix="live",
+            source_message_id=source_message_id,
+            page=page,
+            query=query,
+        ),
     )
 
 
-def _account_keyboard(accounts, prefix: str = "acct") -> dict:
-    # Highest spend-vs-credits first; disabled gateways pushed to the end.
-    ordered = sorted(accounts, key=lambda a: (a.new_api_status != 1, -(_percent(a) or 0)))
+def _ordered_accounts(accounts, *, low_usage_first: bool = False):
+    if low_usage_first:
+        return sorted(
+            accounts,
+            key=lambda a: ((_percent(a) or 0), _spend(a), (a.name or "").lower()),
+        )
+    return sorted(accounts, key=lambda a: (a.new_api_status != 1, -(_percent(a) or 0)))
+
+
+def _account_page_count(total: int) -> int:
+    return max(1, (max(total, 0) + ACCOUNT_PAGE_SIZE - 1) // ACCOUNT_PAGE_SIZE)
+
+
+def _account_page(accounts, page: int = 0, *, low_usage_first: bool = False) -> tuple[list, int, int]:
+    ordered = _ordered_accounts(accounts, low_usage_first=low_usage_first)
+    pages = _account_page_count(len(ordered))
+    page = max(0, min(int(page), pages - 1))
+    start = page * ACCOUNT_PAGE_SIZE
+    return ordered[start : start + ACCOUNT_PAGE_SIZE], page, pages
+
+
+def _account_keyboard(accounts, prefix: str = "acct", page: int = 0, query: str = "") -> dict:
+    slice_rows, page, pages = _account_page(accounts, page, low_usage_first=prefix == "en")
     buttons = []
     row = []
-    for account in ordered:
+    for account in slice_rows:
         percent = _percent(account)
         suffix = f" · {percent:.0f}%" if percent is not None else ""
         marker = "" if account.new_api_status == 1 else "⛔ "
@@ -469,11 +634,27 @@ def _account_keyboard(accounts, prefix: str = "acct") -> dict:
             row = []
     if row:
         buttons.append(row)
+    if pages > 1:
+        buttons.append(_nav_row(_PAGE_PREFIX.get(prefix, f"{prefix}p"), page, pages, query=query))
     buttons.append([{"text": "✖️ Cancel", "callback_data": "cancel"}])
     return {"inline_keyboard": buttons}
 
 
-async def _cmd_usage(query: str) -> tuple[str, dict | None]:
+def _picker_caption(kind: str, total: int, page: int = 0) -> str:
+    pages = _account_page_count(total)
+    page = max(0, min(int(page), pages - 1))
+    if kind == "en":
+        head = "🟢 <b>Enable gateway</b> — pick a channel"
+    elif kind == "dis":
+        head = "⛔ <b>Disable gateway</b> — pick a channel"
+    else:
+        head = "Which account?"
+    if pages > 1:
+        return f"{head} · {page + 1}/{pages} · {total}"
+    return f"{head} · {total}" if total else head
+
+
+async def _cmd_usage(query: str, page: int = 0) -> tuple[str, dict | None]:
     async with SessionLocal() as session:
         accounts = await AccountRepository(session).list_all()
 
@@ -491,11 +672,11 @@ async def _cmd_usage(query: str) -> tuple[str, dict | None]:
         if len(matches) == 1:
             return _account_card(matches[0]), None
         return (
-            f"Which account? {len(matches)} match “{html.escape(query)}”.",
-            _account_keyboard(matches),
+            f"{_picker_caption('acct', len(matches), page)} match “{html.escape(query)}”.",
+            _account_keyboard(matches, page=page, query=query),
         )
 
-    return "Which account?", _account_keyboard(accounts)
+    return f"{_picker_caption('acct', len(accounts), page)}:", _account_keyboard(accounts, page=page)
 
 
 async def _cmd_alerts() -> str:
@@ -579,18 +760,25 @@ def _cmd_test() -> str:
     )
 
 
-async def _cmd_toggle_picker(enable: bool) -> tuple[str, dict | None]:
+def _toggle_candidates(accounts, enable: bool):
+    if enable:
+        return [a for a in accounts if a.new_api_status not in (None, 1) and a.new_api_gateway]
+    return [a for a in accounts if a.new_api_status == 1 and a.new_api_gateway]
+
+
+async def _cmd_toggle_picker(enable: bool, page: int = 0) -> tuple[str, dict | None]:
     async with SessionLocal() as session:
         accounts = await AccountRepository(session).list_all()
-    if enable:
-        candidates = [a for a in accounts if a.new_api_status not in (None, 1) and a.new_api_gateway]
-        if not candidates:
-            return "✅ No disabled gateway channels to enable.", None
-        return "🟢 <b>Enable gateway</b> — pick a channel:", _account_keyboard(candidates, prefix="en")
-    candidates = [a for a in accounts if a.new_api_status == 1 and a.new_api_gateway]
+    kind = "en" if enable else "dis"
+    candidates = _toggle_candidates(accounts, enable)
     if not candidates:
+        if enable:
+            return "✅ No disabled gateway channels to enable.", None
         return "⛔ No enabled gateway channels to disable.", None
-    return "⛔ <b>Disable gateway</b> — pick a channel:", _account_keyboard(candidates, prefix="dis")
+    return (
+        f"{_picker_caption(kind, len(candidates), page)}:",
+        _account_keyboard(candidates, prefix=kind, page=page),
+    )
 
 
 async def _handle_command(
@@ -658,7 +846,13 @@ async def _process_callback(callback: dict) -> None:
     message_id = message.get("message_id")
     data = callback.get("data") or ""
     await telegram_service.answer_callback_query(callback.get("id") or "")
-    if chat_id is None or not _callback_allowed(message.get("chat") or message, sender, data):
+    if chat_id is None:
+        return
+    owner = _picker_owner(chat_id, message_id)
+    if owner and sender != owner:
+        return
+    if not _callback_allowed(message.get("chat") or message, sender, data):
+        await telegram_service.send_message(UNAUTHORIZED_REPLY, chat_id=chat_id)
         return
     parts = data.split(":")
     prefix = parts[0] if parts else ""
@@ -669,6 +863,7 @@ async def _process_callback(callback: dict) -> None:
             source_id = int(raw_id)
         for mid in _message_ids(message_id, source_id):
             _cancel_self_destruct(chat_id, mid)
+            _forget_picker_owner(chat_id, mid)
             await telegram_service.delete_message(chat_id, mid)
         return
     if prefix == "live" and raw_id:
@@ -682,8 +877,23 @@ async def _process_callback(callback: dict) -> None:
                 else f"That person is no longer in the list.{_live_ttl_note()}"
             )
             await _replace_message(chat_id, message_id, text, ephemeral=True, source_id=source_id)
+            _forget_picker_owner(chat_id, message_id)
         except Exception:
             logger.warning("Bot live callback failed: %s", data, exc_info=True)
+        return
+    if prefix == "livep" and raw_id.isdigit():
+        try:
+            text, keyboard = await _cmd_live(
+                _page_query(parts, has_source=source_id is not None),
+                source_message_id=source_id,
+                scope=_group_scope(message.get("chat") or {}),
+                page=int(raw_id),
+            )
+            await telegram_service.edit_message_text(
+                chat_id, message_id, text, reply_markup=keyboard or _EMPTY_KEYBOARD
+            )
+        except Exception:
+            logger.warning("Bot live picker page failed: %s", data, exc_info=True)
         return
     if not _chat_allowed(message.get("chat") or message, sender):
         return
@@ -696,6 +906,23 @@ async def _process_callback(callback: dict) -> None:
             await _replace_message(chat_id, message_id, text)
         except Exception:
             logger.warning("Bot people callback failed: %s", data, exc_info=True)
+        return
+    if prefix in _PAGE_KIND and raw_id.isdigit():
+        try:
+            kind = _PAGE_KIND[prefix]
+            page = int(raw_id)
+            query = _page_query(parts)
+            if kind in ("en", "dis"):
+                text, keyboard = await _cmd_toggle_picker(enable=(kind == "en"), page=page)
+            elif kind == "who":
+                text, keyboard = await _cmd_people(query, page=page)
+            else:
+                text, keyboard = await _cmd_usage(query, page=page)
+            await telegram_service.edit_message_text(
+                chat_id, message_id, text, reply_markup=keyboard or _EMPTY_KEYBOARD
+            )
+        except Exception:
+            logger.warning("Bot picker page failed: %s", data, exc_info=True)
         return
     if prefix not in ("acct", "en", "dis") or not raw_id.isdigit():
         return
@@ -768,27 +995,30 @@ async def _process_update(update: dict) -> None:
             await _process_callback(update["callback_query"])
             return
         message = _incoming_message(update)
-        text = message.get("text") or ""
-        if not text.startswith("/"):
-            return
+        text = (message.get("text") or "").strip()
         sender = str((message.get("from") or {}).get("id") or "")
         chat = message.get("chat") or {}
         chat_id = chat.get("id")
         if chat_id is None:
             return
-        command = text.strip().split(maxsplit=1)[0].split("@")[0].lower()
+        is_command = text.startswith("/")
+        command = text.split(maxsplit=1)[0].split("@")[0].lower() if is_command else ""
         thread_id = message.get("message_thread_id")
-        _poll_state["last_command"] = f"{command} chat={chat_id} type={chat.get('type')}"
+        if command:
+            _poll_state["last_command"] = f"{command} chat={chat_id} type={chat.get('type')}"
         if not _command_allowed(chat, sender, command):
-            logger.info(
-                "Ignoring bot command %s from %s in %s %s",
-                command,
-                sender,
-                chat.get("type") or "unknown",
-                chat_id,
-            )
+            if is_command or str(chat.get("type") or "") == "private":
+                await telegram_service.send_message(
+                    UNAUTHORIZED_REPLY, chat_id=chat_id, message_thread_id=thread_id
+                )
+            return
+        if not is_command:
             return
         source_id = message.get("message_id")
+        if command == "/live":
+            gif_id = await _send_live_gif_prelude(chat, message.get("from") or {}, thread_id)
+            if gif_id is not None:
+                schedule_self_destruct(chat_id, gif_id, delay=LIVE_GIF_TTL_SECONDS)
         # An admin private chat sees every group; a group chat sees only its own.
         reply, keyboard = await _handle_command(
             text,
@@ -808,6 +1038,8 @@ async def _process_update(update: dict) -> None:
             )
             if ephemeral and sent_id is not None:
                 sent_ids.append(sent_id)
+                if index == 0 and keyboard is not None:
+                    _remember_picker_owner(chat_id, sent_id, sender)
         if ephemeral:
             schedule_self_destruct(chat_id, *sent_ids, source_id)
     except Exception:
