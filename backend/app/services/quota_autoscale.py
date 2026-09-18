@@ -20,8 +20,9 @@ from app.services.service_principal_store import email_or_none, list_service_pri
 
 logger = logging.getLogger(__name__)
 
-# New deploys start at weight 1. After Azure TPM/RPM unlocks, route more traffic.
 UPGRADED_NEWAPI_WEIGHT = 4
+TWO_MILLION_TPM = 2_000_000
+TWO_MILLION_CAPACITY = 2000
 
 
 @dataclass(frozen=True)
@@ -46,8 +47,10 @@ def is_newapi_enabled(account: ProviderAccount) -> bool:
     return account.new_api_status == 1
 
 
-def is_live_newapi_enabled(result: KimiDeployResult) -> bool:
-    return result.new_api_status == 1
+def is_live_newapi_enabled(result: KimiDeployResult, portal: ProviderAccount | None = None) -> bool:
+    if result.new_api_status is not None:
+        return result.new_api_status == 1
+    return portal is not None and is_newapi_enabled(portal)
 
 
 def _target_key(account: ProviderAccount) -> tuple[str, str]:
@@ -93,6 +96,14 @@ def _fmt(value: int | float | None) -> str:
 
 def needs_upgraded_weight(current: int | None) -> bool:
     return current is None or current == DEFAULT_WEIGHT
+
+
+def reached_2m_tpm(result: KimiDeployResult) -> bool:
+    tpm = _as_int(result.tpm)
+    if tpm is not None and tpm >= TWO_MILLION_TPM:
+        return True
+    capacity = _as_int(result.capacity)
+    return capacity is not None and capacity >= TWO_MILLION_CAPACITY
 
 
 def _detail(
@@ -171,12 +182,11 @@ async def _raise_newapi_weights(
     pending: list[tuple[AutoscaleCandidate, KimiDeployResult]],
     scaled: list[KimiDeployResult],
 ) -> dict[int, tuple[int | None, int | None, str | None]]:
-    """After a real TPM/RPM raise, move NewAPI routing weight from 1 to 4."""
     from app.services.kimi_newapi import rename_kimi_newapi_channel
 
     changes: dict[int, tuple[int | None, int | None, str | None]] = {}
     for index, ((candidate, before), after) in enumerate(zip(pending, scaled, strict=True)):
-        if not after.ok or not _changed(before, after):
+        if not after.ok or not _changed(before, after) or not reached_2m_tpm(after):
             continue
         current = _current_weight(candidate, after)
         if not needs_upgraded_weight(current):
@@ -265,6 +275,48 @@ async def _write_logs(
     return upgraded, failed
 
 
+def _should_scale(candidate: AutoscaleCandidate, inventory: KimiDeployResult) -> bool:
+    return bool(inventory.ok and inventory.tpm_upgrade_available and is_live_newapi_enabled(inventory, candidate.portal))
+
+
+def _names(pairs: list[tuple[AutoscaleCandidate, KimiDeployResult]]) -> str:
+    labels = [item[1].name or item[0].portal.name or item[0].portal.resource_name or "?" for item in pairs]
+    extra = f" (+{len(labels) - 12})" if len(labels) > 12 else ""
+    return ", ".join(labels[:12]) + extra
+
+
+async def _apply_auto_quota(
+    session: AsyncSession,
+    targets: list[AutoscaleCandidate],
+    inventories: list[KimiDeployResult],
+) -> dict[str, int]:
+    paired = list(zip(targets, inventories, strict=True))
+    pending = [item for item in paired if _should_scale(*item)]
+    unknown_quota = [item for item in paired if item[1].ok and item[1].quota_limit is None]
+    lookup_failed = [item for item in paired if not item[1].ok]
+    logger.info(
+        "Auto TPM upgrade: checked=%s scale=%s unknown_quota=%s lookup_failed=%s",
+        len(targets),
+        len(pending),
+        len(unknown_quota),
+        len(lookup_failed),
+    )
+    if unknown_quota:
+        logger.warning("Auto TPM upgrade: quota unknown for %s", _names(unknown_quota))
+    if lookup_failed:
+        logger.warning("Auto TPM upgrade: inventory failed for %s", _names(lookup_failed))
+    if not pending:
+        return {"checked": len(targets), "upgraded": 0, "failed": 0}
+    scaled = await scale_accounts(
+        [item[0].account for item in pending],
+        jobs=min(AZURE_SYNC_CONCURRENCY, len(pending)),
+        session=session,
+    )
+    weight_changes = await _raise_newapi_weights(session, pending, scaled)
+    upgraded, failed = await _write_logs(session, pending, scaled, weight_changes)
+    return {"checked": len(targets), "upgraded": upgraded, "failed": failed}
+
+
 async def run_auto_quota_upgrades() -> dict[str, int]:
     empty = {"checked": 0, "upgraded": 0, "failed": 0}
     try:
@@ -274,27 +326,15 @@ async def run_auto_quota_upgrades() -> dict[str, int]:
                 await list_service_principals(session),
             )
             if not targets:
+                logger.info("Auto TPM upgrade: no O1-enabled K3 targets")
                 return empty
             inventories = await lookup_accounts_inventory(
                 [item.account for item in targets],
                 session,
-                refresh=True,
+                refresh=False,
+                jobs=AZURE_SYNC_CONCURRENCY,
             )
-            pending = [
-                (candidate, inventory)
-                for candidate, inventory in zip(targets, inventories, strict=True)
-                if inventory.ok and inventory.tpm_upgrade_available and is_live_newapi_enabled(inventory)
-            ]
-            if not pending:
-                return {"checked": len(targets), "upgraded": 0, "failed": 0}
-            scaled = await scale_accounts(
-                [item[0].account for item in pending],
-                jobs=min(AZURE_SYNC_CONCURRENCY, len(pending)),
-                session=session,
-            )
-            weight_changes = await _raise_newapi_weights(session, pending, scaled)
-            upgraded, failed = await _write_logs(session, pending, scaled, weight_changes)
-            return {"checked": len(targets), "upgraded": upgraded, "failed": failed}
+            return await _apply_auto_quota(session, targets, inventories)
     except KimiDeployError as exc:
         logger.warning("Auto TPM upgrade skipped: %s", exc)
         return empty

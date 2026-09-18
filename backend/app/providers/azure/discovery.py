@@ -4,6 +4,7 @@ import logging
 from app.core.exceptions import AzureApiError
 from app.providers.azure.arm_client import AzureArmClient
 from app.providers.base import DeploymentInfo, DiscoveredResource, ProviderCredentials
+from app.runtime import gather_batched
 
 _COGNITIVE_SERVICES_API = "2023-05-01"
 _DEPLOYMENTS_API = "2024-10-01"
@@ -40,8 +41,8 @@ class AzureDiscoveryService:
                 current = by_id.get(key)
                 if current is None or _resource_detail_score(item) > _resource_detail_score(current):
                     by_id[key] = item
-        hydrated = await asyncio.gather(
-            *[self._hydrate_account(credentials, item) for item in by_id.values()]
+        hydrated = await gather_batched(
+            [self._hydrate_account(credentials, item) for item in by_id.values()]
         )
         resources = [_to_resource(item) for item in hydrated if item.get("id")]
         if len(resources) <= 1:
@@ -94,8 +95,8 @@ class AzureDiscoveryService:
     async def _prefer_resources_with_deployments(
         self, credentials: ProviderCredentials, resources: list[DiscoveredResource]
     ) -> list[DiscoveredResource]:
-        counts = await asyncio.gather(
-            *[self._deployment_count(credentials, resource.resource_id) for resource in resources]
+        counts = await gather_batched(
+            [self._deployment_count(credentials, resource.resource_id) for resource in resources]
         )
         ranked = sorted(
             zip(resources, counts, strict=True),
@@ -130,8 +131,8 @@ class AzureDiscoveryService:
             )
         except AzureApiError:
             return []
-        results = await asyncio.gather(
-            *[self._list_one_project(credentials, resource_id, project.get("name", "")) for project in projects]
+        results = await gather_batched(
+            [self._list_one_project(credentials, resource_id, project.get("name", "")) for project in projects]
         )
         deployments: list[DeploymentInfo] = []
         for batch in results:

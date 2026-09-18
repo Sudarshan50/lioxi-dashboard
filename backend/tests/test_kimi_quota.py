@@ -1,8 +1,12 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
+from app.core.exceptions import AzureApiError
+from app.providers.base import ProviderCredentials
 from app.schemas.kimi_deploy import KimiDeployResult
 from app.services.google_sheet_inventory import format_compact
 from app.services.kimi_deploy_service import (
+    _fireworks_quota_limit,
     attach_quota_fields,
     fireworks_limit_from_usages,
     normalize_quota_tier_name,
@@ -64,6 +68,36 @@ class FireworksQuota(unittest.TestCase):
     def test_missing(self):
         self.assertIsNone(fireworks_limit_from_usages({"value": []}))
         self.assertIsNone(fireworks_limit_from_usages(None))
+
+
+class FireworksQuotaLookup(unittest.IsolatedAsyncioTestCase):
+    async def test_reads_limit(self):
+        creds = ProviderCredentials("t", "c", "s", "sub")
+        client = AsyncMock()
+        client.get = AsyncMock(
+            return_value={"value": [{"name": {"value": "AIServices.DataZoneStandard.Fireworks"}, "limit": 500}]}
+        )
+        with (
+            patch("app.services.kimi_deploy_service.AzureArmClient", return_value=client),
+            patch("app.services.kimi_deploy_service.AzureTokenProvider"),
+        ):
+            limit = await _fireworks_quota_limit(creds, "eastus2")
+        self.assertEqual(limit, 500)
+        self.assertEqual(client.get.await_count, 1)
+
+    async def test_arm_error_is_not_retried_here(self):
+        creds = ProviderCredentials("t", "c", "s", "sub")
+        client = AsyncMock()
+        client.get = AsyncMock(side_effect=AzureApiError("Azure API error (429): Too many requests. Please retry."))
+        with (
+            patch("app.services.kimi_deploy_service.AzureArmClient", return_value=client),
+            patch("app.services.kimi_deploy_service.AzureTokenProvider"),
+            patch("app.services.kimi_deploy_service.asyncio.sleep", new_callable=AsyncMock) as slept,
+        ):
+            limit = await _fireworks_quota_limit(creds, "eastus2")
+        self.assertIsNone(limit)
+        self.assertEqual(client.get.await_count, 1)
+        slept.assert_not_awaited()
 
 
 class QuotaUpgrade(unittest.TestCase):

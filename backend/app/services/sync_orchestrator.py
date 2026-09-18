@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from app.core.crypto import SecretBox
 from app.database import SessionLocal
-from app.runtime import AZURE_SYNC_CONCURRENCY
+from app.runtime import azure_batch_size, gather_batched
 from app.repositories.account_repository import AccountRepository
 from app.repositories.model_repository import ModelRepository
 from app.repositories.usage_repository import UsageRepository
@@ -42,13 +42,12 @@ class SyncOrchestrator:
         async with self._azure_lock:
             async with SessionLocal() as session:
                 accounts = await AccountRepository(session).list_all()
-            limit = asyncio.Semaphore(max(1, AZURE_SYNC_CONCURRENCY))
-
-            async def _bounded(account_id: int) -> dict:
-                async with limit:
-                    return await self.sync_one(account_id)
-
-            results = await asyncio.gather(*[_bounded(account.id) for account in accounts])
+            logger.info(
+                "Azure sync: %s account(s) in batches of %s",
+                len(accounts),
+                azure_batch_size(len(accounts)),
+            )
+            results = await gather_batched([self.sync_one(account.id) for account in accounts])
             failed = [result for result in results if result.get("status") == "error"]
             from app.services.quota_autoscale import run_auto_quota_upgrades
 

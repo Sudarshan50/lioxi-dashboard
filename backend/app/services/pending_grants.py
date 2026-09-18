@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models.sp_submit_request import SpSubmitRequest
-from app.runtime import AZURE_SYNC_CONCURRENCY
+from app.runtime import gather_batched
 from app.schemas.kimi_deploy import KimiCreditSnapshot
 from app.schemas.submit import PendingGrantAccount, PendingGrantSummary, PendingGrantsResponse, PendingRequestPublic
 from app.services.join_group import normalize_group
@@ -276,13 +276,7 @@ async def refresh_pending_grants(db: AsyncSession) -> PendingGrantsResponse:
         if not rows:
             return PendingGrantsResponse(ok=True, summary=PendingGrantSummary(), accounts=[])
         jobs = [_job_from_row(row) for row in rows]
-        sem = asyncio.Semaphore(max(1, AZURE_SYNC_CONCURRENCY))
-
-        async def one(job: _GrantJob) -> KimiCreditSnapshot:
-            async with sem:
-                return await _run_grant_job(job)
-
-        snapshots = await asyncio.gather(*[one(job) for job in jobs])
+        snapshots = await gather_batched([_run_grant_job(job) for job in jobs])
         live = (
             await db.execute(
                 select(SpSubmitRequest).where(

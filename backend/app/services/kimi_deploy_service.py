@@ -23,7 +23,7 @@ from app.providers.azure.arm_client import AzureArmClient
 from app.providers.azure.token_provider import AzureTokenProvider
 from app.providers.base import ProviderCredentials
 from app.providers.registry import get_provider
-from app.runtime import DEPLOY_JOBS_MAX
+from app.runtime import DEPLOY_JOBS_MAX, gather_batched
 from app.schemas.kimi_deploy import (
     KimiContentFilterResult,
     KimiCreditSnapshot,
@@ -695,7 +695,7 @@ async def lookup_accounts_credits(
     session: AsyncSession | None = None,
 ) -> list[KimiCreditSnapshot]:
     accounts = await prepare_accounts(raw_accounts, session)
-    return list(await asyncio.gather(*[lookup_account_credits(account) for account in accounts]))
+    return await gather_batched([lookup_account_credits(account) for account in accounts])
 
 
 def _is_kimi_deployment(name: str, model_name: str) -> bool:
@@ -722,7 +722,7 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
             except Exception:  # noqa: BLE001
                 return resource, []
 
-        listed = await asyncio.gather(*[deployments_for(resource) for resource in resources]) if resources else []
+        listed = await gather_batched([deployments_for(resource) for resource in resources])
         matches: list[tuple[int, Any, Any, int]] = []
         for resource, deployments in listed:
             kimi = None
@@ -789,14 +789,13 @@ async def _find_kimi_stack(account: dict[str, str]) -> KimiDeployResult:
 
 async def _fireworks_quota_limit(credentials: ProviderCredentials, location: str | None) -> int | None:
     loc = _arm_location(location)
+    path = (
+        f"/subscriptions/{credentials.subscription_id}"
+        f"/providers/Microsoft.CognitiveServices/locations/{loc}/usages"
+    )
     try:
         body = await AzureArmClient(AzureTokenProvider()).get(
-            credentials,
-            (
-                f"/subscriptions/{credentials.subscription_id}"
-                f"/providers/Microsoft.CognitiveServices/locations/{loc}/usages"
-            ),
-            params={"api-version": _USAGE_API},
+            credentials, path, params={"api-version": _USAGE_API}
         )
     except Exception:  # noqa: BLE001
         logger.info("Fireworks quota lookup failed for %s", loc, exc_info=True)
@@ -910,6 +909,7 @@ async def lookup_accounts_inventory(
     raw_accounts: list[dict[str, Any]],
     session: AsyncSession | None = None,
     refresh: bool = False,
+    jobs: int | None = None,
 ) -> list[KimiDeployResult]:
     accounts = await prepare_accounts(raw_accounts, session)
     if refresh:
@@ -919,7 +919,10 @@ async def lookup_accounts_inventory(
         invalidate_kimi_pool_cache()
         for account in accounts:
             await drop_azure_inventory(account.get("AZURE_SUBSCRIPTION_ID"), account.get("account_name"))
-    results = list(await asyncio.gather(*[lookup_account_inventory(account) for account in accounts]))
+    results = await gather_batched(
+        [lookup_account_inventory(account) for account in accounts],
+        batch_size=jobs,
+    )
     if session is not None:
         from app.repositories.account_repository import AccountRepository
         from app.services.kimi_newapi import attach_kimi_newapi_status
@@ -1204,7 +1207,7 @@ async def deploy_accounts(
 
     raw_results, credit_results = await asyncio.gather(
         asyncio.gather(*[run_one(index, account) for index, account in enumerate(accounts)]),
-        asyncio.gather(*[_fetch_account_credits(account) for account in accounts]),
+        gather_batched([_fetch_account_credits(account) for account in accounts]),
     )
     results = [_merge_credits(_to_result(item), credits) for item, credits in zip(raw_results, credit_results, strict=True)]
     _copy_deploy_outputs(accounts, raw_results)
@@ -1266,7 +1269,7 @@ async def add_kimi_newapi_channels(
     weight: int = 1,
 ) -> list[KimiDeployResult]:
     accounts = await prepare_accounts(raw_accounts, session)
-    results = list(await asyncio.gather(*[lookup_account_inventory(account) for account in accounts]))
+    results = await lookup_accounts_inventory(accounts, session)
     for result, account in zip(results, accounts, strict=True):
         if not result.account_name and account.get("account_name"):
             result.account_name = account["account_name"]
@@ -1453,13 +1456,13 @@ async def scale_accounts(
     workers = _job_workers(jobs, len(accounts))
     logger.info("Kimi TPM/RPM scale started for %s account(s), jobs=%s", len(accounts), workers)
 
-    sem = asyncio.Semaphore(workers)
-
     async def run_one(account: dict[str, str]) -> dict[str, Any]:
-        async with sem:
-            return await asyncio.to_thread(_safe_scale_quota, module, account)
+        return await asyncio.to_thread(_safe_scale_quota, module, account)
 
-    raw_results = await asyncio.gather(*[run_one(account) for account in accounts])
+    raw_results = await gather_batched(
+        [run_one(account) for account in accounts],
+        batch_size=workers,
+    )
     scaled: list[KimiDeployResult] = []
     for account, raw in zip(accounts, raw_results, strict=True):
         await drop_azure_inventory(account.get("AZURE_SUBSCRIPTION_ID"), account.get("account_name"))
@@ -1795,7 +1798,7 @@ async def test_accounts(
 ) -> list[KimiTestResult]:
     accounts = await prepare_accounts(raw_accounts, session)
     collected_keys: list[dict[str, Any]] = []
-    results = list(await asyncio.gather(*[test_account_model(account, collected_keys) for account in accounts]))
+    results = await gather_batched([test_account_model(account, collected_keys) for account in accounts])
     if session is not None and collected_keys:
         from app.services.openai_key_store import persist_foundry_api_keys
 
