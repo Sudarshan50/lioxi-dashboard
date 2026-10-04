@@ -57,6 +57,7 @@ export function downloadPayableCsv(
     spendO1Usd?: number | null;
     spendO2Usd?: number | null;
     settled?: boolean;
+    blocked?: boolean;
   }[],
   filename = "amount-payable.csv",
   extras?: { unsettled?: number; settled?: number }
@@ -67,7 +68,7 @@ export function downloadPayableCsv(
   const grandTotal = rows.reduce((sum, row) => sum + rowPayableUsd(row), 0);
 
   const lines = [
-    ["name", "owner", "newapi_name", "endpoint", "o1", "o2", "o1+o2", "grandtotal", "settled"].map(csvCell).join(","),
+    ["name", "owner", "newapi_name", "endpoint", "o1", "o2", "o1+o2", "grandtotal", "settled", "blocked"].map(csvCell).join(","),
     ...rows.map((row) => {
       const o1 = payableOrNull(row.spendO1Usd);
       const o2 = payableOrNull(row.spendO2Usd);
@@ -84,17 +85,18 @@ export function downloadPayableCsv(
         csvCell(payableCell(o1o2)),
         csvCell(payableCell(grand)),
         csvCell(row.settled ? "settled" : ""),
+        csvCell(row.blocked ? "blocked" : ""),
       ].join(",");
     }),
-    ["TOTAL", "", "", "", o1Total.toFixed(2), o2Total.toFixed(2), o1O2Total.toFixed(2), grandTotal.toFixed(2), ""]
+    ["TOTAL", "", "", "", o1Total.toFixed(2), o2Total.toFixed(2), o1O2Total.toFixed(2), grandTotal.toFixed(2), "", ""]
       .map(csvCell)
       .join(","),
   ];
   if (extras?.unsettled != null) {
-    lines.push(["UNSETTLED", "", "", "", "", "", "", extras.unsettled.toFixed(2), ""].map(csvCell).join(","));
+    lines.push(["UNSETTLED", "", "", "", "", "", "", extras.unsettled.toFixed(2), "", ""].map(csvCell).join(","));
   }
   if (extras?.settled != null) {
-    lines.push(["SETTLED", "", "", "", "", "", "", extras.settled.toFixed(2), ""].map(csvCell).join(","));
+    lines.push(["SETTLED", "", "", "", "", "", "", extras.settled.toFixed(2), "", ""].map(csvCell).join(","));
   }
   const blob = new Blob(["\ufeff" + lines.join("\n") + "\n"], { type: "text/csv;charset=utf-8" });
   const url = URL.createObjectURL(blob);

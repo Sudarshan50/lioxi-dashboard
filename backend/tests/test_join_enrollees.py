@@ -106,6 +106,23 @@ class AutoRetryGate(unittest.TestCase):
                 )
             )
         )
+        self.assertFalse(
+            _row_can_auto_retry(
+                SimpleNamespace(
+                    status="failed",
+                    error_kind="deploy",
+                    error_message=(
+                        "This Azure subscription cannot deploy FW-Kimi-K3. "
+                        "Microsoft has not enabled Fireworks Kimi on it."
+                    ),
+                    client_secret_encrypted="x",
+                    client_id="id",
+                    subscription_id="sub",
+                    tenant_id="tid",
+                    auto_retry_count=0,
+                )
+            )
+        )
 
 
 class ApproveNewApiRequired(unittest.IsolatedAsyncioTestCase):

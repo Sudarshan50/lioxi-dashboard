@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { Bell, BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, ShieldBan, X } from "lucide-react";
+import { Bell, BellRing, Cloud, Cpu, Inbox, LayoutDashboard, LogOut, Rocket, ShieldBan, Sparkles, X } from "lucide-react";
 import { NavLink } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
@@ -13,6 +13,7 @@ const navItems = [
   { to: "/", label: "Overview", icon: LayoutDashboard },
   { to: "/accounts", label: "Accounts", icon: Cloud },
   { to: "/deploy", label: "Deploy K3", icon: Rocket },
+  { to: "/deploy-gpt", label: "Deploy GPT", icon: Sparkles },
   { to: "/pending", label: "Pending", icon: Inbox },
   { to: "/ban", label: "Ban", icon: ShieldBan },
   { to: "/models", label: "Models", icon: Cpu },

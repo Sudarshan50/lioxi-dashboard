@@ -64,6 +64,7 @@ class PendingRequestPublic(BaseModel):
     updated_at: datetime | None = None
     approved_at: datetime | None = None
     rejected_at: datetime | None = None
+    authorized_by: str | None = None
     can_retry_deploy: bool = False
     credits_limit: float | None = None
     credits_remaining: float | None = None
@@ -156,4 +157,16 @@ class PendingBatchSkipped(BaseModel):
 class PendingBatchApproveResponse(BaseModel):
     ok: bool = True
     started: list[int] = Field(default_factory=list)
+    skipped: list[PendingBatchSkipped] = Field(default_factory=list)
+
+
+class PendingBatchDeclineRequest(BaseModel):
+    ids: list[int] | None = None
+    # Restrict a no-ids sweep to one group. None means every group.
+    group: str | None = Field(default=None, max_length=8)
+
+
+class PendingBatchDeclineResponse(BaseModel):
+    ok: bool = True
+    declined: list[int] = Field(default_factory=list)
     skipped: list[PendingBatchSkipped] = Field(default_factory=list)

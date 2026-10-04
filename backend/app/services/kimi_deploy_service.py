@@ -441,6 +441,12 @@ def normalize_account(raw: dict[str, Any], index: int) -> dict[str, str]:
         if weight < 1 or weight > 10000:
             raise KimiDeployError(f"Entry {index + 1} weight must be 1–10000.")
         out["new_api_weight"] = str(weight)
+    channel_id = _pick(merged, ("new_api_channel_id", "newApiChannelId", "channel_id"))
+    if channel_id:
+        out["new_api_channel_id"] = channel_id
+    enable = _pick(merged, ("new_api_enable", "newApiEnable"))
+    if enable:
+        out["new_api_enable"] = enable
     return out
 
 
@@ -522,10 +528,26 @@ def _with_person(rows: list[dict[str, Any]], accounts: list[dict[str, str]]) -> 
     return stamped
 
 
+def _model_blocked(module: ModuleType, message: str) -> bool:
+    """True when Azure has confirmed this subscription cannot host FW-Kimi-K3.
+
+    Checked on the raw error. humanize_kimi_deploy_error replaces that text, and
+    a second full deploy would only wait on the same zero quota again.
+    """
+    unavailable = getattr(module, "model_unavailable", None)
+    if not callable(unavailable):
+        return False
+    try:
+        return bool(unavailable(message))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _safe_deploy(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
     name = account.get("name") or account.get("account_holder") or "account"
     last_error = "Deploy failed."
     for attempt in range(2):
+        blocked = False
         try:
             result = module.deploy_one(account)
             if isinstance(result, dict):
@@ -535,12 +557,14 @@ def _safe_deploy(module: ModuleType, account: dict[str, str]) -> dict[str, Any]:
                 last_error = str(result.get("error") or "Deploy failed.")
             else:
                 last_error = "Deploy returned an unexpected result."
+            blocked = _model_blocked(module, last_error)
         except Exception as exc:  # noqa: BLE001 - surface Azure/CLI failures to the admin UI
             last_error = _scrub_secret(str(exc), account.get("AZURE_CLIENT_SECRET") or "")
+            blocked = _model_blocked(module, last_error)
         humanize = getattr(module, "humanize_kimi_deploy_error", None)
         if callable(humanize):
             last_error = humanize(last_error)
-        if attempt == 0:
+        if attempt == 0 and not blocked:
             logger.warning("Kimi K3 deploy failed for %s; retrying: %s", name, last_error[-300:])
             time.sleep(8)
             continue

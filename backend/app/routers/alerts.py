@@ -13,6 +13,7 @@ from app.services.alert_service import (
     get_alert_config,
     save_alert_config,
     set_at_cap_manual,
+    set_blocked,
     set_payable_settled,
 )
 from app.services.account_service import AccountNotFoundError
@@ -79,6 +80,10 @@ class AtCapManualPayload(BaseModel):
     at_cap: bool
 
 
+class BlockedPayload(BaseModel):
+    blocked: bool
+
+
 @router.get("/state")
 async def read_state(db: AsyncSession = Depends(get_db)):
     return await alert_state(db)
@@ -100,6 +105,16 @@ async def update_at_cap_manual(
 ):
     try:
         return await set_at_cap_manual(db, account_id, payload.at_cap)
+    except AccountNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.patch("/state/{account_id}/blocked")
+async def update_blocked(account_id: int, payload: BlockedPayload, db: AsyncSession = Depends(get_db)):
+    try:
+        return await set_blocked(db, account_id, payload.blocked)
     except AccountNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:

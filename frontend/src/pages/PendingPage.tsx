@@ -14,8 +14,8 @@ import { GROUP_SB, GROUP_VCS, JoinGroup, groupCounts, groupLabel, matchesGroup }
 import { invalidateAfterDeploy, useKimiDeployDefaults, useSaveKimiDeployDefaults } from "@/hooks/useKimiDeploy";
 import apiClient from "@/lib/apiClient";
 import { useBanSettings } from "@/hooks/useBan";
-import { formatCurrency } from "@/lib/format";
-import { enqueuePendingApprove, enqueuePendingApproveBatch } from "@/lib/submitApi";
+import { formatCurrency, formatDateTime, formatRelative } from "@/lib/format";
+import { enqueuePendingApprove, enqueuePendingApproveBatch, enqueuePendingDeclineBatch } from "@/lib/submitApi";
 import { toastError, toastSuccess } from "@/lib/toast";
 import { PendingGrantSummary, PendingListResponse, PendingSubmitRequest } from "@/types";
 
@@ -34,6 +34,19 @@ function statusLabel(status: string) {
   if (status === "failed") return "failed";
   if (status === "approving") return "deploying";
   return status.replace(/_/g, " ");
+}
+
+function approvalBadge(row: PendingSubmitRequest): { label: string; tone: "info" | "success" | "error" | "warning" | "neutral" } {
+  if (row.status !== "approved") {
+    return { label: statusLabel(row.status), tone: statusTone(row.status) };
+  }
+  if (row.authorized_by === "auto-approve") {
+    return { label: "auto-approved", tone: "info" };
+  }
+  if (row.authorized_by === "admin") {
+    return { label: "admin approved", tone: "success" };
+  }
+  return { label: "approved", tone: "success" };
 }
 
 function SubmitCard({
@@ -60,6 +73,8 @@ function SubmitCard({
   const canDecline =
     row.status === "pending_approval" || row.status === "failed" || row.status === "creating_sp";
   const canApprove = !inFlight && !rolesFailed && Boolean(row.can_retry_deploy && onApprove);
+  const badge = approvalBadge(row);
+  const approvedAt = row.approved_at || (row.status === "approved" ? row.updated_at : null);
   return (
     <Card className={`flex flex-col gap-4 ${inFlight ? "!border-accent/40 shadow-glow" : failed ? "!border-red-500/25" : ""}`}>
       <div className="flex items-start justify-between gap-3">
@@ -72,14 +87,20 @@ function SubmitCard({
               </Badge>
             )}
             <GroupBadge group={row.group_tag} />
-            <Badge tone={statusTone(row.status)} className={inFlight ? "animate-pulse" : undefined}>
-              {statusLabel(row.status)}
+            <Badge tone={badge.tone} className={inFlight ? "animate-pulse" : undefined}>
+              {badge.label}
             </Badge>
           </div>
           <p className="mt-0.5 truncate text-xs text-gray-500">{row.account_holder || "No email"}</p>
         </div>
       </div>
       <dl className="grid grid-cols-1 gap-1 text-xs text-gray-400">
+        {approvedAt && (
+          <div className="truncate" title={formatDateTime(approvedAt)}>
+            <span className="text-gray-500">Approved · </span>
+            {formatRelative(approvedAt)}
+          </div>
+        )}
         <div className="truncate">
           <span className="text-gray-500">Subscription · </span>
           {tenantLevel ? "None (tenant login only)" : row.subscription_name || row.subscription_id || "—"}
@@ -170,6 +191,7 @@ export default function PendingPage() {
     },
   });
   const [submitting, setSubmitting] = useState(false);
+  const [decliningAll, setDecliningAll] = useState(false);
   const [grantsOpen, setGrantsOpen] = useState(false);
   const [groupFilter, setGroupFilter] = useState<JoinGroup | null>(null);
 
@@ -311,9 +333,50 @@ export default function PendingPage() {
     fetched_at: null,
   };
   const grantsLoaded = grantSummary.fetched > 0;
-  const busy = submitting || reject.isPending;
+  const busy = submitting || reject.isPending || decliningAll;
   const empty =
     !list.isLoading && waiting.length === 0 && inflight.length === 0 && failedRows.length === 0 && approvedRows.length === 0;
+
+  async function declineBatch() {
+    if (failedRows.length === 0) return;
+    const leftoverCount = failedRows.filter((row) => row.error_kind === "deploy").length;
+    const label = failedRows.length === 1 ? "this failed card" : `all ${failedRows.length} failed cards`;
+    const leftoverNote =
+      leftoverCount > 0
+        ? " Clear leftover removes empty Azure Kimi stacks. Role failures just delete the card."
+        : " Role failures just delete the card.";
+    if (!window.confirm(`Decline ${label}?${leftoverNote} They can /join again.`)) {
+      return;
+    }
+    setDecliningAll(true);
+    try {
+      const result = await enqueuePendingDeclineBatch({
+        ids: failedRows.map((row) => row.id),
+        ...(groupFilter ? { group: groupFilter } : {}),
+      });
+      if (result.declined.length === 0) {
+        const first = result.skipped[0]?.error;
+        toastError(first || "Could not decline these requests.");
+      } else if (result.skipped.length) {
+        toastSuccess(
+          `Declined ${result.declined.length}. ${result.skipped.length} leftover delete${
+            result.skipped.length === 1 ? "" : "s"
+          } failed — try Clear leftover again.`
+        );
+      } else {
+        toastSuccess(
+          leftoverCount > 0
+            ? `Declined ${result.declined.length}. Leftover Azure stacks cleared. They can /join again.`
+            : `Declined ${result.declined.length}. They can register again.`
+        );
+      }
+      await queryClient.invalidateQueries({ queryKey: ["pending-submits"] });
+    } catch (exc) {
+      toastError(exc instanceof Error ? exc.message : "Could not decline these requests.");
+    } finally {
+      setDecliningAll(false);
+    }
+  }
 
   return (
     <div className="flex flex-col gap-5">
@@ -402,20 +465,31 @@ export default function PendingPage() {
                 <AlertTriangle size={16} className="text-red-400" />
                 <h2 className="text-sm font-semibold text-gray-100">Join / deploy errors</h2>
                 <Badge tone="error">{failedRows.length}</Badge>
-                {retryable.length > 0 && (
+                <div className="ml-auto flex flex-wrap items-center gap-2">
                   <Button
-                    className="ml-auto px-3 py-1.5 text-xs"
+                    variant="danger"
+                    className="px-3 py-1.5 text-xs"
                     disabled={busy}
-                    isLoading={submitting}
-                    onClick={() => void approveBatch(true)}
+                    isLoading={decliningAll}
+                    onClick={() => void declineBatch()}
                   >
-                    Retry all ({retryable.length})
+                    Decline all ({failedRows.length})
                   </Button>
-                )}
+                  {retryable.length > 0 && (
+                    <Button
+                      className="px-3 py-1.5 text-xs"
+                      disabled={busy}
+                      isLoading={submitting}
+                      onClick={() => void approveBatch(true)}
+                    >
+                      Retry all ({retryable.length})
+                    </Button>
+                  )}
+                </div>
               </div>
               <p className="text-xs text-gray-500">
-                Retry deploy if K3 failed after the identity was stored (quota/model access). Clear leftover deletes the
-                empty Azure stack and this card. Role failures need /join again.
+                Retry deploy if K3 failed after the identity was stored (quota/model access). Clear leftover or Decline
+                all deletes the empty Azure stack and this card. Role failures need /join again.
               </p>
               <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
                 {failedRows.map((row) => (

@@ -8,6 +8,7 @@ from app.services.kimi_newapi import (
     KIMI_POOL_TAG,
     _channel_create_body,
     _channel_update_body,
+    existing_pool_channel,
     foundry_key_from_account,
     pool_tag,
     pool_tag_variants,
@@ -58,6 +59,32 @@ class PoolTagExact(unittest.TestCase):
     def test_update_keeps_existing_tag_when_omitted(self):
         updated = _channel_update_body({"id": 1, "tag": " kimi-k3-pool"}, "n")
         self.assertEqual(updated["tag"], " kimi-k3-pool")
+
+    def test_update_can_retarget_url_and_key(self):
+        updated = _channel_update_body(
+            {"id": 1, "tag": " kimi-k3-pool", "base_url": "https://old.openai.azure.com"},
+            "kimi-k3-500k-proxy-186",
+            base_url="https://new.openai.azure.com",
+            key="new-key",
+        )
+        self.assertEqual(updated["base_url"], "https://new.openai.azure.com")
+        self.assertEqual(updated["key"], "new-key")
+
+    def test_named_channel_is_found_when_host_changed(self):
+        channels = [
+            {
+                "id": 186,
+                "name": "kimi-k3-500k-proxy-186",
+                "base_url": "https://lioxishaurya8-kimi-t6vw3v.openai.azure.com",
+                "status": 1,
+            }
+        ]
+        found = existing_pool_channel(
+            channels,
+            {"brand-new-stack"},
+            {"new_api_name": "kimi-k3-500k-proxy-186"},
+        )
+        self.assertEqual(found["id"], 186)
 
     def test_create_body_sets_model_group_and_content_filter(self):
         body = _channel_create_body(

@@ -1,4 +1,4 @@
-import { PendingSubmitRequest, SubmitSessionSnapshot } from "@/types";
+import { PendingBatchDeclineResponse, PendingSubmitRequest, SubmitSessionSnapshot } from "@/types";
 
 export const SUBMIT_SESSION_KEY = "submit_session_id";
 export const JOIN_PASSWORD_KEY = "join_password";
@@ -310,6 +310,31 @@ export async function enqueuePendingApproveBatch(payload: {
   }
   if (!response.ok) throw new Error(await readError(response, `Approve failed (${response.status}).`));
   return (await response.json()) as { started: number[]; skipped: { id: number; error: string }[] };
+}
+
+export async function enqueuePendingDeclineBatch(payload: {
+  ids?: number[];
+  // Restricts an ids-less sweep to one Join group; omit for every group.
+  group?: string;
+}) {
+  const token = localStorage.getItem("access_token");
+  const response = await fetch(`${submitBaseUrl()}/api/pending/decline-batch`, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+      Accept: "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(payload),
+  });
+  if (response.status === 401) {
+    localStorage.removeItem("access_token");
+    window.location.href = "/login";
+    throw new Error("Your session expired. Sign in again.");
+  }
+  if (!response.ok) throw new Error(await readError(response, `Decline failed (${response.status}).`));
+  return (await response.json()) as PendingBatchDeclineResponse;
 }
 
 export type { PendingSubmitRequest };

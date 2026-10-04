@@ -9,7 +9,45 @@ from app.services.new_api_service import (
     _portal_quota,
     _portal_status,
     _unique_channels,
+    channels_matching_account,
 )
+from app.services.channel_cards import cards_for_channels
+
+
+class ChannelsMatchingAccount(unittest.TestCase):
+    def test_matches_new_host_after_redeploy(self):
+        account = SimpleNamespace(
+            resource_name="lioxishaurya8-kimi-w556kl",
+            endpoint="https://lioxishaurya8-kimi-w556kl.openai.azure.com/",
+            new_api_channel_id=223,
+            new_api_name="kimi-k3-500k-proxy-186",
+        )
+        channels = [
+            {
+                "id": 223,
+                "name": "kimi-k3-500k-proxy-186",
+                "base_url": "https://lioxishaurya8-kimi-w556kl.openai.azure.com",
+                "status": 2,
+            }
+        ]
+        self.assertEqual(channels_matching_account(account, channels)[0]["id"], 223)
+
+    def test_falls_back_to_channel_id_when_host_still_old(self):
+        account = SimpleNamespace(
+            resource_name="lioxishaurya8-kimi-w556kl",
+            endpoint="https://lioxishaurya8-kimi-w556kl.openai.azure.com/",
+            new_api_channel_id=223,
+            new_api_name="kimi-k3-500k-proxy-186",
+        )
+        channels = [
+            {
+                "id": 223,
+                "name": "kimi-k3-500k-proxy-186",
+                "base_url": "https://lioxishaurya8-kimi-t6vw3v.openai.azure.com",
+                "status": 2,
+            }
+        ]
+        self.assertEqual(channels_matching_account(account, channels)[0]["id"], 223)
 
 
 class UniqueChannels(unittest.TestCase):
@@ -119,3 +157,34 @@ class HostAndPages(unittest.TestCase):
         self.assertEqual(_merge_channel_page(by_id, [{"id": 2101, "used_quota": 9}]), 0)
         self.assertEqual(_merge_channel_page(by_id, [{"id": 16, "used_quota": 2}]), 1)
         self.assertEqual(len(by_id), 2)
+
+
+class ChannelCards(unittest.TestCase):
+    def test_same_host_keeps_separate_status_and_spend(self):
+        channels = [
+            {
+                "id": 10,
+                "name": "kimi-k3-proxy",
+                "tag": " kimi-k3-pool",
+                "base_url": "https://res-a.openai.azure.com",
+                "status": 1,
+                "used_quota": 2_500_000_000,
+            },
+            {
+                "id": 11,
+                "name": "gpt-astra-proxy2",
+                "tag": "gpt-astra",
+                "base_url": "https://res-a.openai.azure.com/",
+                "status": 2,
+                "used_quota": 8_500_000,
+            },
+        ]
+        cards = cards_for_channels(channels, "O1", 500_000)["res-a"]
+        self.assertEqual([card["name"] for card in cards], ["kimi-k3-proxy", "gpt-astra-proxy2"])
+        self.assertEqual(cards[0]["role"], "primary")
+        self.assertEqual(cards[0]["status"], 1)
+        self.assertAlmostEqual(cards[0]["spend_usd"], 5000)
+        self.assertEqual(cards[1]["role"], "gpt")
+        self.assertEqual(cards[1]["status"], 2)
+        self.assertAlmostEqual(cards[1]["spend_usd"], 17)
+        self.assertAlmostEqual(cards[0]["spend_usd"] + cards[1]["spend_usd"], 5017)

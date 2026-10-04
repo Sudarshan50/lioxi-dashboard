@@ -130,6 +130,22 @@ def _account_key(account: ProviderAccount) -> str | None:
     return name or _host_key(account.endpoint)
 
 
+def channels_matching_account(account: ProviderAccount, channels: list[dict]) -> list[dict]:
+    key = _account_key(account)
+    by_host = [channel for channel in channels if key and _host_key(channel.get("base_url")) == key]
+    if by_host:
+        return _unique_channels(by_host)
+    extras: list[dict] = []
+    channel_id = account.new_api_channel_id
+    name = (account.new_api_name or "").strip().lower()
+    for channel in channels:
+        if channel_id is not None and _channel_id(channel) == int(channel_id):
+            extras.append(channel)
+        elif name and (channel.get("name") or "").strip().lower() == name:
+            extras.append(channel)
+    return _unique_channels(extras)
+
+
 def _index_accounts(accounts: list[ProviderAccount]) -> dict[str, ProviderAccount | None]:
     """Map match-key → account. Duplicate keys are stored as None so neither
     colliding account silently steals the other's channels.
@@ -382,6 +398,38 @@ async def set_channel_status(gateway: Gateway, channel_id: int, status: int) -> 
     return bool(body.get("data"))
 
 
+async def set_account_channel_status(
+    session: AsyncSession, account_id: int, channel_id: int, status: int, gateway_label: str = "O1"
+) -> dict:
+    """Enable or disable one channel. Sibling channels on the same Azure resource stay as they are."""
+    if status not in (1, 2):
+        raise NewApiError("Status must be 1 or 2")
+    async with _gateway_lock:
+        account = await AccountRepository(session).get(account_id)
+        if account is None:
+            raise NewApiError("Account not found")
+        if status == 1 and bool(getattr(account, "blocked", False)):
+            raise NewApiError("This account is blocked. Unblock it on Alerts before enabling.")
+        gateway = next((item for item in gateways() if item.label == gateway_label), None)
+        if gateway is None:
+            raise NewApiError(f"Gateway {gateway_label} is not configured")
+        channels = await fetch_channels(gateway)
+        matches = channels_matching_account(account, channels)
+        target = next((item for item in matches if _channel_id(item) == int(channel_id)), None)
+        if target is None:
+            raise NewApiError("That channel is not on this account")
+        await set_channel_status(gateway, int(channel_id), status)
+        target["status"] = status
+        rolled = _portal_status(matches)
+        if gateway_label == "O1":
+            account.new_api_status_o1 = rolled
+        else:
+            account.new_api_status_o2 = rolled
+        recompute_overall_status(account)
+        await session.commit()
+        return {"status": "ok", "channel_id": int(channel_id), "channel_status": status}
+
+
 async def set_gateway_status(
     session: AsyncSession, account_id: int, status: int, gateway_label: str | None = None
 ) -> dict:
@@ -399,6 +447,8 @@ async def _set_gateway_status_locked(
     account = await AccountRepository(session).get(account_id)
     if account is None:
         raise NewApiError("Account not found")
+    if status == 1 and bool(getattr(account, "blocked", False)):
+        raise NewApiError("This account is blocked. Unblock it on Alerts before enabling.")
     key = _account_key(account)
     if not key:
         raise NewApiError("Account has no endpoint to match against")
@@ -411,9 +461,7 @@ async def _set_gateway_status_locked(
     for gateway in targets:
         try:
             channels = await fetch_channels(gateway)
-            matches = _unique_channels(
-                [channel for channel in channels if _host_key(channel.get("base_url")) == key]
-            )
+            matches = channels_matching_account(account, channels)
             if not matches:
                 if gateway_label:
                     errors[gateway.label] = "no matching channels"

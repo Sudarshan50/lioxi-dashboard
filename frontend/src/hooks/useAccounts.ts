@@ -2,7 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 
 import apiClient from "@/lib/apiClient";
-import { Account, Deployment, DiscoveredResource, SyncAccountResult, SyncAllResult } from "@/types";
+import { Account, Deployment, DiscoveredResource, KimiDeployJob, SyncAccountResult, SyncAllResult } from "@/types";
+
+const REDEPLOY_TIMEOUT_MS = 45 * 60 * 1000;
 
 export function useAccounts() {
   return useQuery({
@@ -101,6 +103,70 @@ export function useTestAccount() {
   });
 }
 
+export function useRevealAccountApiKey() {
+  return useMutation({
+    mutationFn: async (accountId: number) =>
+      (await apiClient.post<{ api_key: string; endpoint: string; new_api_error?: string | null }>(
+        `/api/accounts/${accountId}/api-key`
+      )).data,
+  });
+}
+
+export function useRotateAccountApiKey() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (accountId: number) =>
+      (await apiClient.post<{ api_key: string; endpoint: string; new_api_error?: string | null }>(
+        `/api/accounts/${accountId}/rotate-key`
+      )).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["accounts"] });
+    },
+  });
+}
+
+export function useRedeployAccount() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async (accountId: number) => {
+      const queued = (
+        await apiClient.post<{ status: string; job_id: string | null; name: string }>(`/api/accounts/${accountId}/redeploy`)
+      ).data;
+      const deadline = Date.now() + REDEPLOY_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => window.setTimeout(resolve, 4000));
+        const job = (await apiClient.get<KimiDeployJob>("/api/kimi-deploy/job")).data;
+        if (queued.job_id && job.job_id && job.job_id !== queued.job_id) {
+          continue;
+        }
+        if (job.running) {
+          continue;
+        }
+        if (job.error) {
+          throw new Error(job.error);
+        }
+        const result = job.results?.[0];
+        if (result && result.ok === false) {
+          throw new Error(result.error || "Redeploy failed.");
+        }
+        return { queued, result };
+      }
+      throw new Error("Redeploy is still running. Check Deploy K3 for progress.");
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-groups"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+      queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["models"] });
+      queryClient.invalidateQueries({ queryKey: ["kimi-deploy-job"] });
+      queryClient.invalidateQueries({ queryKey: ["kimi-inventory"] });
+      queryClient.invalidateQueries({ queryKey: ["kimi-capacity"] });
+      queryClient.invalidateQueries({ queryKey: ["kimi-newapi"] });
+    },
+  });
+}
+
 export function useSyncAccount() {
   const queryClient = useQueryClient();
   return useMutation({
@@ -108,6 +174,35 @@ export function useSyncAccount() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["accounts"] });
       queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+  });
+}
+
+export function useSetChannelStatus() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({
+      accountId,
+      channelId,
+      enable,
+      gateway,
+    }: {
+      accountId: number;
+      channelId: number;
+      enable: boolean;
+      gateway: string;
+    }) =>
+      (
+        await apiClient.post<{ status: string; channel_id: number; channel_status: number }>(
+          `/api/accounts/${accountId}/channels/${channelId}/status`,
+          null,
+          { params: { status: enable ? 1 : 2, gateway } }
+        )
+      ).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["accounts"] });
+      queryClient.invalidateQueries({ queryKey: ["account-groups"] });
       queryClient.invalidateQueries({ queryKey: ["alerts"] });
     },
   });

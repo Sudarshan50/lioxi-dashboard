@@ -36,7 +36,6 @@ LIVE_GIF_FILENAME = "animation.gif.mp4"
 _PUBLIC_COMMANDS = {"/live", "/help", "/start"}
 UNAUTHORIZED_REPLY = "Bhag Bhosdike!"
 _pending_deletes: dict[tuple[str, int], asyncio.Task] = {}
-_picker_owners: dict[tuple[str, int], str] = {}
 ACCOUNT_PAGE_SIZE = 16
 _PAGE_PREFIX = {"en": "enp", "dis": "disp", "acct": "acp", "who": "whop", "live": "livep"}
 _PAGE_KIND = {value: key for key, value in _PAGE_PREFIX.items()}
@@ -147,11 +146,6 @@ def cancel_all_self_destructs(chat_id: str | int | None = None) -> int:
     for key, task in pending:
         _pending_deletes.pop(key, None)
         task.cancel()
-    if wanted is None:
-        _picker_owners.clear()
-    else:
-        for key in [k for k in _picker_owners if k[0] == wanted]:
-            _picker_owners.pop(key, None)
     return len(pending)
 
 
@@ -171,30 +165,6 @@ def _message_ids(*message_ids: int | None | list[int | None] | tuple[int | None,
     return list(dict.fromkeys(ids))
 
 
-def _picker_key(chat_id, message_id) -> tuple[str, int] | None:
-    if chat_id is None or message_id is None:
-        return None
-    return (str(chat_id), int(message_id))
-
-
-def _remember_picker_owner(chat_id, message_id, user_id) -> None:
-    key = _picker_key(chat_id, message_id)
-    if key is None or not user_id:
-        return
-    _picker_owners[key] = str(user_id)
-
-
-def _forget_picker_owner(chat_id, message_id) -> None:
-    key = _picker_key(chat_id, message_id)
-    if key is not None:
-        _picker_owners.pop(key, None)
-
-
-def _picker_owner(chat_id, message_id) -> str | None:
-    key = _picker_key(chat_id, message_id)
-    return _picker_owners.get(key) if key else None
-
-
 def schedule_self_destruct(
     chat_id: str | int | None,
     *message_ids: int | None | list[int | None] | tuple[int | None, ...],
@@ -212,7 +182,6 @@ def schedule_self_destruct(
             await asyncio.sleep(delay)
             for message_id in ids:
                 await telegram_service.delete_message(chat_id, message_id)
-                _forget_picker_owner(chat_id, message_id)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -451,7 +420,11 @@ def _channel_block(account, index: int | None = None) -> str:
     grant = credit_grant_usd(account)
     percent = _percent(account)
     title = html.escape(account.new_api_name or account.name or "channel")
-    extra = " · paused" if not _is_live(account) else ""
+    extra = ""
+    if getattr(account, "blocked", False):
+        extra = " · blocked"
+    elif not _is_live(account):
+        extra = " · paused"
     prefix = f"<b>{index}.</b> " if index is not None else ""
     lines = [f"{prefix}<code>{title}</code> · {html.escape(gateway)}{extra}"]
     if "O1" in labels:
@@ -848,9 +821,6 @@ async def _process_callback(callback: dict) -> None:
     await telegram_service.answer_callback_query(callback.get("id") or "")
     if chat_id is None:
         return
-    owner = _picker_owner(chat_id, message_id)
-    if owner and sender != owner:
-        return
     if not _callback_allowed(message.get("chat") or message, sender, data):
         await telegram_service.send_message(UNAUTHORIZED_REPLY, chat_id=chat_id)
         return
@@ -863,7 +833,6 @@ async def _process_callback(callback: dict) -> None:
             source_id = int(raw_id)
         for mid in _message_ids(message_id, source_id):
             _cancel_self_destruct(chat_id, mid)
-            _forget_picker_owner(chat_id, mid)
             await telegram_service.delete_message(chat_id, mid)
         return
     if prefix == "live" and raw_id:
@@ -877,7 +846,6 @@ async def _process_callback(callback: dict) -> None:
                 else f"That person is no longer in the list.{_live_ttl_note()}"
             )
             await _replace_message(chat_id, message_id, text, ephemeral=True, source_id=source_id)
-            _forget_picker_owner(chat_id, message_id)
         except Exception:
             logger.warning("Bot live callback failed: %s", data, exc_info=True)
         return
@@ -1038,8 +1006,6 @@ async def _process_update(update: dict) -> None:
             )
             if ephemeral and sent_id is not None:
                 sent_ids.append(sent_id)
-                if index == 0 and keyboard is not None:
-                    _remember_picker_owner(chat_id, sent_id, sender)
         if ephemeral:
             schedule_self_destruct(chat_id, *sent_ids, source_id)
     except Exception:

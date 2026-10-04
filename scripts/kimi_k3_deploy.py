@@ -59,6 +59,11 @@ STACK_SUFFIXES = (STACK_SUFFIX_SB, STACK_SUFFIX_VCS)
 API_VERSION = "2023-05-01"
 DEPLOY_API_VERSION = "2024-10-01"
 FIREWORKS_FEATURE = "Fireworks.EnableDeploy"
+# Feature registration returns while state is still Registering, and the usage
+# API keeps reporting limit 0 until that finishes. Poll this long before
+# treating quota 0 as a permanent block.
+FIREWORKS_ACCESS_WAIT_SEC = 120
+FIREWORKS_ACCESS_POLL_SEC = 10
 RAI_POLICY_NAME = "LioxiCustom"
 RAI_POLICY_API = "2024-10-01"
 RAI_CONTENT_FILTERS = [
@@ -870,6 +875,94 @@ def fireworks_quota(env: dict[str, str], location: str) -> tuple[int, int]:
     return 0, 0
 
 
+def fireworks_feature_state(env: dict[str, str] | None) -> str:
+    try:
+        data = az_json(
+            [
+                "az",
+                "feature",
+                "show",
+                "--namespace",
+                "Microsoft.CognitiveServices",
+                "--name",
+                FIREWORKS_FEATURE,
+                "-o",
+                "json",
+            ],
+            env=env,
+            timeout=45,
+        )
+    except AzError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    props = data.get("properties") if isinstance(data.get("properties"), dict) else {}
+    return str(props.get("state") or data.get("state") or "").strip()
+
+
+def register_fireworks_feature(env: dict[str, str] | None) -> None:
+    az_ok(
+        [
+            "az",
+            "feature",
+            "register",
+            "--namespace",
+            "Microsoft.CognitiveServices",
+            "--name",
+            FIREWORKS_FEATURE,
+        ],
+        env=env,
+        timeout=60,
+    )
+
+
+def wait_for_fireworks_quota(
+    env: dict[str, str] | None,
+    location: str,
+    *,
+    timeout: int = FIREWORKS_ACCESS_WAIT_SEC,
+    interval: float = FIREWORKS_ACCESS_POLL_SEC,
+) -> tuple[int, int]:
+    """Poll until Fireworks quota is visible after feature registration.
+
+    A limit of 0 while Fireworks.EnableDeploy is still Registering is propagation.
+    Only a Registered feature that stays at 0 for the whole window is a real block.
+    """
+    deadline = time.time() + timeout
+    last_state = ""
+    saw_registered = False
+    while True:
+        last_state = fireworks_feature_state(env)
+        if last_state.lower() == "registered":
+            saw_registered = True
+        elif last_state.lower() in {"", "notregistered", "unregistered"}:
+            register_fireworks_feature(env)
+        try:
+            current, limit = fireworks_quota(env, location)
+        except AzError as exc:
+            progress(f"  {FIREWORKS_FEATURE}: quota lookup failed ({exc})")
+            current, limit = 0, 0
+        if limit > 0:
+            progress(f"  {FIREWORKS_FEATURE}: quota {current}/{limit} in {location}")
+            return current, limit
+        if time.time() >= deadline:
+            break
+        progress(
+            f"  {FIREWORKS_FEATURE}: quota still 0 in {location} "
+            f"(feature {last_state or 'registering'})"
+        )
+        time.sleep(interval)
+    if saw_registered:
+        raise AzError(
+            "SpecialFeatureOrQuotaIdRequired: this subscription does not have access to "
+            f"{QUOTA_NAME} in {location}"
+        )
+    raise AzError(
+        f"Timed out waiting for {FIREWORKS_FEATURE} to register "
+        f"(state {last_state or 'unknown'}). Retry deploy."
+    )
+
+
 def account_ready(env: dict[str, str], name: str, rg: str) -> tuple[bool, str]:
     try:
         data = az_json(
@@ -1181,31 +1274,16 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
 
         for ns in PROVIDERS:
             az_ok(["az", "provider", "register", "--namespace", ns], env=env, timeout=120)
-        az_ok(
-            [
-                "az",
-                "feature",
-                "register",
-                "--namespace",
-                "Microsoft.CognitiveServices",
-                "--name",
-                FIREWORKS_FEATURE,
-            ],
-            env=env,
-        )
-
-        current_q, limit_q = fireworks_quota(env, LOCATION)
-        if limit_q <= 0:
-            leftover = list_kimi_stacks(env)
-            for leftover_name, leftover_rg in leftover:
-                if looks_like_kimi_stack(leftover_name, leftover_rg):
-                    purge_kimi_stack(env, leftover_name, leftover_rg)
-            raise AzError(
-                humanize_kimi_deploy_error(
-                    "SpecialFeatureOrQuotaIdRequired: this subscription does not have access to "
-                    f"{QUOTA_NAME} in {LOCATION}"
-                )
-            )
+        register_fireworks_feature(env)
+        try:
+            wait_for_fireworks_quota(env, LOCATION)
+        except AzError as exc:
+            if model_unavailable(str(exc)):
+                leftover = list_kimi_stacks(env)
+                for leftover_name, leftover_rg in leftover:
+                    if looks_like_kimi_stack(leftover_name, leftover_rg):
+                        purge_kimi_stack(env, leftover_name, leftover_rg)
+            raise
 
         def _create():
             return pick_or_create_account(env, slug, sub, suffix)
@@ -1227,7 +1305,7 @@ def deploy_one(acct: dict[str, Any]) -> dict[str, Any]:
         except AzError as exc:
             if model_unavailable(str(exc)) and looks_like_kimi_stack(acct_name, rg):
                 delete_dedicated_kimi_stack(env, acct_name, rg)
-            raise AzError(humanize_kimi_deploy_error(str(exc))) from exc
+            raise
         keys = az_json(
             ["az", "cognitiveservices", "account", "keys", "list", "-n", acct_name, "-g", rg, "-o", "json"],
             env=env,
@@ -2102,8 +2180,9 @@ def cmd_deploy(args: argparse.Namespace) -> int:
                 print(f"OK {name} capacity={results[i]['capacity']} endpoint={results[i]['azure_openai_endpoint']}", file=sys.stderr)
             except Exception as exc:  # noqa: BLE001
                 errors += 1
-                results[i] = {"ok": False, "name": name, "error": str(exc)[-1500:]}
-                print(f"FAIL {name}: {exc}", file=sys.stderr)
+                detail = humanize_kimi_deploy_error(str(exc))
+                results[i] = {"ok": False, "name": name, "error": detail[-1500:]}
+                print(f"FAIL {name}: {detail}", file=sys.stderr)
 
     public = []
     for r in results:

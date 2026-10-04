@@ -50,3 +50,35 @@ class SafeDeployRetry(unittest.TestCase):
         self.assertEqual(calls["n"], 2)
         self.assertFalse(result["ok"])
         self.assertIn("still broken", result["error"])
+
+    def test_does_not_redeploy_when_fireworks_is_blocked(self):
+        calls = {"n": 0}
+
+        def deploy_one(_account):
+            calls["n"] += 1
+            raise RuntimeError(
+                "SpecialFeatureOrQuotaIdRequired: this subscription does not have access to "
+                "AIServices.DataZoneStandard.Fireworks in eastus2"
+            )
+
+        def model_unavailable(err: str) -> bool:
+            return "specialfeatureorquotaidrequired" in err.lower()
+
+        def humanize(err: str) -> str:
+            if model_unavailable(err):
+                return (
+                    "This Azure subscription cannot deploy FW-Kimi-K3. Microsoft has not enabled "
+                    "Fireworks Kimi on it."
+                )
+            return err
+
+        module = SimpleNamespace(
+            deploy_one=deploy_one,
+            model_unavailable=model_unavailable,
+            humanize_kimi_deploy_error=humanize,
+        )
+        with patch("app.services.kimi_deploy_service.time.sleep"):
+            result = _safe_deploy(module, {"name": "Lioxi-Prem4"})
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("has not enabled Fireworks Kimi", result["error"])

@@ -237,5 +237,54 @@ class RefreshGrants(unittest.IsolatedAsyncioTestCase):
         db.commit.assert_awaited()
 
 
+class PendingPublicAuth(unittest.TestCase):
+    def test_passes_through_who_approved(self):
+        from app.services.submit_service import pending_public
+
+        now = datetime.now(timezone.utc)
+        public = pending_public(
+            _row(
+                status="approved",
+                group_tag="sb",
+                subscription_name="Contoso",
+                tenant_id="tid",
+                billing_error=None,
+                error_message=None,
+                error_kind=None,
+                created_at=now,
+                updated_at=now,
+                approved_at=now,
+                rejected_at=None,
+                authorized_by="auto-approve",
+                client_secret_encrypted=None,
+                client_id=None,
+            )
+        )
+        self.assertEqual(public.authorized_by, "auto-approve")
+        self.assertEqual(public.approved_at, now)
+
+    def test_missing_authorized_by_stays_blank(self):
+        from app.services.submit_service import pending_public
+
+        public = pending_public(
+            _row(
+                status="approved",
+                group_tag="sb",
+                subscription_name="Contoso",
+                tenant_id="tid",
+                billing_error=None,
+                error_message=None,
+                error_kind=None,
+                created_at=None,
+                updated_at=None,
+                approved_at=None,
+                rejected_at=None,
+                client_secret_encrypted=None,
+                client_id=None,
+            )
+        )
+        self.assertIsNone(public.authorized_by)
+
+
 if __name__ == "__main__":
     unittest.main()

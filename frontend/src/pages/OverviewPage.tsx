@@ -248,6 +248,7 @@ export default function OverviewPage() {
         spendO2Usd: account.new_api_cost_o2_usd,
         spendUsd: account.new_api_cost_usd,
         settled: Boolean(account.payable_settled),
+        blocked: Boolean(account.blocked),
       })),
     [scopedAccounts]
   );

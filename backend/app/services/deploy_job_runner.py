@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any
+
+OnComplete = Callable[[list[Any]], Awaitable[None]]
 
 from app.runtime import AZ_CLI_CONCURRENCY, DEPLOY_JOBS_MAX
 from app.schemas.kimi_deploy import KimiDeployJobSnapshot
@@ -70,6 +73,7 @@ async def start_kimi_deploy_job(
     jobs: int,
     new_api_priority: int,
     new_api_weight: int,
+    on_complete: OnComplete | None = None,
 ) -> KimiDeployJobSnapshot:
     global _job, _task
     async with _guard:
@@ -84,7 +88,7 @@ async def start_kimi_deploy_job(
             "results": None,
         }
         _task = asyncio.create_task(
-            _run_kimi_deploy_job(job_id, accounts, jobs, new_api_priority, new_api_weight)
+            _run_kimi_deploy_job(job_id, accounts, jobs, new_api_priority, new_api_weight, on_complete)
         )
     logger.info("Kimi deploy job %s queued for %s account(s)", job_id, len(accounts))
     return kimi_job_snapshot()
@@ -96,6 +100,7 @@ async def _run_kimi_deploy_job(
     jobs: int,
     new_api_priority: int,
     new_api_weight: int,
+    on_complete: OnComplete | None = None,
 ) -> None:
     from app.database import SessionLocal
 
@@ -111,6 +116,11 @@ async def _run_kimi_deploy_job(
                     new_api_priority=new_api_priority,
                     new_api_weight=new_api_weight,
                 )
+        if on_complete:
+            try:
+                await on_complete(results)
+            except Exception:
+                logger.exception("Kimi deploy job %s post-complete failed", job_id)
         if _job and _job.get("job_id") == job_id:
             _job["results"] = results
             _job["error"] = None

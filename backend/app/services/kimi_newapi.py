@@ -309,6 +309,22 @@ def is_kimi_pool_channel(channel: dict) -> bool:
     return is_kimi_channel_name(channel.get("name")) or _is_pool_tag(channel.get("tag"))
 
 
+def existing_pool_channel(channels: list[dict], hosts: set[str], account: dict[str, str] | None = None) -> dict | None:
+    found = match_channel(channels, hosts)
+    if found is not None:
+        return found
+    payload = account or {}
+    custom = (payload.get("new_api_name") or "").strip()
+    if custom:
+        found = _name_owner(channels, custom)
+        if found is not None:
+            return found
+    channel_id = _as_int(payload.get("new_api_channel_id"))
+    if channel_id is None:
+        return None
+    return next((item for item in channels if _as_int(item.get("id")) == channel_id), None)
+
+
 def match_channel(channels: list[dict], hosts: set[str]) -> dict | None:
     wanted = {host.strip().lower() for host in hosts if host and host.strip()}
     if not wanted:
@@ -543,7 +559,11 @@ async def _post_channel(gateway: Gateway, body: dict[str, Any]) -> None:
 
 
 async def _stamp_portal_account(session: AsyncSession, subscription_id: str, resource_name: str, channel: dict) -> None:
-    account = await AccountRepository(session).get_by_subscription_and_resource(subscription_id, resource_name)
+    repo = AccountRepository(session)
+    account = await repo.get_by_subscription_and_resource(subscription_id, resource_name)
+    if account is None:
+        siblings = await repo.list_by_subscription(subscription_id)
+        account = siblings[0] if len(siblings) == 1 else None
     if account is None:
         return
     membership = _membership(account)
@@ -598,12 +618,26 @@ async def ensure_kimi_newapi_channels(
             if not resource_name:
                 resource_name = next(iter(hosts), "")
             row_group = await _group_for_account(session, account, subscription_id, resource_name)
-            existing = match_channel(channels, hosts)
+            existing = existing_pool_channel(channels, hosts, account)
             if existing is not None:
                 current_pri = _as_int(existing.get("priority"))
                 current_wt = _as_int(existing.get("weight"))
-                if current_pri != row_priority or current_wt != row_weight:
+                target_url = openai_base_url(endpoint, resource_name) if resource_name or endpoint else ""
+                retarget = bool(target_url and _host_key(existing.get("base_url")) != _host_key(target_url))
+                routing = current_pri != row_priority or current_wt != row_weight
+                enable = (account.get("new_api_enable") or "").strip().lower() in {"1", "true", "yes"}
+                current_status = _as_int(existing.get("status"))
+                if retarget or routing or (enable and current_status != 1):
                     try:
+                        api_key = ""
+                        if retarget:
+                            api_key = await decrypt_foundry_key(session, subscription_id, resource_name)
+                            if not api_key:
+                                api_key = foundry_key_from_account(account)
+                            if not api_key:
+                                result.new_api_error = "No stored Foundry API key. Deploy or test the model first."
+                                _apply_channel(result, existing)
+                                continue
                         await _put_channel(
                             gateway,
                             _channel_update_body(
@@ -612,8 +646,15 @@ async def ensure_kimi_newapi_channels(
                                 priority=row_priority,
                                 weight=row_weight,
                                 tag=canonical_tag,
+                                base_url=target_url if retarget else None,
+                                key=api_key or None,
                             ),
                         )
+                        if retarget or enable:
+                            from app.services.new_api_service import set_channel_status
+
+                            await set_channel_status(gateway, int(existing["id"]), 1)
+                            existing["status"] = 1
                         invalidate_kimi_pool_cache()
                         channels = await list_kimi_pool_channels(force=True)
                         next_index = {group: next_kimi_index(channels, group) for group in GROUPS}
@@ -625,7 +666,10 @@ async def ensure_kimi_newapi_channels(
                             **existing,
                             "priority": row_priority,
                             "weight": row_weight,
+                            "base_url": target_url if retarget else existing.get("base_url"),
                         }
+                        if retarget or enable:
+                            existing["status"] = 1
                         if subscription_id and resource_name:
                             try:
                                 await _stamp_portal_account(session, subscription_id, resource_name, existing)
@@ -774,13 +818,15 @@ def _channel_update_body(
     priority: int | None = None,
     weight: int | None = None,
     tag: str | None = None,
+    base_url: str | None = None,
+    key: str | None = None,
 ) -> dict[str, Any]:
     """Name/routing update. Omit key so NewAPI keeps the existing key."""
     body: dict[str, Any] = {
         "id": channel.get("id"),
         "type": channel.get("type") or KIMI_CHANNEL_TYPE,
         "name": name,
-        "base_url": channel.get("base_url"),
+        "base_url": base_url or channel.get("base_url"),
         "other": channel.get("other") or KIMI_AZURE_API_VERSION,
         "models": channel.get("models") or KIMI_CHANNEL_MODELS,
         "group": channel.get("group") or KIMI_CHANNEL_GROUP,
@@ -795,6 +841,8 @@ def _channel_update_body(
         "header_override": channel.get("header_override") or "",
         "remark": channel.get("remark") or "",
     }
+    if key:
+        body["key"] = key
     pri = channel.get("priority") if priority is None else priority
     wt = channel.get("weight") if weight is None else weight
     if pri is not None:

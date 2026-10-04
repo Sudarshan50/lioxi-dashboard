@@ -86,6 +86,13 @@ class PeopleUsage(unittest.TestCase):
         self.assertNotIn("Gateway", text)
         self.assertNotIn("Synced", text)
 
+    def test_blocked_channel_is_labelled(self):
+        account = _acct("Alex1", "Alex", 10, live=False, channel="kimi-alex")
+        account.blocked = True
+        text = _account_card(account)
+        self.assertIn("blocked", text)
+        self.assertNotIn("paused", text)
+
     def test_alerts_report_uses_same_cards(self):
         hot = _acct("Gaurav1", "Gaurav", 8000, channel="kimi-hot")
         text = _channel_report([hot], "⚠ <b>At or above 75%</b> · 1 channel", numbered=False)

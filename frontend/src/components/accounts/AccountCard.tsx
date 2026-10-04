@@ -1,5 +1,6 @@
-import { Check, Pencil, PlugZap, Power, RefreshCw, Trash2, X } from "lucide-react";
+import { Check, Copy, Eye, EyeOff, KeyRound, Pencil, PlugZap, Power, RefreshCw, Rocket, Trash2, X } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import DeploymentLinkPicker, {
   REGISTER_NEW,
@@ -15,6 +16,7 @@ import ManualResourceFields, {
 import GroupTagField from "@/components/accounts/GroupTagField";
 import OwnerTagField from "@/components/accounts/OwnerTagField";
 import Badge from "@/components/ui/Badge";
+import BlockedBadge from "@/components/ui/BlockedBadge";
 import GroupBadge from "@/components/ui/GroupBadge";
 import { JoinGroup, normalizeGroup } from "@/lib/joinGroup";
 import Button from "@/components/ui/Button";
@@ -26,6 +28,10 @@ import {
   useDeleteAccount,
   useDiscoverAccountDeployments,
   useDiscoverAccountResources,
+  useRedeployAccount,
+  useRevealAccountApiKey,
+  useRotateAccountApiKey,
+  useSetChannelStatus,
   useSetGatewayStatus,
   useSyncAccount,
   useTestAccount,
@@ -33,22 +39,35 @@ import {
 } from "@/hooks/useAccounts";
 import { useCreateModel, useModels } from "@/hooks/useModels";
 import { useRegisteredModels } from "@/hooks/useRegisteredModels";
+import { copyText } from "@/lib/copyText";
 import { formatCurrency, formatDateTime, formatRelative } from "@/lib/format";
 import { grantTier } from "@/lib/grantTier";
-import { Account, Deployment, DiscoveredResource } from "@/types";
+import { Account, ChannelCard, Deployment, DiscoveredResource } from "@/types";
 
-export default function AccountCard({ account }: { account: Account }) {
+export default function AccountCard({
+  account,
+  channel,
+  lead = true,
+}: {
+  account: Account;
+  channel?: ChannelCard;
+  lead?: boolean;
+}) {
   const testAccount = useTestAccount();
   const syncAccount = useSyncAccount();
+  const rotateKey = useRotateAccountApiKey();
+  const redeployAccount = useRedeployAccount();
   const deleteAccount = useDeleteAccount();
   const updateAccount = useUpdateAccount();
   const discover = useDiscoverAccountResources();
   const discoverDeployments = useDiscoverAccountDeployments();
   const setGatewayStatus = useSetGatewayStatus();
+  const setChannelStatus = useSetChannelStatus();
   const createModel = useCreateModel();
   const { data: models } = useModels();
   const { data: registeredModels } = useRegisteredModels();
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState<string | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [nameDraft, setNameDraft] = useState(account.name);
   const [ownerTagDraft, setOwnerTagDraft] = useState(account.owner_tag ?? "");
@@ -77,10 +96,22 @@ export default function AccountCard({ account }: { account: Account }) {
     () => (account.new_api_gateway ?? "").split("+").filter((p): p is "O1" | "O2" => p === "O1" || p === "O2"),
     [account.new_api_gateway]
   );
+  const focusedChannel = channel ?? null;
+  const split = Boolean(focusedChannel) && (account.channel_cards?.length ?? 0) > 1;
 
   function portalStatus(portal: "O1" | "O2"): number | null {
+    if (focusedChannel) return focusedChannel.gateway === portal ? focusedChannel.status : null;
     return portal === "O1" ? (account.new_api_status_o1 ?? null) : (account.new_api_status_o2 ?? null);
   }
+
+  const visiblePortals: ("O1" | "O2")[] = focusedChannel
+    ? focusedChannel.gateway === "O1" || focusedChannel.gateway === "O2"
+      ? [focusedChannel.gateway]
+      : []
+    : portals;
+  const gatewayOff = focusedChannel
+    ? focusedChannel.status != null && focusedChannel.status !== 1
+    : account.new_api_status != null && account.new_api_status !== 1;
 
   const alreadyLinked = useMemo(() => {
     const names = new Set<string>();
@@ -95,7 +126,9 @@ export default function AccountCard({ account }: { account: Account }) {
     setTestResult(null);
     try {
       const result = await testAccount.mutateAsync(account.id);
-      setTestResult(result.status === "ok" ? "Connection OK" : result.detail ?? "Connection failed.");
+      setTestResult(
+        result.status === "ok" ? result.detail || "Connection OK" : result.detail ?? "Connection failed."
+      );
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? "Could not test this account.");
     }
@@ -117,7 +150,16 @@ export default function AccountCard({ account }: { account: Account }) {
     setError(null);
     setPendingPortal(gateway ?? "ALL");
     try {
-      await setGatewayStatus.mutateAsync({ accountId: account.id, enable, gateway });
+      if (focusedChannel?.id != null && gateway) {
+        await setChannelStatus.mutateAsync({
+          accountId: account.id,
+          channelId: focusedChannel.id,
+          enable,
+          gateway,
+        });
+      } else {
+        await setGatewayStatus.mutateAsync({ accountId: account.id, enable, gateway });
+      }
     } catch (err: any) {
       setError(
         err?.response?.data?.detail ??
@@ -125,6 +167,57 @@ export default function AccountCard({ account }: { account: Account }) {
       );
     } finally {
       setPendingPortal(null);
+    }
+  }
+
+  async function handleRedeploy() {
+    const channel = account.new_api_name || "the NewAPI channel";
+    if (
+      !window.confirm(
+        `Redeploy ${account.name}? Azure will create a new Foundry stack and point ${channel} at it.`
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    setTestResult(null);
+    try {
+      const done = await redeployAccount.mutateAsync(account.id);
+      const stack = done.result?.account_name;
+      const proxy = done.result?.new_api_name || channel;
+      const enabled = done.result?.new_api_status === 1;
+      setError(null);
+      setTestResult(
+        [
+          stack ? `Redeployed to ${stack}` : `Redeploy finished for ${account.name}`,
+          enabled ? `${proxy} is on` : `${proxy} updated`,
+        ].join(". ") + "."
+      );
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? err?.message ?? "Could not redeploy this account.");
+    }
+  }
+
+  async function handleRotateKey() {
+    if (
+      !window.confirm(
+        `Rotate the Foundry API key for ${account.name}? The current key stops working immediately. NewAPI will be pointed at the new key.`
+      )
+    ) {
+      return;
+    }
+    setError(null);
+    setTestResult(null);
+    try {
+      const result = await rotateKey.mutateAsync(account.id);
+      setApiKey(result.api_key);
+      setTestResult(
+        result.new_api_error
+          ? `Rotated the API key. NewAPI update failed: ${result.new_api_error}`
+          : "Rotated the API key. NewAPI is using the new key."
+      );
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Could not rotate this API key.");
     }
   }
 
@@ -395,6 +488,7 @@ export default function AccountCard({ account }: { account: Account }) {
   const statusTone = account.last_sync_status === "success" ? "success" : account.last_sync_status === "error" ? "error" : "neutral";
   const isSaving = updateAccount.isPending || createModel.isPending || syncAccount.isPending;
   const isDiscovering = discover.isPending || modelsLoading || discoverDeployments.isPending;
+  const email = accountEmail(account.email);
 
   return (
     <>
@@ -566,39 +660,62 @@ export default function AccountCard({ account }: { account: Account }) {
                   </Badge>
                 )}
                 <GroupBadge group={account.group_tag} channel={account.new_api_name} />
-                <button type="button" onClick={startEditing} className="text-gray-600 hover:text-gray-300" aria-label="Edit account">
-                  <Pencil size={12} />
-                </button>
+                {focusedChannel?.role === "gpt" && (
+                  <Badge tone="info" className="shrink-0">
+                    GPT
+                  </Badge>
+                )}
+                {account.blocked && <BlockedBadge />}
+                {lead && (
+                  <button type="button" onClick={startEditing} className="text-gray-600 hover:text-gray-300" aria-label="Edit account">
+                    <Pencil size={12} />
+                  </button>
+                )}
               </div>
-              {account.new_api_name && (
+              {(focusedChannel?.name || account.new_api_name) && (
                 <p className="truncate text-[11px] text-gray-400" title="NewAPI channel">
-                  {account.new_api_name}
+                  {focusedChannel?.name || account.new_api_name}
+                </p>
+              )}
+              {lead && tier === "10k" && !account.gpt_deployed && (
+                <Link
+                  to={`/deploy-gpt?account=${account.id}`}
+                  className="mt-0.5 inline-flex text-[11px] font-medium text-indigo-300 hover:text-indigo-100"
+                >
+                  Deploy GPT
+                </Link>
+              )}
+              {email && (
+                <p className="truncate text-xs text-gray-400" title={email}>
+                  {email}
                 </p>
               )}
               <p className="truncate text-xs text-gray-500">
                 {account.resource_name} - {account.location}
                 {account.credits_limit_manual ? " · manual grant" : ""}
               </p>
-              {(portals.length > 0 || (account.new_api_status != null && account.new_api_status !== 1)) && (
+              {(visiblePortals.length > 0 || gatewayOff) && (
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                  {account.new_api_status != null && account.new_api_status !== 1 && (
-                    <Badge tone="warning">gateway disabled</Badge>
-                  )}
-                  {portals.map((portal) => {
+                  {gatewayOff && <Badge tone="warning">gateway disabled</Badge>}
+                  {visiblePortals.map((portal) => {
                     const status = portalStatus(portal);
                     const enabled = status === 1;
                     const unknown = status == null;
-                    const isPending = setGatewayStatus.isPending && pendingPortal === portal;
+                    const isPending =
+                      (setGatewayStatus.isPending || setChannelStatus.isPending) && pendingPortal === portal;
+                    const enableBlocked = Boolean(account.blocked) && !enabled;
                     return (
                       <button
                         key={portal}
                         type="button"
                         onClick={() => handleGatewayToggle(!enabled, portal)}
-                        disabled={setGatewayStatus.isPending || unknown}
+                        disabled={setGatewayStatus.isPending || setChannelStatus.isPending || unknown || enableBlocked}
                         title={
                           unknown
                             ? `${portal} status unknown — wait for the next NewAPI sync`
-                            : `${enabled ? "Disable" : "Enable"} the ${portal} channel for this account`
+                            : enableBlocked
+                              ? "Unblock this account on Alerts before enabling"
+                              : `${enabled ? "Disable" : "Enable"} ${focusedChannel?.name || `the ${portal} channel`}`
                         }
                         className={
                           unknown
@@ -625,7 +742,10 @@ export default function AccountCard({ account }: { account: Account }) {
         </div>
         {!isEditing && (
           <>
-            <p className="truncate text-xs text-gray-500">{account.endpoint}</p>
+            <div className="flex flex-col gap-1">
+              {account.endpoint ? <CopyValueRow label="Endpoint" value={account.endpoint} /> : null}
+              <AccountApiKeyRow accountId={account.id} apiKey={apiKey} onApiKey={setApiKey} />
+            </div>
             <div className="flex flex-col gap-1">
               <div className="flex items-center justify-between gap-2 text-xs">
                 <span className="truncate text-gray-500">Credits remaining</span>
@@ -654,8 +774,15 @@ export default function AccountCard({ account }: { account: Account }) {
                 <div className="flex items-center justify-between gap-2 text-xs">
                   <span className="text-gray-500">NewAPI spend</span>
                   <span className="text-right">
-                    <span className="tabular-nums text-violet-300">{formatCurrency(account.new_api_cost_usd, "USD")}</span>
-                    {account.new_api_cost_o1_usd != null && account.new_api_cost_o2_usd != null && (
+                    <span className="tabular-nums text-violet-300">
+                      {formatCurrency(split && focusedChannel ? focusedChannel.spend_usd : account.new_api_cost_usd, "USD")}
+                    </span>
+                    {split && lead && account.new_api_cost_usd != null && (
+                      <span className="mt-0.5 block text-[11px] text-gray-500">
+                        combined {formatCurrency(account.new_api_cost_usd, "USD")}
+                      </span>
+                    )}
+                    {!split && account.new_api_cost_o1_usd != null && account.new_api_cost_o2_usd != null && (
                       <span className="mt-0.5 block text-[11px] text-gray-500">
                         O1 {formatCurrency(account.new_api_cost_o1_usd, "USD")} + O2{" "}
                         {formatCurrency(account.new_api_cost_o2_usd, "USD")}
@@ -689,9 +816,33 @@ export default function AccountCard({ account }: { account: Account }) {
               <Button variant="secondary" className="px-3 py-1.5 text-xs" onClick={handleSync} isLoading={syncAccount.isPending}>
                 <RefreshCw size={14} /> Sync now
               </Button>
-              <Button variant="danger" className="ml-auto px-2.5 py-1.5" onClick={handleDelete} isLoading={deleteAccount.isPending}>
-                <Trash2 size={14} />
-              </Button>
+              {lead && (
+                <Button
+                  variant="secondary"
+                  className="px-3 py-1.5 text-xs"
+                  onClick={handleRotateKey}
+                  isLoading={rotateKey.isPending}
+                  title="Regenerate the Foundry API key and update NewAPI"
+                >
+                  <KeyRound size={14} /> Rotate keys
+                </Button>
+              )}
+              {lead && resourceMissing(account.last_sync_error) && (
+                <Button
+                  variant="secondary"
+                  className="px-3 py-1.5 text-xs"
+                  onClick={handleRedeploy}
+                  isLoading={redeployAccount.isPending}
+                  title="Recreate the Foundry stack and retarget the existing NewAPI channel"
+                >
+                  <Rocket size={14} /> Redeploy
+                </Button>
+              )}
+              {lead && (
+                <Button variant="danger" className="ml-auto px-2.5 py-1.5" onClick={handleDelete} isLoading={deleteAccount.isPending}>
+                  <Trash2 size={14} />
+                </Button>
+              )}
             </div>
           </>
         )}
@@ -711,6 +862,143 @@ export default function AccountCard({ account }: { account: Account }) {
         }}
       />
     </>
+  );
+}
+
+function AccountApiKeyRow({
+  accountId,
+  apiKey,
+  onApiKey,
+}: {
+  accountId: number;
+  apiKey: string | null;
+  onApiKey: (key: string) => void;
+}) {
+  const reveal = useRevealAccountApiKey();
+  const [visible, setVisible] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (apiKey) setVisible(true);
+  }, [apiKey]);
+
+  async function ensureKey(): Promise<string | null> {
+    if (apiKey) return apiKey;
+    try {
+      const data = await reveal.mutateAsync(accountId);
+      onApiKey(data.api_key);
+      setError(null);
+      return data.api_key;
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Could not load this API key.");
+      return null;
+    }
+  }
+
+  async function handleReveal() {
+    if (visible) {
+      setVisible(false);
+      return;
+    }
+    const value = await ensureKey();
+    if (value) setVisible(true);
+  }
+
+  async function handleCopy() {
+    const value = await ensureKey();
+    if (!value) return;
+    if (await copyText(value)) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    }
+  }
+
+  const display = visible && apiKey ? apiKey : "••••••••••••••••";
+  const busy = reveal.isPending;
+
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="shrink-0 text-gray-500">API key</span>
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span
+            className="truncate font-mono text-gray-300"
+            title={visible && apiKey ? apiKey : undefined}
+          >
+            {display}
+          </span>
+          <button
+            type="button"
+            onClick={() => void handleReveal()}
+            disabled={busy}
+            className="text-gray-600 hover:text-gray-300 disabled:opacity-50"
+            aria-label={visible ? "Hide API key" : "Reveal API key"}
+            title={visible ? "Hide API key" : "Reveal API key"}
+          >
+            {busy ? <Spinner className="h-3 w-3" /> : visible ? <EyeOff size={12} /> : <Eye size={12} />}
+          </button>
+          <button
+            type="button"
+            onClick={() => void handleCopy()}
+            disabled={busy}
+            className="text-gray-600 hover:text-gray-300 disabled:opacity-50"
+            aria-label="Copy API key"
+            title="Copy API key"
+          >
+            {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+          </button>
+        </div>
+      </div>
+      {error && <p className="break-words text-[11px] text-red-400">{error}</p>}
+    </div>
+  );
+}
+
+function CopyValueRow({ label, value }: { label: string; value: string }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy() {
+    if (await copyText(value)) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-2 text-xs">
+      <span className="shrink-0 text-gray-500">{label}</span>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className="truncate font-mono text-gray-300" title={value}>
+          {value}
+        </span>
+        <button
+          type="button"
+          onClick={() => void handleCopy()}
+          className="text-gray-600 hover:text-gray-300"
+          aria-label={`Copy ${label.toLowerCase()}`}
+          title={`Copy ${label.toLowerCase()}`}
+        >
+          {copied ? <Check size={12} className="text-emerald-400" /> : <Copy size={12} />}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function accountEmail(value?: string | null): string {
+  const text = (value || "").trim();
+  return text.includes("@") && !text.includes(" ") ? text : "";
+}
+
+function resourceMissing(error?: string | null) {
+  const text = (error || "").toLowerCase();
+  return (
+    text.includes("was not found") ||
+    text.includes("could not be found") ||
+    text.includes("does not exist") ||
+    text.includes("resourcenotfound") ||
+    text.includes("resourcegroupnotfound")
   );
 }
 

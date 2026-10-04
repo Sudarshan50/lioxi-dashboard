@@ -8,6 +8,7 @@ from app.models.join_enrollee import JoinEnrollee
 from app.models.sp_submit_request import SpSubmitRequest
 from app.models.sync_notification import SyncNotification
 from app.models.cost_snapshot import CostSnapshot
+from app.models.gpt_deploy_log import GptDeployLog
 from app.models.model_catalog import MonitoredModel
 from app.models.provider_account import ProviderAccount
 from app.models.registered_model import RegisteredModel
@@ -28,4 +29,5 @@ __all__ = [
     "MonitoredModel",
     "UsageSnapshot",
     "CostSnapshot",
+    "GptDeployLog",
 ]

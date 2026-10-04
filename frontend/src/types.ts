@@ -1,3 +1,12 @@
+export interface ChannelCard {
+  id: number | null;
+  name: string;
+  role: "primary" | "gpt" | string;
+  gateway: string;
+  status: number | null;
+  spend_usd: number;
+}
+
 export interface Account {
   id: number;
   name: string;
@@ -39,6 +48,11 @@ export interface Account {
   payable_settled?: boolean;
   payable_settled_at?: string | null;
   at_cap_manual?: boolean;
+  blocked?: boolean;
+  gpt_deployed?: boolean;
+  channel_cards?: ChannelCard[];
+  has_api_key?: boolean;
+  email?: string | null;
   created_at: string;
 }
 
@@ -163,6 +177,7 @@ export interface AlertStateItem {
   name: string;
   deployed_at?: string | null;
   new_api_name?: string | null;
+  channel_cards?: ChannelCard[];
   new_api_tag?: string | null;
   owner_tag?: string | null;
   gateway: string | null;
@@ -180,6 +195,7 @@ export interface AlertStateItem {
   exhausted: boolean;
   exhausted_reason: "overspent" | "manual" | null;
   at_cap_manual?: boolean;
+  blocked?: boolean;
   alert_level: number;
   payable_settled?: boolean;
   payable_settled_at?: string | null;
@@ -525,6 +541,7 @@ export interface PendingSubmitRequest {
   updated_at?: string | null;
   approved_at?: string | null;
   rejected_at?: string | null;
+  authorized_by?: string | null;
   can_retry_deploy?: boolean;
   credits_limit?: number | null;
   credits_remaining?: number | null;
@@ -594,6 +611,12 @@ export interface PendingBatchApproveResponse {
   skipped: { id: number; error: string }[];
 }
 
+export interface PendingBatchDeclineResponse {
+  ok: boolean;
+  declined: number[];
+  skipped: { id: number; error: string }[];
+}
+
 export interface JoinEnrollee {
   id: number;
   name: string;
@@ -652,5 +675,80 @@ export interface SystemStats {
   memory: ResourceMetric;
   storage: ResourceMetric;
   collected_at: string;
+}
+
+export interface GptAccountRow {
+  id: number;
+  name: string;
+  owner_tag: string;
+  location: string;
+  resource_name: string;
+  new_api_name: string;
+  new_api_status: number | null;
+  blocked: boolean;
+  gpt_deployed: boolean;
+  spend_usd: number | null;
+  grant_usd: number | null;
+  stop_at_usd: number | null;
+}
+
+export interface GptModelPlan {
+  name: string;
+  version: string | null;
+  available: boolean;
+  sku: string | null;
+  capacity: number | null;
+  tpm: number | null;
+  rpm: number | null;
+  quota_limit: number | null;
+  quota_used: number | null;
+  deployed: boolean;
+  deployed_capacity: number | null;
+  deployed_sku: string | null;
+  reason: string | null;
+}
+
+export interface GptAvailability {
+  account_id: number;
+  account_name: string;
+  location: string;
+  endpoint: string;
+  new_api_name: string;
+  spend_usd: number | null;
+  grant_usd: number | null;
+  stop_at_usd: number | null;
+  eligible: boolean;
+  eligibility_error: string | null;
+  models: GptModelPlan[];
+}
+
+export interface GptJob {
+  running: boolean;
+  job_id: string | null;
+  account_id: number | null;
+  account_name: string | null;
+  action: string | null;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  total: number;
+  done: number;
+  failed: number;
+  current: string | null;
+  skipped: string[];
+}
+
+export interface GptLogRow {
+  id: number;
+  account_id: number | null;
+  account_name: string;
+  action: string;
+  level: string;
+  message: string;
+  created_at: string | null;
+}
+
+export interface GptLogList {
+  items: GptLogRow[];
 }
 

@@ -28,6 +28,7 @@ import {
   gatewayRank,
   portalSpendUsd,
 } from "@/lib/accountSort";
+import { expandChannelCards } from "@/lib/channelCards";
 import { grantTier, isGatewayEnabled } from "@/lib/grantTier";
 import { GrantBucket, GrantTierBits, summarizeAccounts } from "@/lib/grantSpend";
 import { amountPayableUsd } from "@/lib/payable";
@@ -55,7 +56,7 @@ type AccountSort =
   | "location"
   | "created";
 
-type GatewayFilter = "all" | "enabled" | "o1" | "o2" | "both" | "disabled" | "none";
+type GatewayFilter = "all" | "enabled" | "o1" | "o2" | "both" | "disabled" | "blocked" | "none";
 type GrantFilter = "all" | "1k" | "10k";
 
 export default function AccountsPage() {
@@ -343,7 +344,7 @@ export default function AccountsPage() {
                     id="account-search"
                     value={search}
                     onChange={(e) => setSearch(e.target.value)}
-                    placeholder="Name, resource, channel, tag, or group"
+                    placeholder="Name, email, resource, channel, tag, or group"
                     className="w-full rounded-lg border border-surface-border bg-black/30 py-2 pl-8 pr-9 text-sm text-gray-100 outline-none transition-colors placeholder:text-gray-600 focus:border-accent"
                   />
                   {search && (
@@ -370,6 +371,7 @@ export default function AccountsPage() {
                 <option value="o1">On O1</option>
                 <option value="o2">On O2</option>
                 <option value="disabled">Disabled</option>
+                <option value="blocked">Blocked</option>
                 <option value="none">No NewAPI match</option>
               </Select>
               <Select id="account-sort" label="Sort by" value={sort} onChange={(e) => setSort(e.target.value as AccountSort)}>
@@ -456,8 +458,8 @@ export default function AccountsPage() {
                       </p>
                     </div>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-                      {rows.map((account) => (
-                        <AccountCard key={account.id} account={account} />
+                      {expandChannelCards(rows).map(({ key, item, channel, lead }) => (
+                        <AccountCard key={key} account={item} channel={channel} lead={lead} />
                       ))}
                     </div>
                   </div>
@@ -510,6 +512,7 @@ function matchesAccountSearch(account: Account, rawQuery: string, groupNames: st
   const haystack = normalizeSearchText(
     [
       account.name,
+      account.email,
       account.resource_name,
       account.resource_group,
       account.endpoint,
@@ -519,6 +522,7 @@ function matchesAccountSearch(account: Account, rawQuery: string, groupNames: st
       account.new_api_name,
       account.new_api_tag,
       account.new_api_gateway,
+      account.blocked ? "blocked" : "",
       ...groupNames,
     ]
       .filter(Boolean)
@@ -544,6 +548,7 @@ function matchesGatewayFilter(account: Account, filter: GatewayFilter): boolean 
   if (filter === "both") return labels.has("O1") && labels.has("O2");
   if (filter === "o1") return labels.has("O1");
   if (filter === "o2") return labels.has("O2");
+  if (filter === "blocked") return Boolean(account.blocked);
   return account.new_api_status != null && account.new_api_status !== 1;
 }
 

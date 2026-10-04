@@ -19,6 +19,37 @@ def email_or_none(value: str | None) -> str | None:
     return text if looks_like_email(text) else None
 
 
+def add_holder_emails(by_sub: dict[str, str], rows: list[tuple[str | None, str | None]]) -> dict[str, str]:
+    """Fill missing subscription -> Microsoft login email mappings. First write wins."""
+    for subscription_id, holder in rows:
+        email = email_or_none(holder)
+        key = (subscription_id or "").strip().lower()
+        if key and email and key not in by_sub:
+            by_sub[key] = email
+    return by_sub
+
+
+async def emails_by_subscription(session: AsyncSession) -> dict[str, str]:
+    """Microsoft login emails for portal accounts, keyed by lowercase subscription id."""
+    by_sub: dict[str, str] = {}
+    principals = (
+        await session.execute(select(AzureServicePrincipal.subscription_id, AzureServicePrincipal.account_holder))
+    ).all()
+    add_holder_emails(by_sub, [(row[0], row[1]) for row in principals])
+    joins = (
+        await session.execute(
+            select(SpSubmitRequest.subscription_id, SpSubmitRequest.account_holder)
+            .where(
+                SpSubmitRequest.subscription_id.is_not(None),
+                SpSubmitRequest.account_holder.is_not(None),
+            )
+            .order_by(SpSubmitRequest.id.desc())
+        )
+    ).all()
+    add_holder_emails(by_sub, [(row[0], row[1]) for row in joins])
+    return by_sub
+
+
 async def persist_service_principals(
     session: AsyncSession,
     accounts: list[dict],

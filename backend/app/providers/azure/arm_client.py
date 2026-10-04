@@ -48,6 +48,11 @@ class AzureArmClient:
     ) -> dict:
         return await self._json_request("POST", credentials, _url(path), params=params, json=json)
 
+    async def put(
+        self, credentials: ProviderCredentials, path: str, json: dict, params: dict | None = None
+    ) -> dict:
+        return await self._json_request("PUT", credentials, _url(path), params=params, json=json)
+
     async def get_all_pages(
         self, credentials: ProviderCredentials, path: str, params: dict | None = None
     ) -> list[dict]:

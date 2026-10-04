@@ -43,3 +43,4 @@ class SpSubmitRequest(Base, TimestampMixin):
     az_config_dir: Mapped[str | None] = mapped_column(String(512), nullable=True, default=None)
     approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    authorized_by: Mapped[str | None] = mapped_column(String(32), nullable=True, default=None)

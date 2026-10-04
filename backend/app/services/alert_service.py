@@ -285,9 +285,12 @@ async def _send_spaced(text: str, sent_so_far: int, group: str | None = None) ->
 
 async def alert_state(session: AsyncSession) -> list[dict]:
     """Per-account alert snapshot for the portal UI."""
+    from app.services.channel_cards import cards_by_host
+
     config = await get_alert_config(session)
     buffer = float(config["overspend_buffer_usd"])
     accounts = await AccountRepository(session).list_all()
+    cards = await cards_by_host()
     items = []
     for account in accounts:
         spend = new_api_spend(account)
@@ -296,12 +299,14 @@ async def alert_state(session: AsyncSession) -> list[dict]:
         headroom = None if spend is None or cap is None else cap - spend
         auto_cap = credits_exhausted(account, buffer)
         manual_cap = bool(getattr(account, "at_cap_manual", False))
+        host = (account.resource_name or "").strip().lower()
         items.append(
             {
                 "id": account.id,
                 "name": account.name,
                 "deployed_at": account.created_at.isoformat() if getattr(account, "created_at", None) else None,
                 "new_api_name": account.new_api_name or "",
+                "channel_cards": cards.get(host, []) if host else [],
                 "new_api_tag": account.new_api_tag or "",
                 "owner_tag": account.owner_tag or "",
                 "gateway": account.new_api_gateway,
@@ -319,6 +324,7 @@ async def alert_state(session: AsyncSession) -> list[dict]:
                 "exhausted": auto_cap or manual_cap,
                 "exhausted_reason": "overspent" if auto_cap else "manual" if manual_cap else None,
                 "at_cap_manual": manual_cap,
+                "blocked": bool(getattr(account, "blocked", False)),
                 "alert_level": account.new_api_alert_level or 0,
                 "payable_settled": bool(getattr(account, "payable_settled", False)),
                 "payable_settled_at": account.payable_settled_at.isoformat()
@@ -364,6 +370,18 @@ async def set_at_cap_manual(session: AsyncSession, account_id: int, tagged: bool
     account.at_cap_manual = bool(tagged)
     await AccountRepository(session).save(account)
     return {"id": account.id, "at_cap_manual": account.at_cap_manual}
+
+
+async def set_blocked(session: AsyncSession, account_id: int, tagged: bool) -> dict:
+    """Mark a disabled account as blocked so it stays off and shows a blocked tag."""
+    account = await AccountRepository(session).get(account_id)
+    if account is None:
+        raise AccountNotFoundError("Account not found.")
+    if tagged and account.new_api_status == 1:
+        raise ValueError("Only disabled accounts can be tagged blocked.")
+    account.blocked = bool(tagged)
+    await AccountRepository(session).save(account)
+    return {"id": account.id, "blocked": account.blocked}
 
 
 async def check_new_api_credit_alerts(session: AsyncSession) -> dict:

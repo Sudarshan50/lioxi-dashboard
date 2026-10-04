@@ -64,6 +64,10 @@ AUTH_AUTO = "auto-approve"
 OPEN_LOGIN = {STATUS_LOGIN_STARTED, STATUS_LOGGED_IN}
 TERMINAL = {STATUS_APPROVED, STATUS_REJECTED, STATUS_FAILED, STATUS_EXPIRED}
 LIVE_SUB_STATUSES = (STATUS_PENDING, STATUS_CREATING_SP, STATUS_APPROVING)
+# Leftover rows from a deleted portal account. Decline already deletes the
+# pending row; account delete used to leave these, which reserved the unique
+# Join name and blocked /join from reclaiming Lioxi-<Name> / <Name>.
+STALE_SUB_STATUSES = (STATUS_FAILED, STATUS_APPROVED, STATUS_REJECTED, STATUS_EXPIRED)
 DUPLICATE_SUB_MESSAGE = (
     "This Azure subscription is already submitted. An admin must decline it before you can register again."
 )
@@ -240,6 +244,7 @@ def pending_public(row: SpSubmitRequest) -> PendingRequestPublic:
         updated_at=row.updated_at,
         approved_at=row.approved_at,
         rejected_at=row.rejected_at,
+        authorized_by=getattr(row, "authorized_by", None),
         **public_grant_fields(row),
         can_retry_deploy=bool(
             row.client_secret_encrypted
@@ -400,7 +405,72 @@ async def live_request_for_subscription(
     return (await db.execute(stmt)).scalars().first()
 
 
-async def _discard_failed_for_subscription(
+async def release_join_for_subscription(
+    db: AsyncSession,
+    subscription_id: str | None,
+    account_name: str | None = None,
+) -> None:
+    """Drop Join reservations so /join can run again after a portal delete.
+
+    Clearing only the email left the approved row in place. That row still
+    holds `uq_sp_submit_name`, so the next Join could not reclaim the same
+    person name and leftover sign-ins kept showing the old Microsoft email.
+    """
+    wanted_sub = (subscription_id or "").strip().lower()
+    wanted_name = (account_name or "").strip().lower()
+    if not wanted_sub and not wanted_name:
+        return
+    clauses = []
+    if wanted_sub:
+        clauses.append(func.lower(SpSubmitRequest.subscription_id) == wanted_sub)
+    if wanted_name:
+        clauses.append(func.lower(SpSubmitRequest.name) == wanted_name)
+    rows = list((await db.execute(select(SpSubmitRequest).where(or_(*clauses)))).scalars())
+    seen = {row.id for row in rows}
+    emails = {(row.account_holder or "").strip().lower() for row in rows if (row.account_holder or "").strip()}
+    if emails:
+        extras = list(
+            (
+                await db.execute(
+                    select(SpSubmitRequest).where(
+                        func.lower(SpSubmitRequest.account_holder).in_(emails),
+                        or_(
+                            SpSubmitRequest.subscription_id.is_(None),
+                            func.btrim(SpSubmitRequest.subscription_id) == "",
+                        ),
+                        SpSubmitRequest.status.in_(
+                            (
+                                STATUS_EXPIRED,
+                                STATUS_FAILED,
+                                STATUS_LOGIN_STARTED,
+                                STATUS_LOGGED_IN,
+                                STATUS_REJECTED,
+                            )
+                        ),
+                    )
+                )
+            ).scalars()
+        )
+        for row in extras:
+            if row.id not in seen:
+                seen.add(row.id)
+                rows.append(row)
+    if not rows:
+        return
+    for row in rows:
+        await abort_approve_work(row.id)
+        await abort_session_work(row.session_id)
+        await db.delete(row)
+    await db.commit()
+
+
+async def forget_join_emails_for_subscription(
+    db: AsyncSession, subscription_id: str | None, account_name: str | None = None
+) -> None:
+    await release_join_for_subscription(db, subscription_id, account_name)
+
+
+async def _discard_stale_for_subscription(
     db: AsyncSession,
     subscription_id: str,
     exclude_id: int | None = None,
@@ -411,7 +481,7 @@ async def _discard_failed_for_subscription(
         return
     stmt = select(SpSubmitRequest).where(
         func.lower(SpSubmitRequest.subscription_id) == wanted,
-        SpSubmitRequest.status == STATUS_FAILED,
+        SpSubmitRequest.status.in_(STALE_SUB_STATUSES),
     )
     if exclude_id is not None:
         stmt = stmt.where(SpSubmitRequest.id != exclude_id)
@@ -425,8 +495,19 @@ async def _discard_failed_for_subscription(
             inherit_into.client_secret_encrypted = old.client_secret_encrypted
             inherit_into.sp_display_name = old.sp_display_name or inherit_into.sp_display_name
         await abort_approve_work(old.id)
-        await drop_az_session(old.session_id)
+        await abort_session_work(old.session_id)
         await db.delete(old)
+
+
+async def _discard_failed_for_subscription(
+    db: AsyncSession,
+    subscription_id: str,
+    exclude_id: int | None = None,
+    inherit_into: SpSubmitRequest | None = None,
+) -> None:
+    await _discard_stale_for_subscription(
+        db, subscription_id, exclude_id=exclude_id, inherit_into=inherit_into
+    )
 
 
 async def list_owner_names(db: AsyncSession, group: str | None = None) -> list[str]:
@@ -791,7 +872,9 @@ async def commit_session(
     existing_pending = await live_request_for_subscription(db, match.subscription_id, exclude_id=row.id)
     if existing_pending is not None:
         raise SubmitError(DUPLICATE_SUB_MESSAGE)
-    await _discard_failed_for_subscription(db, match.subscription_id, exclude_id=row.id, inherit_into=row)
+    # A prior portal delete can leave an approved row. There is no account
+    # (checked above), so drop it and reclaim the name before allocation.
+    await _discard_stale_for_subscription(db, match.subscription_id, exclude_id=row.id, inherit_into=row)
 
     try:
         enrollee = await ensure_enrollee_for_submit(db, person_associated, group)
@@ -1169,6 +1252,16 @@ def _missing_subscription_error(text: str) -> bool:
     )
 
 
+_DECLINABLE_STATUSES = {
+    STATUS_PENDING,
+    STATUS_FAILED,
+    STATUS_LOGIN_STARTED,
+    STATUS_LOGGED_IN,
+    STATUS_CREATING_SP,
+}
+_DECLINE_NOTICE = {"type": "error", "detail": "An admin declined this request. You can register again."}
+
+
 def _row_is_tenant_level(row: SpSubmitRequest) -> bool:
     return is_tenant_level_account(
         subscription_id=str(row.subscription_id or ""),
@@ -1177,58 +1270,153 @@ def _row_is_tenant_level(row: SpSubmitRequest) -> bool:
     )
 
 
+def _should_clean_azure(row: SpSubmitRequest) -> bool:
+    return (
+        bool(row.client_secret_encrypted and row.client_id and row.tenant_id and row.subscription_id)
+        and not _row_is_tenant_level(row)
+    )
+
+
+def _leftover_blocks_decline(row: SpSubmitRequest, leftover_error: str | None) -> bool:
+    return bool(
+        leftover_error
+        and row.error_kind == ERROR_KIND_DEPLOY
+        and not _missing_subscription_error(leftover_error)
+    )
+
+
+def _leftover_block_message(leftover_error: str) -> str:
+    return (
+        "Could not remove leftover Azure Kimi resources. The card is still here — try Clear leftover again. "
+        + leftover_error
+    )
+
+
+async def _delete_leftover_stacks(rows: list[SpSubmitRequest]) -> dict[int, str]:
+    """Return leftover-delete errors keyed by submit id. Missing key means Azure cleanup finished."""
+    errors: dict[int, str] = {}
+    if not rows:
+        return errors
+    from app.runtime import DEPLOY_JOBS_DEFAULT
+    from app.services.kimi_deploy_service import delete_accounts
+
+    payloads: list[dict[str, str]] = []
+    payload_rows: list[SpSubmitRequest] = []
+    for row in rows:
+        try:
+            secret = get_secret_box().decrypt(row.client_secret_encrypted)
+        except Exception as exc:
+            errors[row.id] = str(exc)[:400]
+            continue
+        payloads.append(deploy_payload_from_row(row, secret))
+        payload_rows.append(row)
+    if not payloads:
+        return errors
+    try:
+        results = await delete_accounts(payloads, jobs=min(DEPLOY_JOBS_DEFAULT, len(payloads)))
+    except Exception as exc:
+        leftover_error = str(exc)[:400]
+        logger.exception("Could not remove leftover Kimi stacks for %s submit(s)", len(payloads))
+        for row in payload_rows:
+            errors[row.id] = leftover_error
+        return errors
+    for index, row in enumerate(payload_rows):
+        result = results[index] if index < len(results) else None
+        if result is None or not result.ok:
+            errors[row.id] = (
+                (result.error if result is not None else None) or "Azure leftover delete did not complete."
+            )
+    return errors
+
+
+async def _discard_declined_row(db: AsyncSession, row: SpSubmitRequest) -> tuple[int, str | None, str]:
+    """Wipe the secret, drop az state, and delete the row. Caller commits and notifies."""
+    from app.services.service_principal_store import drop_orphan_service_principal
+
+    deleted_id = row.id
+    subscription_id = row.subscription_id
+    session_id = row.session_id
+    await drop_orphan_service_principal(db, subscription_id)
+    _wipe_secret(row)
+    await drop_az_session(session_id)
+    await db.delete(row)
+    return deleted_id, subscription_id, session_id
+
+
 async def reject_request(db: AsyncSession, request_id: int) -> tuple[int, str | None]:
     """Decline a submission: wipe the secret, drop az state, and delete the row so they can register again."""
     row = await get_request_by_id(db, request_id)
     if row is None:
         raise SubmitError("Unknown pending request.")
-    if row.status not in {
-        STATUS_PENDING,
-        STATUS_FAILED,
-        STATUS_LOGIN_STARTED,
-        STATUS_LOGGED_IN,
-        STATUS_CREATING_SP,
-    }:
+    if row.status not in _DECLINABLE_STATUSES:
         raise SubmitError("This request cannot be declined.")
     deleted_id = row.id
     subscription_id = row.subscription_id
     session_id = row.session_id
     await abort_approve_work(deleted_id)
     await abort_session_work(session_id)
-    leftover_error: str | None = None
-    should_clean_azure = (
-        bool(row.client_secret_encrypted and row.client_id and row.tenant_id and row.subscription_id)
-        and not _row_is_tenant_level(row)
-    )
-    if should_clean_azure:
-        try:
-            from app.services.kimi_deploy_service import delete_accounts
-
-            secret = get_secret_box().decrypt(row.client_secret_encrypted)
-            results = await delete_accounts([deploy_payload_from_row(row, secret)], jobs=1)
-            if results and not results[0].ok:
-                leftover_error = results[0].error or "Azure leftover delete did not complete."
-        except Exception as exc:
-            leftover_error = str(exc)[:400]
-            logger.exception("Could not remove leftover Kimi stack for submit %s", deleted_id)
-        if (
-            leftover_error
-            and row.error_kind == ERROR_KIND_DEPLOY
-            and not _missing_subscription_error(leftover_error)
-        ):
-            raise SubmitError(
-                "Could not remove leftover Azure Kimi resources. The card is still here — try Clear leftover again. "
-                + leftover_error
-            )
-    from app.services.service_principal_store import drop_orphan_service_principal
-
-    await drop_orphan_service_principal(db, subscription_id)
-    _wipe_secret(row)
-    await drop_az_session(session_id)
-    await db.delete(row)
+    leftover_error = (await _delete_leftover_stacks([row])).get(row.id) if _should_clean_azure(row) else None
+    if _leftover_blocks_decline(row, leftover_error):
+        raise SubmitError(_leftover_block_message(leftover_error or ""))
+    await _discard_declined_row(db, row)
     await db.commit()
-    await _publish(session_id, {"type": "error", "detail": "An admin declined this request. You can register again."})
+    await _publish(session_id, _DECLINE_NOTICE)
     return deleted_id, subscription_id
+
+
+async def reject_many(
+    db: AsyncSession,
+    ids: list[int] | None,
+    *,
+    group: str | None = None,
+) -> tuple[list[int], list[tuple[int, str]]]:
+    """Decline many cards at once. No ids sweeps failed rows only — never the ready-to-approve queue."""
+    wanted = {int(item) for item in ids} if ids else None
+    only_group = normalize_group(group) if group is not None else None
+    if wanted is not None:
+        rows = list(
+            (
+                await db.execute(select(SpSubmitRequest).where(SpSubmitRequest.id.in_(wanted)))
+            ).scalars()
+        )
+        found = {row.id for row in rows}
+        skipped: list[tuple[int, str]] = [
+            (item_id, "Unknown pending request.") for item_id in wanted if item_id not in found
+        ]
+    else:
+        rows = await list_pending(db)
+        skipped = []
+    candidates: list[SpSubmitRequest] = []
+    for row in rows:
+        if wanted is not None and row.id not in wanted:
+            continue
+        if only_group is not None and normalize_group(row.group_tag) != only_group:
+            continue
+        if wanted is None and row.status != STATUS_FAILED:
+            continue
+        if row.status not in _DECLINABLE_STATUSES:
+            if wanted is not None:
+                skipped.append((row.id, "This request cannot be declined."))
+            continue
+        candidates.append(row)
+    for row in candidates:
+        await abort_approve_work(row.id)
+        await abort_session_work(row.session_id)
+    leftover_errors = await _delete_leftover_stacks([row for row in candidates if _should_clean_azure(row)])
+    declined: list[int] = []
+    notify: list[str] = []
+    for row in candidates:
+        leftover_error = leftover_errors.get(row.id)
+        if _leftover_blocks_decline(row, leftover_error):
+            skipped.append((row.id, _leftover_block_message(leftover_error or "")))
+            continue
+        deleted_id, _subscription_id, session_id = await _discard_declined_row(db, row)
+        declined.append(deleted_id)
+        notify.append(session_id)
+    await db.commit()
+    for session_id in notify:
+        await _publish(session_id, _DECLINE_NOTICE)
+    return declined, skipped
 
 
 def _auto_retry_count(row: SpSubmitRequest | None) -> int:
@@ -1240,8 +1428,21 @@ def _auto_retry_count(row: SpSubmitRequest | None) -> int:
         return 0
 
 
+def _permanent_deploy_block(message: str | None) -> bool:
+    """Quota stayed 0 after Fireworks.EnableDeploy finished registering."""
+    text = (message or "").lower()
+    return (
+        "has not enabled fireworks kimi" in text
+        or "specialfeatureorquotaidrequired" in text
+        or "does not have access to this model" in text
+        or "fireworks datazonestandard quota is 0" in text
+    )
+
+
 def _row_can_auto_retry(row: SpSubmitRequest | None) -> bool:
     if row is None or row.status != STATUS_FAILED or row.error_kind != ERROR_KIND_DEPLOY:
+        return False
+    if _permanent_deploy_block(getattr(row, "error_message", None)):
         return False
     if _auto_retry_count(row) >= AUTO_RETRY_LIMIT:
         return False
@@ -1287,6 +1488,7 @@ async def enqueue_approve(
         row.auto_retry_count = 0
     priority, weight = await resolve_routing(db, new_api_priority, new_api_weight)
     row.status = STATUS_APPROVING
+    row.authorized_by = authorized_by
     row.error_message = None
     await db.commit()
     task = asyncio.create_task(_run_approve_job(request_id, priority, weight, authorized_by))
@@ -1564,6 +1766,7 @@ async def execute_approve(
             return results
         row.status = STATUS_APPROVED
         row.approved_at = _utcnow()
+        row.authorized_by = authorized_by
         row.error_message = None
         row.error_kind = None
         _wipe_secret(row)

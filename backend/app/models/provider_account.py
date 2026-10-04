@@ -64,3 +64,8 @@ class ProviderAccount(Base, TimestampMixin):
     payable_settled: Mapped[bool] = mapped_column(default=False, server_default="false")
     payable_settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     at_cap_manual: Mapped[bool] = mapped_column(default=False, server_default="false")
+    blocked: Mapped[bool] = mapped_column(default=False, server_default="false")
+
+    @property
+    def has_api_key(self) -> bool:
+        return bool(self.openai_api_key_encrypted)

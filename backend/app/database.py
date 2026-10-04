@@ -56,6 +56,7 @@ _ACCOUNT_EXTRA_COLUMNS = (
     ("payable_settled", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("payable_settled_at", "TIMESTAMPTZ"),
     ("at_cap_manual", "BOOLEAN NOT NULL DEFAULT FALSE"),
+    ("blocked", "BOOLEAN NOT NULL DEFAULT FALSE"),
     ("openai_api_key_encrypted", "TEXT"),
     ("group_tag", "VARCHAR(8) NOT NULL DEFAULT 'sb'"),
 )
@@ -82,6 +83,7 @@ _SUBMIT_EXTRA_COLUMNS = (
     ("credits_fetched_at", "TIMESTAMPTZ"),
     ("credits_error", "TEXT"),
     ("group_tag", "VARCHAR(8) NOT NULL DEFAULT 'sb'"),
+    ("authorized_by", "VARCHAR(32)"),
 )
 
 

@@ -23,9 +23,11 @@ import {
   useSendTestAlert,
   SendTarget,
   useSetAtCapManual,
+  useSetBlocked,
   useSetPayableSettled,
   useStartClearGroupChat,
 } from "@/hooks/useAlerts";
+import { expandChannelCards } from "@/lib/channelCards";
 import { formatCurrency, formatRelative } from "@/lib/format";
 import { amountPayableUsd, brokerageUsd, downloadPayableCsv, payablePercentLabel } from "@/lib/payable";
 import { matchesOwner, ownerLabel, uniqueOwners, UNTAGGED_OWNER } from "@/lib/ownerTag";
@@ -137,11 +139,13 @@ function matchesAlertSearch(item: AlertStateItem, rawQuery: string): boolean {
       item.name,
       item.deployed_at ? formatRelative(item.deployed_at) : "",
       item.new_api_name,
+      ...(item.channel_cards ?? []).map((card) => card.name),
       item.owner_tag,
       groupLabel(resolveGroup(null, item.new_api_name)),
       item.endpoint,
       item.gateway,
       item.exhausted ? "at cap" : "",
+      item.blocked ? "blocked" : "",
       item.alert_level >= 100 && item.exhausted && item.exhausted_reason === "overspent" ? "auto-disabled" : "",
     ]
       .filter(Boolean)
@@ -167,6 +171,7 @@ export default function AlertsPage() {
   const runCheck = useRunAlertCheck();
   const setPayableSettled = useSetPayableSettled();
   const setAtCapManual = useSetAtCapManual();
+  const setBlocked = useSetBlocked();
 
   const [enabled, setEnabled] = useState(true);
   const [thresholds, setThresholds] = useState<number[]>([75, 95]);
@@ -348,6 +353,7 @@ export default function AlertsPage() {
     () => sortAlertState(visibleAlertState, alertSort),
     [alertSort, visibleAlertState]
   );
+  const alertRows = useMemo(() => expandChannelCards(sortedAlertState), [sortedAlertState]);
   const payableTotals = useMemo(() => {
     const spend = visibleAlertState.reduce((sum, item) => sum + (item.spend_usd || 0), 0);
     const payable = visibleAlertState.reduce((sum, item) => sum + amountPayableUsd(item.spend_usd), 0);
@@ -410,6 +416,17 @@ export default function AlertsPage() {
       setMessage(atCap ? `${item.name} tagged at cap.` : `${item.name} at-cap tag removed.`);
     } catch (err: any) {
       setError(err?.response?.data?.detail ?? "Could not update at-cap tag.");
+    }
+  }
+
+  async function handleMarkBlocked(item: AlertStateItem, blocked: boolean) {
+    setMessage(null);
+    setError(null);
+    try {
+      await setBlocked.mutateAsync({ id: item.id, blocked });
+      setMessage(blocked ? `${item.name} tagged blocked.` : `${item.name} unblocked.`);
+    } catch (err: any) {
+      setError(err?.response?.data?.detail ?? "Could not update blocked tag.");
     }
   }
 
@@ -798,12 +815,16 @@ export default function AlertsPage() {
                     visibleAlertState.map((item) => ({
                     name: item.name,
                     owner: item.owner_tag,
-                    newApiName: item.new_api_name,
+                    newApiName:
+                      (item.channel_cards ?? []).map((card) => card.name).filter(Boolean).join("+") ||
+                      item.new_api_name ||
+                      "",
                       endpoint: item.endpoint,
                       spendUsd: item.spend_usd,
                       spendO1Usd: item.spend_o1_usd,
                       spendO2Usd: item.spend_o2_usd,
                       settled: Boolean(item.payable_settled),
+                      blocked: Boolean(item.blocked),
                     })),
                     "amount-payable.csv",
                     { unsettled: payableTotals.unsettled, settled: payableTotals.settled }
@@ -887,60 +908,78 @@ export default function AlertsPage() {
                 </tr>
               </thead>
               <tbody>
-                {sortedAlertState.map((item) => {
-                  const channelLine = [item.new_api_name, item.gateway].filter(Boolean).join(" · ");
-                  const spendSplit = spendSplitLabel(item);
+                {alertRows.map(({ key, item, channel, lead }) => {
+                  const split = Boolean(channel) && (item.channel_cards?.length ?? 0) > 1;
+                  const channelOn = channel ? channel.status === 1 : item.gateway_enabled;
+                  const channelLine = [channel?.name || item.new_api_name, channel?.gateway || item.gateway]
+                    .filter(Boolean)
+                    .join(" · ");
+                  const spendSplit = split ? null : spendSplitLabel(item);
                   const pendingCap = setAtCapManual.isPending && setAtCapManual.variables?.id === item.id;
+                  const pendingBlocked = setBlocked.isPending && setBlocked.variables?.id === item.id;
                   const pendingPaid = setPayableSettled.isPending && setPayableSettled.variables?.id === item.id;
                   return (
-                    <tr key={item.id} className="border-b border-white/[0.04] last:border-0 hover:bg-white/[0.02]">
+                    <tr key={key} className="border-b border-white/[0.04] last:border-0 hover:bg-white/[0.02]">
                       <td className="px-4 py-3 pr-3 sm:px-5">
                         <div className="min-w-[16rem] max-w-[22rem]">
                           <div className="flex flex-wrap items-center gap-1.5">
                             <span className="font-medium text-gray-100">{item.name}</span>
-                            {item.deployed_at && (
+                            {lead && item.deployed_at && (
                               <span className="shrink-0 text-[11px] tabular-nums text-gray-500">
                                 {formatRelative(item.deployed_at)}
                               </span>
                             )}
-                            {item.owner_tag && <StatusPill tone="violet">{item.owner_tag}</StatusPill>}
-                            <GroupBadge channel={item.new_api_name} />
-                            {item.gateway && !item.gateway_enabled && <StatusPill tone="amber">disabled</StatusPill>}
-                            {!item.gateway && <StatusPill tone="amber" title="No NewAPI channel matched">no NewAPI</StatusPill>}
-                            {item.alert_level >= 100 && item.exhausted && item.exhausted_reason === "overspent" && (
+                            {lead && item.owner_tag && <StatusPill tone="violet">{item.owner_tag}</StatusPill>}
+                            {lead && <GroupBadge channel={item.new_api_name} />}
+                            {channel?.role === "gpt" && <StatusPill tone="violet">GPT</StatusPill>}
+                            {(channel ? channel.gateway : item.gateway) && !channelOn && (
+                              <StatusPill tone="amber">disabled</StatusPill>
+                            )}
+                            {lead && item.blocked && (
+                              <StatusPill tone="red" title="Blocked — will not be enabled until unblocked">
+                                blocked
+                              </StatusPill>
+                            )}
+                            {lead && !item.gateway && <StatusPill tone="amber" title="No NewAPI channel matched">no NewAPI</StatusPill>}
+                            {lead && item.alert_level >= 100 && item.exhausted && item.exhausted_reason === "overspent" && (
                               <StatusPill tone="red" title={atCapTitle(item)}>
                                 auto-disabled
                               </StatusPill>
                             )}
-                            {item.exhausted && (
+                            {lead && item.exhausted && (
                               <StatusPill tone="red" title={atCapTitle(item)}>
                                 at cap
                               </StatusPill>
                             )}
-                            {item.payable_settled && <StatusPill tone="green">settled</StatusPill>}
+                            {lead && item.payable_settled && <StatusPill tone="green">settled</StatusPill>}
                           </div>
-                          {channelLine && <p className="mt-0.5 truncate text-[11px] text-gray-500">{channelLine}</p>}
+                          {channelLine && <p className="mt-0.5 break-all text-[11px] text-gray-500">{channelLine}</p>}
                         </div>
                       </td>
                       <td className="py-3 pr-3 text-right tabular-nums text-violet-300">
-                        <div>{formatCurrency(item.spend_usd, "USD")}</div>
+                        <div>{formatCurrency(split && channel ? channel.spend_usd : item.spend_usd, "USD")}</div>
+                        {split && lead && (
+                          <p className="mt-0.5 text-[11px] font-normal text-gray-500">
+                            combined {formatCurrency(item.spend_usd, "USD")}
+                          </p>
+                        )}
                         {spendSplit && <p className="mt-0.5 text-[11px] font-normal text-gray-500">{spendSplit}</p>}
                       </td>
                       <td className="py-3 pr-3 text-right tabular-nums text-amber-200">
-                        {formatCurrency(amountPayableUsd(item.spend_usd), "USD")}
+                        {lead ? formatCurrency(amountPayableUsd(item.spend_usd), "USD") : ""}
                       </td>
                       <td className="py-3 pr-3 text-right tabular-nums text-gray-300">
-                        {item.credits_limit != null ? formatCurrency(item.credits_limit, item.credits_currency || "USD") : "—"}
+                        {lead && item.credits_limit != null ? formatCurrency(item.credits_limit, item.credits_currency || "USD") : lead ? "—" : ""}
                       </td>
                       <td
                         className={`py-3 pr-3 text-right tabular-nums ${
-                          item.headroom_usd != null && item.headroom_usd <= 0 ? "text-red-300" : "text-gray-300"
+                          lead && item.headroom_usd != null && item.headroom_usd <= 0 ? "text-red-300" : "text-gray-300"
                         }`}
                       >
-                        {item.headroom_usd != null ? formatCurrency(item.headroom_usd, "USD") : "—"}
+                        {lead && item.headroom_usd != null ? formatCurrency(item.headroom_usd, "USD") : lead ? "—" : ""}
                       </td>
                       <td className="py-3 pr-3">
-                        {item.percent == null ? (
+                        {!lead ? null : item.percent == null ? (
                           <span className="text-gray-600">n/a</span>
                         ) : (
                           <div className="flex min-w-[7.5rem] items-center gap-2">
@@ -962,6 +1001,7 @@ export default function AlertsPage() {
                         )}
                       </td>
                       <td className="px-4 py-3 sm:px-5">
+                        {lead && (
                         <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1">
                           {item.gateway && !item.gateway_enabled && !item.exhausted && (
                             <button
@@ -983,28 +1023,49 @@ export default function AlertsPage() {
                               Untag
                             </button>
                           )}
-                          {item.payable_settled ? (
+                          {item.gateway && !item.gateway_enabled && !item.blocked && (
                             <button
                               type="button"
-                              disabled={pendingPaid}
-                              onClick={() => handleMarkPaid(item, false)}
+                              disabled={pendingBlocked}
+                              onClick={() => handleMarkBlocked(item, true)}
+                              className="text-[11px] font-medium text-rose-300 hover:text-rose-200 disabled:opacity-50"
+                            >
+                              Tag blocked
+                            </button>
+                          )}
+                          {item.blocked && (
+                            <button
+                              type="button"
+                              disabled={pendingBlocked}
+                              onClick={() => handleMarkBlocked(item, false)}
                               className="text-[11px] font-medium text-gray-500 hover:text-gray-300 disabled:opacity-50"
                             >
-                              Undo paid
+                              Unblock
                             </button>
-                          ) : isDisabledAtCap(item) ? (
-                            <button
-                              type="button"
-                              disabled={pendingPaid}
-                              onClick={() => handleMarkPaid(item, true)}
-                              className="text-[11px] font-medium text-emerald-300 hover:text-emerald-200 disabled:opacity-50"
-                            >
-                              Mark paid
-                            </button>
-                          ) : (
-                            <span className="text-gray-700">—</span>
+                          )}
+                          {item.payable_settled ? (
+                              <button
+                                type="button"
+                                disabled={pendingPaid}
+                                onClick={() => handleMarkPaid(item, false)}
+                                className="text-[11px] font-medium text-gray-500 hover:text-gray-300 disabled:opacity-50"
+                              >
+                                Undo paid
+                              </button>
+                            ) : isDisabledAtCap(item) ? (
+                              <button
+                                type="button"
+                                disabled={pendingPaid}
+                                onClick={() => handleMarkPaid(item, true)}
+                                className="text-[11px] font-medium text-emerald-300 hover:text-emerald-200 disabled:opacity-50"
+                              >
+                                Mark paid
+                              </button>
+                            ) : (
+                              <span className="text-gray-700">—</span>
                           )}
                         </div>
+                        )}
                       </td>
                     </tr>
                   );

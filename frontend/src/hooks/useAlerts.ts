@@ -116,6 +116,20 @@ export function useSetAtCapManual() {
   });
 }
 
+export function useSetBlocked() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, blocked }: { id: number; blocked: boolean }) =>
+      (await apiClient.patch<{ id: number; blocked: boolean }>(`/api/alerts/state/${id}/blocked`, {
+        blocked,
+      })).data,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["alerts", "state"] });
+      queryClient.invalidateQueries({ queryKey: ["accounts"] });
+    },
+  });
+}
+
 export function useRunAlertCheck() {
   const queryClient = useQueryClient();
   return useMutation({

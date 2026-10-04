@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class AccountDiscoverRequest(BaseModel):
@@ -58,6 +58,15 @@ class AccountUpdateRequest(BaseModel):
     group_tag: str | None = None
 
 
+class ChannelCard(BaseModel):
+    id: int | None = None
+    name: str = ""
+    role: str = "primary"
+    gateway: str = "O1"
+    status: int | None = None
+    spend_usd: float = 0
+
+
 class AccountResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -102,6 +111,17 @@ class AccountResponse(BaseModel):
     payable_settled: bool = False
     payable_settled_at: datetime | None = None
     at_cap_manual: bool = False
+    blocked: bool = False
+    gpt_deployed: bool = False
+    channel_cards: list[ChannelCard] = Field(default_factory=list)
+    has_api_key: bool = False
+    email: str | None = None
+
+
+class AccountApiKeyResponse(BaseModel):
+    api_key: str
+    endpoint: str
+    new_api_error: str | None = None
 
 
 class DeploymentResponse(BaseModel):

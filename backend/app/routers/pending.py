@@ -8,6 +8,8 @@ from app.schemas.submit import (
     PendingApproveRequest,
     PendingBatchApproveRequest,
     PendingBatchApproveResponse,
+    PendingBatchDeclineRequest,
+    PendingBatchDeclineResponse,
     PendingBatchSkipped,
     PendingDeclineResponse,
     PendingGrantsResponse,
@@ -20,6 +22,7 @@ from app.services.submit_service import (
     enqueue_approve_many,
     list_pending,
     pending_public,
+    reject_many,
     reject_request,
 )
 
@@ -46,6 +49,22 @@ async def pending_grants(db: AsyncSession = Depends(get_db)) -> PendingGrantsRes
 @router.post("/grants/refresh", response_model=PendingGrantsResponse)
 async def pending_grants_refresh(db: AsyncSession = Depends(get_db)) -> PendingGrantsResponse:
     return await refresh_pending_grants(db)
+
+
+@router.post("/decline-batch", response_model=PendingBatchDeclineResponse)
+async def pending_decline_batch(
+    payload: PendingBatchDeclineRequest,
+    db: AsyncSession = Depends(get_db),
+) -> PendingBatchDeclineResponse:
+    try:
+        declined, skipped = await reject_many(db, payload.ids, group=payload.group)
+    except SubmitError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return PendingBatchDeclineResponse(
+        ok=True,
+        declined=declined,
+        skipped=[PendingBatchSkipped(id=item_id, error=error) for item_id, error in skipped],
+    )
 
 
 @router.post("/{request_id}/reject", response_model=PendingDeclineResponse)
