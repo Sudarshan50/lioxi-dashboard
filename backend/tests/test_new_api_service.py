@@ -11,7 +11,8 @@ from app.services.new_api_service import (
     _unique_channels,
     channels_matching_account,
 )
-from app.services.channel_cards import cards_for_channels
+from app.services.alert_service import credits_exhausted, telegram_exhausted, telegram_spend
+from app.services.channel_cards import add_gpt_pool, cards_for_channels
 
 
 class ChannelsMatchingAccount(unittest.TestCase):
@@ -140,6 +141,22 @@ class KeepLastKnownPortal(unittest.TestCase):
         self.assertAlmostEqual(account.new_api_cost_o2_usd, 7500.0)
         self.assertAlmostEqual(account.new_api_cost_usd, 10000.0)
 
+    def test_gpt_pool_joins_combined_spend_without_a_gateway_label(self):
+        account = self._account()
+        _apply_fetched_portals(
+            account,
+            {"O1", "GPT"},
+            {
+                "O1": [{"id": 1, "used_quota": 1_250_000_000, "status": 1}],
+                "GPT": [{"id": 451, "name": "gpt-astra-proxy2", "used_quota": 8_500_000, "status": 1}],
+            },
+        )
+        self.assertEqual(account.new_api_gateway, "O1+O2")
+        self.assertAlmostEqual(account.new_api_cost_o1_usd, 2500.0)
+        self.assertAlmostEqual(account.new_api_cost_o2_usd, 7500.0)
+        self.assertAlmostEqual(account.new_api_cost_gpt_usd, 17.0)
+        self.assertAlmostEqual(account.new_api_cost_usd, 10017.0)
+
 
 class HostAndPages(unittest.TestCase):
     def test_host_key_joins_openai_and_cognitiveservices(self):
@@ -188,3 +205,56 @@ class ChannelCards(unittest.TestCase):
         self.assertEqual(cards[1]["status"], 2)
         self.assertAlmostEqual(cards[1]["spend_usd"], 17)
         self.assertAlmostEqual(cards[0]["spend_usd"] + cards[1]["spend_usd"], 5017)
+
+    def test_gpt_portal_spend_joins_the_same_channel_name(self):
+        o1 = cards_for_channels(
+            [
+                {
+                    "id": 11,
+                    "name": "gpt-astra-proxy2",
+                    "tag": "gpt-astra",
+                    "base_url": "https://res-a.openai.azure.com",
+                    "status": 1,
+                    "used_quota": 8_500_000,
+                }
+            ],
+            "O1",
+            500_000,
+        )
+        pool = cards_for_channels(
+            [
+                {
+                    "id": 451,
+                    "name": "gpt-astra-proxy2",
+                    "tag": "gpt-astra",
+                    "base_url": "https://res-a.openai.azure.com",
+                    "status": 1,
+                    "used_quota": 8_000_000,
+                }
+            ],
+            "GPT",
+            500_000,
+        )
+        add_gpt_pool(o1, pool)
+        self.assertEqual(len(o1["res-a"]), 1)
+        self.assertAlmostEqual(o1["res-a"][0]["spend_usd"], 33)
+
+
+class GptPoolSpend(unittest.TestCase):
+    def test_pool_is_in_the_stop_and_out_of_telegram(self):
+        account = SimpleNamespace(
+            new_api_gateway="O1",
+            new_api_cost_o1_usd=9990.0,
+            new_api_cost_o2_usd=None,
+            new_api_cost_gpt_usd=20.0,
+            new_api_cost_usd=10010.0,
+            new_api_status_o1=1,
+            new_api_status_o2=None,
+            new_api_status=1,
+            new_api_used_quota=None,
+            credits_limit=10000,
+            credits_currency="USD",
+        )
+        self.assertTrue(credits_exhausted(account, 0))
+        self.assertFalse(telegram_exhausted(account, 0))
+        self.assertAlmostEqual(telegram_spend(account), 9990)

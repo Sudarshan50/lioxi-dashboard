@@ -100,6 +100,7 @@ class AccountResponse(BaseModel):
     new_api_used_quota: float | None = None
     new_api_cost_o1_usd: float | None = None
     new_api_cost_o2_usd: float | None = None
+    new_api_cost_gpt_usd: float | None = None
     new_api_cost_usd: float | None = None
     new_api_status: int | None = None
     new_api_status_o1: int | None = None

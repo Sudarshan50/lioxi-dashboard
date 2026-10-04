@@ -210,6 +210,31 @@ def consumed_percent(account) -> float | None:
     return spend / grant * 100
 
 
+def telegram_spend(account) -> float | None:
+    """Spend that may send a Telegram alert. The GPT portal pool is excluded."""
+    spend = new_api_spend(account)
+    if spend is None:
+        return None
+    pool = max(float(getattr(account, "new_api_cost_gpt_usd", 0) or 0), 0.0)
+    return max(spend - pool, 0.0)
+
+
+def telegram_percent(account) -> float | None:
+    spend = telegram_spend(account)
+    grant = credit_grant_usd(account)
+    if spend is None or grant is None:
+        return None
+    return spend / grant * 100
+
+
+def telegram_exhausted(account, overspend_buffer: float = DEFAULT_OVERSPEND_BUFFER) -> bool:
+    spend = telegram_spend(account)
+    cap = stop_at_usd(account, overspend_buffer)
+    if spend is None or cap is None:
+        return False
+    return spend >= cap
+
+
 def credits_exhausted(account, overspend_buffer: float = DEFAULT_OVERSPEND_BUFFER) -> bool:
     """Stop when NewAPI spend reaches grant + buffer."""
     spend = new_api_spend(account)
@@ -437,6 +462,7 @@ async def check_new_api_credit_alerts(session: AsyncSession) -> dict:
                 notify
                 and live
                 and previous < EXHAUSTED_LEVEL
+                and telegram_exhausted(account, buffer)
                 and (bool(flipped) or flip_error is not None)
             )
             if should_announce:
@@ -458,7 +484,7 @@ async def check_new_api_credit_alerts(session: AsyncSession) -> dict:
         if not live:
             continue
 
-        percent = consumed_percent(account)
+        percent = telegram_percent(account)
         if percent is None:
             continue
         level = _crossed_level(percent, thresholds)

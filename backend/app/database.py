@@ -44,6 +44,7 @@ _ACCOUNT_EXTRA_COLUMNS = (
     ("new_api_used_quota", "DOUBLE PRECISION"),
     ("new_api_cost_o1_usd", "DOUBLE PRECISION"),
     ("new_api_cost_o2_usd", "DOUBLE PRECISION"),
+    ("new_api_cost_gpt_usd", "DOUBLE PRECISION"),
     ("new_api_cost_usd", "DOUBLE PRECISION"),
     ("azure_token_totals", "JSONB"),
     ("new_api_status", "INTEGER"),

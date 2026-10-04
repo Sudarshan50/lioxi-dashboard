@@ -51,6 +51,7 @@ class ProviderAccount(Base, TimestampMixin):
     new_api_used_quota: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o1_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_o2_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
+    new_api_cost_gpt_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     new_api_cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True, default=None)
     azure_token_totals: Mapped[dict | None] = mapped_column(JSON, nullable=True, default=None)
     new_api_status: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)

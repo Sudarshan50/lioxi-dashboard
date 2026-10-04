@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     new_api2_tag_filter: str = ""
     new_api2_proxy: str | None = None
 
+    # Spend-only mirror of the gpt-astra channels. Same names as O1.
+    # Counted in the combined stop and the GPT card. Not a Telegram source.
+    new_api_gpt_base_url: str = ""
+    new_api_gpt_system_token: str | None = None
+    new_api_gpt_user_id: int = 1
+
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     # Second group chat, scoped to VCS accounts. Blank disables it.

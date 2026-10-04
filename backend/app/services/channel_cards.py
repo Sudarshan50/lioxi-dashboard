@@ -47,15 +47,37 @@ def cards_for_channels(channels: list[dict], gateway_label: str, unit: float) ->
     return grouped
 
 
+def add_gpt_pool(merged: dict[str, list[dict]], pool: dict[str, list[dict]]) -> None:
+    """Add the GPT portal's spend onto the card with the same channel name."""
+    for host, extras in pool.items():
+        by_name: dict[str, float] = {}
+        for card in extras:
+            name = card["name"]
+            if not name:
+                continue
+            by_name[name] = by_name.get(name, 0.0) + float(card["spend_usd"] or 0)
+        for card in merged.get(host, []):
+            extra = by_name.pop(card["name"], None)
+            if extra:
+                card["spend_usd"] = float(card["spend_usd"] or 0) + extra
+
+
 async def cards_by_host() -> dict[str, list[dict]]:
     unit = get_settings().new_api_quota_per_unit or 1
     merged: dict[str, list[dict]] = {}
+    pool: dict[str, list[dict]] = {}
     for gateway in gateways():
         try:
             channels = await fetch_channels(gateway)
         except Exception:
             logger.warning("Channel cards skipped for %s", gateway.label, exc_info=True)
             continue
-        for host, cards in cards_for_channels(channels, gateway.label, unit).items():
+        grouped = cards_for_channels(channels, gateway.label, unit)
+        if gateway.label == "GPT":
+            for host, cards in grouped.items():
+                pool.setdefault(host, []).extend(cards)
+            continue
+        for host, cards in grouped.items():
             merged.setdefault(host, []).extend(cards)
+    add_gpt_pool(merged, pool)
     return merged

@@ -93,6 +93,15 @@ def gateways() -> list[Gateway]:
                 proxy=settings.new_api2_proxy or None,
             )
         )
+    if settings.new_api_gpt_system_token and settings.new_api_gpt_base_url:
+        result.append(
+            Gateway(
+                "GPT",
+                settings.new_api_gpt_base_url.rstrip("/"),
+                settings.new_api_gpt_system_token,
+                settings.new_api_gpt_user_id,
+            )
+        )
     if not result:
         raise NewApiError("No NewAPI system token configured (set NEW_API_SYSTEM_TOKEN / NEW_API2_SYSTEM_TOKEN)")
     return result
@@ -169,8 +178,12 @@ def _index_accounts(accounts: list[ProviderAccount]) -> dict[str, ProviderAccoun
     return by_key
 
 
+_BILLING_PORTALS = {"O1", "O2"}
+GPT_POOL = "GPT"
+
+
 def _membership(account: ProviderAccount) -> set[str]:
-    return {part for part in (account.new_api_gateway or "").split("+") if part in {"O1", "O2"}}
+    return {part for part in (account.new_api_gateway or "").split("+") if part in _BILLING_PORTALS}
 
 
 def _channel_status(raw) -> int | None:
@@ -264,6 +277,10 @@ def gateway_still_live(account: ProviderAccount) -> bool:
     return account.new_api_status == 1
 
 
+def _gpt_pool_usd(account: ProviderAccount) -> float:
+    return max(float(getattr(account, "new_api_cost_gpt_usd", 0) or 0), 0.0)
+
+
 def _recompute_totals(account: ProviderAccount) -> None:
     labels = _membership(account)
     o1 = account.new_api_cost_o1_usd or 0.0 if "O1" in labels else 0.0
@@ -272,7 +289,8 @@ def _recompute_totals(account: ProviderAccount) -> None:
         account.new_api_cost_o1_usd = None
     if "O2" not in labels:
         account.new_api_cost_o2_usd = None
-    account.new_api_cost_usd = (o1 + o2) if labels else None
+    gpt = _gpt_pool_usd(account)
+    account.new_api_cost_usd = (o1 + o2 + gpt) if labels or gpt else None
     account.new_api_used_quota = None
     recompute_overall_status(account)
 
@@ -285,6 +303,8 @@ def _apply_fetched_portals(
     """
     membership = _membership(account)
     for label in fetched_ok:
+        if label not in _BILLING_PORTALS:
+            continue
         channels = _unique_channels(channels_by_label.get(label, []))
         if channels:
             membership.add(label)
@@ -293,6 +313,9 @@ def _apply_fetched_portals(
             )
         elif label not in membership:
             _clear_portal(account, label)
+    if GPT_POOL in fetched_ok:
+        pooled = _unique_channels(channels_by_label.get(GPT_POOL) or [])
+        account.new_api_cost_gpt_usd = _quota_to_usd(_portal_quota(pooled))
     account.new_api_gateway = "+".join(sorted(membership)) or None
     _recompute_totals(account)
 
@@ -481,7 +504,7 @@ async def _set_gateway_status_locked(
                 flipped[gateway.label] = changed
                 if gateway.label == "O1":
                     account.new_api_status_o1 = status
-                else:
+                elif gateway.label == "O2":
                     account.new_api_status_o2 = status
             elif changed:
                 flipped[gateway.label] = changed
@@ -564,7 +587,7 @@ async def _sync_new_api_locked(session: AsyncSession) -> dict:
         fetched_channels = [
             channel
             for label, channel in labelled
-            if label in fetched_ok
+            if label in fetched_ok and label in _BILLING_PORTALS
         ]
         fetched_channels = _unique_channels(fetched_channels)
         if fetched_channels:
